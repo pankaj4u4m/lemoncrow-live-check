@@ -1,0 +1,23 @@
+FROM node:24-bookworm-slim
+WORKDIR /app
+RUN npm install --global npm@11.6.2
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Browser ownership lives on Companion devices.
+#
+# The server keeps the Playwright/Patchright Node packages installed by `npm ci`
+# because it is the remote CDP controller, but this image deliberately installs
+# no Chrome/Chromium binaries, Playwright browser downloads, Xvfb, DISPLAY, or
+# browser-only system dependencies. Every real browser process belongs to a
+# paired Companion, even when that Companion runs on the same physical machine
+# as Docker.
+
+# The subscription CLIs the hosted agent can run instead of a BYOK model key
+# (TREVRA_AGENT_CLI in .env.example). They ship no credential -- the container
+# gets one at runtime through TREVRA_AGENT_CLI_OAUTH_TOKEN.
+RUN npm install --global @anthropic-ai/claude-code @openai/codex
+
+COPY . .
+EXPOSE 5173 8787
+CMD ["npm", "run", "dev"]

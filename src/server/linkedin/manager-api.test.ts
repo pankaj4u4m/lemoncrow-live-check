@@ -1,0 +1,1214 @@
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import request from 'supertest';
+import type { Express } from 'express';
+import { createApp } from '../app.js';
+import { closeAuthDatabase, migrateAuthDatabase } from '../auth-service.js';
+import { openDatabase, type Db } from '../db.js';
+import { importLeadCsv, importLeadProfileUrls } from './lead-lists.js';
+import { recordAction } from './actions.js';
+import { ADDITIONAL_WORKFLOW_STARTERS } from '../../client/workflow-starter-recipes.js';
+import {
+  registerEmailComplianceProvider,
+  resetEmailComplianceProvider,
+  OUTREACH_OPT_OUT_SENTENCE
+} from '../email/compliance.js';
+import { upsertSeat } from './seats.js';
+
+let db: Db;
+let app: Express;
+const A = 'ws_li_manager_api_a';
+const B = 'ws_li_manager_api_b';
+const NOW = new Date('2026-08-13T09:00:00.000Z');
+let tokenA = '';
+let tokenB = '';
+
+async function session(workspaceId: string): Promise<string> {
+  const userId = `usr_${workspaceId}`;
+  await db
+    .prepare(
+      'INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING'
+    )
+    .run(workspaceId, workspaceId, NOW.toISOString());
+  await db
+    .prepare(
+      'INSERT INTO users (id,workspace_id,email,name,created_at) VALUES (?,?,?,?,?) ON CONFLICT (id) DO NOTHING'
+    )
+    .run(userId, workspaceId, `${userId}@trevra.test`, workspaceId, NOW.toISOString());
+  const token = randomBytes(32).toString('hex');
+  await db
+    .prepare('INSERT INTO sessions (token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')
+    .run(
+      createHash('sha256').update(token).digest('hex'),
+      userId,
+      new Date(Date.now() + 86_400_000).toISOString(),
+      NOW.toISOString()
+    );
+  return token;
+}
+
+function as(token: string) {
+  const cookie = `trevra_session=${token}`;
+  return {
+    get: (path: string) => request(app).get(path).set('Cookie', cookie),
+    post: (path: string) => request(app).post(path).set('Cookie', cookie),
+    patch: (path: string) => request(app).patch(path).set('Cookie', cookie),
+    put: (path: string) => request(app).put(path).set('Cookie', cookie),
+    delete: (path: string) => request(app).delete(path).set('Cookie', cookie)
+  };
+}
+
+async function clear(workspaceId: string) {
+  await db.prepare('DELETE FROM linkedin_manual_tasks WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_actions WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_campaign_members WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_campaigns WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_workflows WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_lead_contacts WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_lead_lists WHERE workspace_id=?').run(workspaceId);
+  await db.prepare('DELETE FROM linkedin_seats WHERE workspace_id=?').run(workspaceId);
+}
+
+beforeAll(async () => migrateAuthDatabase());
+afterAll(async () => closeAuthDatabase());
+beforeEach(async () => {
+  db = await openDatabase({ connectionString: process.env.TEST_DATABASE_URL, seedDemo: false });
+  app = createApp(db);
+  await clear(A);
+  await clear(B);
+  tokenA = await session(A);
+  tokenB = await session(B);
+  await upsertSeat(
+    db,
+    A,
+    { label: 'Owner A', timezone: 'Europe/Zurich' },
+    new Date('2026-06-01T09:00:00Z')
+  );
+  await upsertSeat(
+    db,
+    B,
+    { label: 'Owner B', timezone: 'Europe/Zurich' },
+    new Date('2026-06-01T09:00:00Z')
+  );
+});
+afterEach(async () => {
+  resetEmailComplianceProvider();
+  await db?.close();
+});
+
+describe('LinkedIn manager HTTP surface', () => {
+  it('requires a Trevra session', async () => {
+    await request(app).get('/api/linkedin/manager/lead-lists').expect(401);
+    await request(app).get('/api/linkedin/manager/analytics').expect(401);
+  });
+
+  it('reviews browser actions only in their own workspace and rejects stale approval hashes', async () => {
+    const action = await recordAction(
+      db,
+      {
+        workspaceId: A,
+        kind: 'dm',
+        targetRef: 'https://linkedin.com/in/maya-review-http/',
+        status: 'planned',
+        source: 'manual',
+        plannedFor: NOW.toISOString()
+      },
+      NOW
+    );
+    await db
+      .prepare('UPDATE linkedin_actions SET body=? WHERE workspace_id=? AND id=?')
+      .run('First message', A, action.id);
+    const path = '/api/linkedin/manager/action-approvals';
+    await request(app).get(path).expect(401);
+    expect((await as(tokenB).get(path).expect(200)).body.reviews).toEqual([]);
+    await as(tokenB)
+      .post(`${path}/${action.id}`)
+      .send({ contentHash: '0'.repeat(64) })
+      .expect(404);
+    const reviews = (await as(tokenA).get(path).expect(200)).body.reviews;
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toMatchObject({
+      actionId: action.id,
+      body: 'First message',
+      seatKey: 'owner',
+      policy: { effect: 'require_approval' },
+      approved: false
+    });
+    await as(tokenA)
+      .post(`${path}/${action.id}`)
+      .send({ contentHash: '0'.repeat(64) })
+      .expect(409);
+    await as(tokenA)
+      .post(`${path}/${action.id}`)
+      .send({ contentHash: reviews[0].contentHash })
+      .expect(200);
+    await as(tokenB).get(`${path}/${action.id}/audit`).expect(404);
+    expect((await as(tokenA).get(`${path}/${action.id}/audit`).expect(200)).body.events).toEqual([
+      expect.objectContaining({
+        decision: 'approved',
+        contentHash: reviews[0].contentHash,
+        actorId: `usr_${A}`
+      })
+    ]);
+    expect((await as(tokenA).get(path).expect(200)).body.reviews).toEqual([]);
+    await db
+      .prepare('UPDATE linkedin_actions SET body=? WHERE workspace_id=? AND id=?')
+      .run('A different message', A, action.id);
+    expect((await as(tokenA).get(path).expect(200)).body.reviews).toMatchObject([
+      { actionId: action.id, body: 'A different message', approved: false }
+    ]);
+  });
+
+  it('saves all new starter templates through the real API without sending or leaking to another workspace', async () => {
+    const route = '/api/linkedin/manager/workflows';
+    for (const recipe of ADDITIONAL_WORKFLOW_STARTERS) {
+      let stepNo = 0;
+      const steps = recipe.build(() => `node-${++stepNo}`);
+      const created = (
+        await as(tokenA)
+          .post(route)
+          .send({ name: recipe.label, scope: 'workspace', steps })
+          .expect(201)
+      ).body.workflow;
+      expect(created.name).toBe(recipe.label);
+      expect(created.steps).toHaveLength(steps.length);
+    }
+    const own = (await as(tokenA).get(route).expect(200)).body.workflows;
+    expect(own.map((row: { name: string }) => row.name).sort()).toEqual(
+      ADDITIONAL_WORKFLOW_STARTERS.map((row) => row.label).sort()
+    );
+    expect((await as(tokenB).get(route).expect(200)).body.workflows).toEqual([]);
+    expect(
+      (
+        await db
+          .prepare('SELECT count(*) AS count FROM linkedin_actions WHERE workspace_id=?')
+          .get<{ count: number }>(A)
+      )?.count
+    ).toBe(0);
+  });
+
+  it('keeps list/workflow/campaign read models workspace-scoped', async () => {
+    const listA = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'A leads', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await as(tokenB)
+      .post('/api/linkedin/manager/lead-lists')
+      .send({ name: 'B leads', sourceKind: 'csv' })
+      .expect(201);
+    const listsA = (await as(tokenA).get('/api/linkedin/manager/lead-lists').expect(200)).body
+      .lists as Array<{ id: string; name: string }>;
+    expect(listsA.map((list) => list.name)).toEqual(['A leads']);
+    await as(tokenB).get(`/api/linkedin/manager/lead-lists/${listA.id}/contacts`).expect(404);
+  });
+
+  it('pages lead review past the first response with strict bounds and tenant isolation', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Page review' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,LinkedIn URL\nMaya,One,Acme,https://linkedin.com/in/api-paged-one/\nMaya,Two,Acme,https://linkedin.com/in/api-paged-two/\nMaya,Three,Acme,https://linkedin.com/in/api-paged-three/'
+      },
+      NOW
+    );
+    const url = `/api/linkedin/manager/lead-lists/${list.id}/contacts`;
+    const first = (await as(tokenA).get(`${url}?limit=2`).expect(200)).body;
+    const second = (await as(tokenA).get(`${url}?limit=2&offset=2`).expect(200)).body;
+    expect(first).toMatchObject({ total: 3, pageLimit: 2, offset: 0, hasMore: true });
+    expect(second).toMatchObject({ total: 3, pageLimit: 2, offset: 2, hasMore: false });
+    expect(
+      [...first.contacts, ...second.contacts].map((entry: { id: string }) => entry.id)
+    ).toHaveLength(3);
+    expect(
+      new Set([...first.contacts, ...second.contacts].map((entry: { id: string }) => entry.id)).size
+    ).toBe(3);
+    await as(tokenB).get(`${url}?limit=1&offset=2`).expect(404);
+    for (const params of [
+      'limit=0',
+      'limit=-1',
+      'limit=5001',
+      'offset=-1',
+      'offset=NaN',
+      'offset=99999999999999999',
+      'limit=1&limit=2'
+    ]) {
+      await as(tokenA).get(`${url}?${params}`).expect(400);
+    }
+    const past = (await as(tokenA).get(`${url}?offset=999&limit=2`).expect(200)).body;
+    expect(past).toMatchObject({ contacts: [], total: 3, hasMore: false });
+  });
+
+  it('searches and reviews all list members, with filtered totals and strict query validation', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Filter review' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,LinkedIn URL\nMaya,Chen,Acme,https://linkedin.com/in/review-api-maya/\nJules,Stone,Percent%Works,https://linkedin.com/in/review-api-jules/'
+      },
+      NOW
+    );
+    const profiles = await importLeadProfileUrls(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        urls: ['https://www.linkedin.com/in/review-api-unknown/']
+      },
+      NOW
+    );
+    expect(profiles.inserted).toBe(1);
+    const url = `/api/linkedin/manager/lead-lists/${list.id}/contacts`;
+    const searched = (await as(tokenA).get(`${url}?query=jules&limit=1`).expect(200)).body;
+    expect(searched).toMatchObject({
+      total: 1,
+      listTotal: 3,
+      identityReviewCount: 1,
+      hasMore: false
+    });
+    expect(searched.contacts[0].firstName).toBe('Jules');
+    const percent = (await as(tokenA).get(`${url}?query=%25`).expect(200)).body;
+    expect(percent.total).toBe(1);
+    expect(percent.contacts[0].company).toBe('Percent%Works');
+    const review = (await as(tokenA).get(`${url}?needsIdentityOnly=true`).expect(200)).body;
+    expect(review).toMatchObject({ total: 1, listTotal: 3, identityReviewCount: 1 });
+    expect(review.contacts[0].firstName).toBe('');
+    const noHit = (await as(tokenA).get(`${url}?query=maya&needsIdentityOnly=true`).expect(200))
+      .body;
+    expect(noHit).toMatchObject({ contacts: [], total: 0, listTotal: 3, identityReviewCount: 1 });
+    for (const invalid of [
+      `query=${'x'.repeat(201)}`,
+      'query=x&query=y',
+      'needsIdentityOnly=1',
+      'needsIdentityOnly=TRUE',
+      'needsIdentityOnly=true&needsIdentityOnly=false'
+    ])
+      await as(tokenA).get(`${url}?${invalid}`).expect(400);
+    await as(tokenB).get(`${url}?query=maya`).expect(404);
+  });
+
+  it('previews and automatches CSV without persisting a contact', async () => {
+    const csv = Buffer.from(
+      'First Name,Last Name,Company,Email\nDr. Maya,Smith,Acme,maya@acme.test\n'
+    );
+    const body = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists/preview')
+        .attach('file', csv, { filename: 'leads.csv', contentType: 'text/csv' })
+        .expect(200)
+    ).body;
+    expect(body.acceptedCount).toBe(1);
+    expect(body.mapping).toMatchObject({
+      firstName: 'First Name',
+      lastName: 'Last Name',
+      company: 'Company'
+    });
+    const count = await db
+      .prepare('SELECT COUNT(*)::int AS total FROM linkedin_lead_contacts WHERE workspace_id=?')
+      .get<{ total: number }>(A);
+    expect(count?.total ?? 0).toBe(0);
+  });
+
+  it('previews and imports a full-name Sales Navigator-style CSV with a mapped Person, without scraping', async () => {
+    const csv = Buffer.from(
+      [
+        'Name,Current Company,Profile URL,Email Address',
+        'Maya Chen,Acme,https://linkedin.com/in/maya-export-api/,maya-export@acme.test'
+      ].join('\n')
+    );
+    const mapping = {
+      fullName: 'Name',
+      company: 'Current Company',
+      profileUrl: 'Profile URL',
+      email: 'Email Address'
+    };
+    const preview = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists/preview')
+        .field('mapping', JSON.stringify(mapping))
+        .attach('file', csv, { filename: 'sales.csv', contentType: 'text/csv' })
+        .expect(200)
+    ).body;
+    expect(preview).toMatchObject({
+      acceptedCount: 1,
+      mapping,
+      accepted: [expect.objectContaining({ firstName: 'Maya', lastName: 'Chen', company: 'Acme' })]
+    });
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Sales CSV', sourceKind: 'sales_navigator' })
+        .expect(201)
+    ).body.list;
+    const imported = (
+      await as(tokenA)
+        .post(`/api/linkedin/manager/lead-lists/${list.id}/import`)
+        .field('mapping', JSON.stringify(mapping))
+        .attach('file', csv, { filename: 'sales.csv', contentType: 'text/csv' })
+        .expect(201)
+    ).body;
+    expect(imported).toMatchObject({ inserted: 1, rejected: [] });
+    const other = (
+      await as(tokenB).get(`/api/linkedin/manager/lead-lists/${list.id}/contacts`).expect(404)
+    ).body;
+    expect(other).toBeDefined();
+    const own = (
+      await as(tokenA).get(`/api/linkedin/manager/lead-lists/${list.id}/contacts`).expect(200)
+    ).body;
+    expect(JSON.stringify(own)).toContain('Maya');
+    expect(JSON.stringify(own)).toContain('Chen');
+  });
+
+  it('supports strict reusable workflow CRUD and rejects unsupported variables', async () => {
+    const valid = {
+      name: 'Founder flow',
+      steps: [
+        {
+          id: 'invite',
+          action: 'connection_request',
+          delayBefore: { amount: 0, unit: 'hours' },
+          config: { message: 'Hi {{first_name}}' }
+        },
+        {
+          id: 'msg',
+          action: 'message',
+          delayBefore: { amount: 2, unit: 'days' },
+          config: {
+            variants: [
+              { id: 'a', body: 'Hi {{first_name}}', weight: 50 },
+              { id: 'b', body: 'Hey {{first_name}} at {{company}}', weight: 50 }
+            ]
+          }
+        }
+      ]
+    };
+    const created = (
+      await as(tokenA).post('/api/linkedin/manager/workflows').send(valid).expect(201)
+    ).body.workflow;
+    expect(created.version).toBe(1);
+    const updated = (
+      await as(tokenA)
+        .put(`/api/linkedin/manager/workflows/${created.id}`)
+        .send({ ...valid, name: 'Founder flow v2' })
+        .expect(200)
+    ).body.workflow;
+    expect(updated.version).toBe(2);
+    await as(tokenA)
+      .post('/api/linkedin/manager/workflows')
+      .send({
+        name: 'bad',
+        steps: [
+          {
+            id: 'invite',
+            action: 'connection_request',
+            delayBefore: { amount: 0, unit: 'hours' },
+            config: { message: 'Hi {{job_title}}' }
+          }
+        ]
+      })
+      .expect(400);
+  });
+
+  it('exposes exact email reviews to the right tenant and approves only the fresh owner-reviewed hash', async () => {
+    registerEmailComplianceProvider({
+      footer: async () =>
+        `Acme, 1 Market St\nPrivacy: https://acme.test/privacy\n${OUTREACH_OPT_OUT_SENTENCE}`,
+      blockers: async () => []
+    });
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Review targets', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,Email,LinkedIn URL\nMaya,Review,Acme,maya-review@acme.test,https://linkedin.com/in/review-api\n'
+      },
+      NOW
+    );
+    const flow = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'Review flow',
+          steps: [
+            {
+              id: 'email',
+              action: 'email',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {
+                subject: 'Hello',
+                variants: [{ id: 'a', body: 'Hi {{first_name}}', weight: 100 }],
+                tracking: 'off',
+                threaded: false
+              }
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const camp = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({
+          name: 'Human review',
+          leadListId: list.id,
+          workflowId: flow.id
+        })
+        .expect(201)
+    ).body.campaign;
+    await db
+      .prepare("UPDATE linkedin_campaigns SET status='running' WHERE workspace_id=? AND id=?")
+      .run(A, camp.id);
+    const member = await db
+      .prepare(
+        'SELECT id,contact_id FROM linkedin_campaign_members WHERE workspace_id=? AND campaign_id=? LIMIT 1'
+      )
+      .get<{ id: string; contact_id: string }>(A, camp.id);
+    await db
+      .prepare(
+        `INSERT INTO connections(id,workspace_id,provider,provider_config_key,
+         external_connection_id,display_name,status,is_demo,mailbox_address,created_at,updated_at)
+       VALUES ('conn_review_api',?,'gmail','trevra-gmail','external-mailbox','Review mailbox',
+        'connected',0,'founder@acme.test',?::timestamptz,?::timestamptz)`
+      )
+      .run(A, NOW.toISOString(), NOW.toISOString());
+    await db
+      .prepare(
+        `INSERT INTO linkedin_campaign_channel_actions
+       (id,workspace_id,campaign_id,member_id,contact_id,workflow_step_id,kind,status,planned_for,
+        payload_json,idempotency_key,connection_id,created_at,updated_at)
+       VALUES ('licha_review_api',?,?,?,?, 'email','email','planned',?::timestamptz,
+        ?::jsonb,'review-api-key','conn_review_api',?::timestamptz,?::timestamptz)`
+      )
+      .run(
+        A,
+        camp.id,
+        member!.id,
+        member!.contact_id,
+        NOW.toISOString(),
+        JSON.stringify({
+          recipient: 'maya-review@acme.test',
+          subject: 'A specific subject',
+          body: 'Hello Maya',
+          tracking: 'off'
+        }),
+        NOW.toISOString(),
+        NOW.toISOString()
+      );
+    const url = `/api/linkedin/manager/campaigns/${camp.id}/email-approvals`;
+    await request(app).get(url).expect(401);
+    await as(tokenB).get(url).expect(404);
+    await as(tokenB)
+      .post(`${url}/licha_review_api`)
+      .send({ contentHash: '0'.repeat(64) })
+      .expect(404);
+    const listResponse = (await as(tokenA).get(url).expect(200)).body;
+    expect(listResponse.reviews).toHaveLength(1);
+    const review = listResponse.reviews[0];
+    expect(review).toMatchObject({
+      actionId: 'licha_review_api',
+      sender: 'founder@acme.test',
+      approved: false,
+      policy: { effect: 'require_approval' }
+    });
+    await as(tokenA)
+      .post(`${url}/licha_review_api`)
+      .send({ contentHash: '0'.repeat(64) })
+      .expect(409);
+    await as(tokenA)
+      .post(`${url}/licha_review_api`)
+      .send({ contentHash: review.contentHash })
+      .expect(200);
+    expect((await as(tokenA).get(url).expect(200)).body.reviews[0].approved).toBe(true);
+    await db
+      .prepare(
+        "UPDATE linkedin_campaign_channel_actions SET payload_json=jsonb_set(payload_json,'{subject}',to_jsonb('CHANGED'::text)) WHERE id='licha_review_api'"
+      )
+      .run();
+    expect((await as(tokenA).get(url).expect(200)).body.reviews[0].approved).toBe(false);
+  });
+
+  it('renames a lead list via authenticated HTTP without altering tenant or campaign references', async () => {
+    const created = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Original name', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    const path = `/api/linkedin/manager/lead-lists/${created.id}`;
+    await as(tokenB).patch(path).send({ name: 'Other workspace' }).expect(404);
+    await as(tokenA).patch(path).send({ name: '   ' }).expect(400);
+    const renamed = (await as(tokenA).patch(path).send({ name: '  Better name  ' }).expect(200))
+      .body.list;
+    expect(renamed).toMatchObject({ id: created.id, name: 'Better name', seatKey: 'owner' });
+    expect(
+      (await as(tokenA).get('/api/linkedin/manager/lead-lists').expect(200)).body.lists
+    ).toMatchObject([expect.objectContaining({ id: created.id, name: 'Better name' })]);
+    expect(
+      (await as(tokenB).get('/api/linkedin/manager/lead-lists').expect(200)).body.lists
+    ).toEqual([]);
+  });
+
+  it('creates a campaign draft with enrollment but zero ledger actions', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Campaign leads', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,LinkedIn URL\nMaya,Smith,Acme,https://linkedin.com/in/maya-smith\n'
+      },
+      NOW
+    );
+    const workflow = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'Draft flow',
+          steps: [
+            {
+              id: 'view',
+              action: 'profile_view',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {}
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const result = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({ name: 'Draft campaign', leadListId: list.id, workflowId: workflow.id })
+        .expect(201)
+    ).body;
+    expect(result.enrolled).toBe(1);
+    expect(result.campaign.status).toBe('draft');
+    const actions = await db
+      .prepare(
+        'SELECT COUNT(*)::int AS total FROM linkedin_actions WHERE workspace_id=? AND campaign_id=?'
+      )
+      .get<{ total: number }>(A, result.campaign.id);
+    expect(actions?.total ?? 0).toBe(0);
+  });
+
+  it('accepts only signed provider email events and applies reply stop exactly once', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Email event leads', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,Email,LinkedIn URL\nMaya,Smith,Acme,maya@example.com,https://linkedin.com/in/maya-email-event\n'
+      },
+      NOW
+    );
+    const workflow = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'Email event flow',
+          steps: [
+            {
+              id: 'email',
+              action: 'email',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {
+                subject: 'Hello',
+                variants: [{ id: 'a', body: 'Hi {{first_name}}', weight: 100 }],
+                threaded: true,
+                tracking: 'off'
+              }
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const campaign = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({ name: 'Email event campaign', leadListId: list.id, workflowId: workflow.id })
+        .expect(201)
+    ).body.campaign;
+    const member = await db
+      .prepare(
+        'SELECT id,contact_id FROM linkedin_campaign_members WHERE workspace_id=? AND campaign_id=? LIMIT 1'
+      )
+      .get<{ id: string; contact_id: string }>(A, campaign.id);
+    expect(member).toBeDefined();
+    await db
+      .prepare(
+        `INSERT INTO linkedin_campaign_channel_actions
+         (id,workspace_id,campaign_id,member_id,contact_id,workflow_step_id,kind,status,planned_for,payload_json,idempotency_key,completed_at,external_ref,provider,created_at,updated_at)
+         VALUES ('licha_signed',?,?,?,?,?,'email','sent',?::timestamptz,'{}'::jsonb,'signed-event-idem',?::timestamptz,'provider-message-42','gmail',?::timestamptz,?::timestamptz)`
+      )
+      .run(
+        A,
+        campaign.id,
+        member!.id,
+        member!.contact_id,
+        'email',
+        NOW.toISOString(),
+        NOW.toISOString(),
+        NOW.toISOString(),
+        NOW.toISOString()
+      );
+    await db
+      .prepare(
+        `INSERT INTO linkedin_actions
+         (id,workspace_id,seat_key,kind,target_ref,status,planned_for,campaign_id,campaign_member_id,source,replay_scope,created_at)
+         VALUES ('lact_after_email',?,'owner','dm','https://linkedin.com/in/maya-email-event','planned',?::timestamptz,?,?,'campaign','after-email',?::timestamptz)`
+      )
+      .run(
+        A,
+        new Date(NOW.getTime() + 3_600_000).toISOString(),
+        campaign.id,
+        member!.id,
+        NOW.toISOString()
+      );
+
+    const oldSecret = process.env.LINKEDIN_CAMPAIGN_EMAIL_WEBHOOK_SECRET;
+    process.env.LINKEDIN_CAMPAIGN_EMAIL_WEBHOOK_SECRET = 'provider-test-secret';
+    const body = JSON.stringify({
+      workspaceId: A,
+      externalRef: 'provider-message-42',
+      eventKind: 'reply',
+      providerEventId: 'provider-event-42',
+      occurredAt: NOW.toISOString()
+    });
+    try {
+      await request(app)
+        .post('/api/webhooks/linkedin-campaign-email')
+        .set('Content-Type', 'application/json')
+        .send(body)
+        .expect(401);
+      const signature = createHmac('sha256', 'provider-test-secret').update(body).digest('hex');
+      const first = await request(app)
+        .post('/api/webhooks/linkedin-campaign-email')
+        .set('Content-Type', 'application/json')
+        .set('x-trevra-signature', `sha256=${signature}`)
+        .send(body)
+        .expect(202);
+      expect(first.body).toMatchObject({ recorded: true, memberId: member!.id });
+      const replay = await request(app)
+        .post('/api/webhooks/linkedin-campaign-email')
+        .set('Content-Type', 'application/json')
+        .set('x-trevra-signature', `sha256=${signature}`)
+        .send(body)
+        .expect(200);
+      expect(replay.body).toMatchObject({ recorded: false, memberId: member!.id });
+    } finally {
+      if (oldSecret === undefined) delete process.env.LINKEDIN_CAMPAIGN_EMAIL_WEBHOOK_SECRET;
+      else process.env.LINKEDIN_CAMPAIGN_EMAIL_WEBHOOK_SECRET = oldSecret;
+    }
+    expect(
+      (
+        await db
+          .prepare('SELECT status FROM linkedin_campaign_members WHERE id=?')
+          .get<{ status: string }>(member!.id)
+      )?.status
+    ).toBe('replied');
+    expect(
+      (
+        await db
+          .prepare("SELECT status FROM linkedin_actions WHERE id='lact_after_email'")
+          .get<{ status: string }>()
+      )?.status
+    ).toBe('skipped');
+  });
+
+  it('reports the missing LinkedIn account as a 400, not a 500, when creating a campaign before one is connected', async () => {
+    const workspaceId = 'ws_li_manager_api_no_seat';
+    const token = await session(workspaceId);
+    const list = (
+      await as(token)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'No seat leads', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      { workspaceId, listId: list.id, csv: 'First Name,Last Name,Company\nMaya,Smith,Acme\n' },
+      NOW
+    );
+    const workflow = (
+      await as(token)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'No seat flow',
+          steps: [
+            {
+              id: 'view',
+              action: 'profile_view',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {}
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const body = (
+      await as(token)
+        .post('/api/linkedin/manager/campaigns')
+        .send({ name: 'No seat campaign', leadListId: list.id, workflowId: workflow.id })
+        .expect(400)
+    ).body;
+    expect(body.error).toMatch(/not configured/i);
+  });
+
+  it('stores additional seat configuration separately from the owner seat', async () => {
+    const second = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/seats')
+        .send({
+          seatKey: 'founder-eu',
+          label: 'Founder EU',
+          timezone: 'Europe/Zurich',
+          workingDays: [1, 2, 3, 4, 5],
+          workStartMinute: 540,
+          workEndMinute: 1020,
+          dailyInviteLimit: 20,
+          dailyMessageLimit: 15,
+          dailyProfileViewLimit: 20,
+          dailyFollowLimit: 10
+        })
+        .expect(201)
+    ).body.seat;
+    expect(second.seatKey).toBe('founder-eu');
+    const seats = (await as(tokenA).get('/api/linkedin/manager/seats').expect(200)).body
+      .seats as Array<{ seatKey: string }>;
+    expect(seats.map((seat) => seat.seatKey).sort()).toEqual(['founder-eu', 'owner']);
+    expect(
+      (await as(tokenB).get('/api/linkedin/manager/seats').expect(200)).body.seats
+    ).toHaveLength(1);
+  });
+
+  it('round-trips human-send mode through the manager seat PATCH API', async () => {
+    const updated = (
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ sendMode: 'human' })
+        .expect(200)
+    ).body.seat as { sendMode: string };
+    expect(updated.sendMode).toBe('human');
+    await as(tokenA)
+      .patch('/api/linkedin/manager/seats/owner')
+      .send({ sendMode: 'robot' })
+      .expect(400);
+    const listed = (await as(tokenB).get('/api/linkedin/manager/seats').expect(200)).body.seats as {
+      sendMode: string;
+    }[];
+    expect(listed.map((seat) => seat.sendMode)).toEqual(['automated']);
+  });
+
+  it('lets the workspace resolve its own handoff and nobody else', async () => {
+    await upsertSeat(db, A, { sendMode: 'human' }, NOW);
+    await db
+      .prepare(
+        `INSERT INTO linkedin_actions (id,workspace_id,seat_key,kind,target_ref,status,planned_for,source,body,created_at)
+           VALUES ('lact_manager_handoff',?,'owner','dm','https://www.linkedin.com/in/handoff-api/','planned',?,'export','Hello',?)`
+      )
+      .run(A, NOW.toISOString(), NOW.toISOString());
+
+    await as(tokenB)
+      .post('/api/linkedin/handoffs/lact_manager_handoff/resolve')
+      .send({ resolution: 'sent' })
+      .expect(404);
+    await as(tokenA)
+      .post('/api/linkedin/handoffs/lact_manager_handoff/resolve')
+      .send({ resolution: 'later' })
+      .expect(400);
+    const done = await as(tokenA)
+      .post('/api/linkedin/handoffs/lact_manager_handoff/resolve')
+      .send({ resolution: 'sent' })
+      .expect(200);
+    expect(done.body.handoff).toEqual({ actionId: 'lact_manager_handoff', status: 'sent' });
+  });
+
+  it('refuses to switch a seat back to automatic while a presented handoff waits, and allows it otherwise', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+    try {
+      await upsertSeat(db, A, { sendMode: 'human' }, NOW);
+      // Nothing waiting: the switch is fine, and a patch without sendMode never checks.
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ label: 'Renamed' })
+        .expect(200);
+      await db
+        .prepare(
+          `INSERT INTO linkedin_actions (id,workspace_id,seat_key,kind,target_ref,status,planned_for,source,body,created_at)
+           VALUES ('lact_manager_switch',?,'owner','dm','https://www.linkedin.com/in/switch-api/','planned',?,'export','Hello',?)`
+        )
+        .run(A, new Date(NOW.getTime() - 60_000).toISOString(), NOW.toISOString());
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ label: 'Renamed again' })
+        .expect(200);
+      // Today shows it to the founder; from then on it blocks the switch.
+      const today = await as(tokenA).get('/api/today').expect(200);
+      expect(
+        (today.body.needsAttention as { kind: string; reference: { id: string } }[])
+          .filter((item) => item.kind === 'linkedin_handoff_waiting')
+          .map((item) => item.reference.id)
+      ).toEqual(['lact_manager_switch']);
+      const refused = await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ sendMode: 'automated' })
+        .expect(409);
+      expect(refused.body.error).toContain('A LinkedIn handoff is waiting in Today');
+      // Saturday: the gate would hold the row back, the guard still does not.
+      vi.setSystemTime(new Date('2026-08-15T09:00:00.000Z'));
+      await as(tokenA).put('/api/linkedin/seat').send({ sendMode: 'automated' }).expect(409);
+      await as(tokenA)
+        .post('/api/linkedin/manager/seats')
+        .send({
+          seatKey: 'owner',
+          label: 'Renamed again',
+          timezone: 'Europe/Zurich',
+          sendMode: 'automated'
+        })
+        .expect(409);
+      await as(tokenA)
+        .post('/api/linkedin/handoffs/lact_manager_switch/resolve')
+        .send({ resolution: 'skip' })
+        .expect(200);
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ sendMode: 'automated' })
+        .expect(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('round-trips the account warm-up override through the manager seat PATCH API', async () => {
+    const updated = (
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner')
+        .send({ warmupOverride: true })
+        .expect(200)
+    ).body.seat as { warmupOverride: boolean };
+    expect(updated.warmupOverride).toBe(true);
+
+    const capabilities = (
+      await as(tokenA)
+        .patch('/api/linkedin/manager/seats/owner/capabilities')
+        .send({
+          inmail: 'unknown',
+          premium: false,
+          salesNavigator: false,
+          recruiter: false,
+          inmailMonthlyBudget: null,
+          inmailPaidCreditCap: null
+        })
+        .expect(200)
+    ).body.seat as {
+      warmupOverride: boolean;
+      capabilities: { inmail: string };
+    };
+    expect(capabilities.warmupOverride).toBe(true);
+    expect(capabilities.capabilities.inmail).toBe('unknown');
+
+    const updatedSeats = (await as(tokenA).get('/api/linkedin/manager/seats').expect(200)).body
+      .seats as Array<{
+      seatKey: string;
+      warmupOverride: boolean;
+    }>;
+    expect(updatedSeats.find((seat) => seat.seatKey === 'owner')?.warmupOverride).toBe(true);
+  });
+
+  it('requires an active campaign to be stopped before it can be deleted', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Delete lifecycle', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    const workflow = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'Delete lifecycle flow',
+          steps: [
+            {
+              id: 'view',
+              action: 'profile_view',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {}
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const campaign = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({ name: 'Delete lifecycle', leadListId: list.id, workflowId: workflow.id })
+        .expect(201)
+    ).body.campaign;
+
+    await as(tokenA)
+      .post(`/api/linkedin/manager/campaigns/${campaign.id}/start`)
+      .send({})
+      .expect(200);
+    const refused = await as(tokenA)
+      .delete(`/api/linkedin/manager/campaigns/${campaign.id}`)
+      .expect(409);
+    expect(refused.body.error).toMatch(/stop it first/i);
+
+    await as(tokenA)
+      .post(`/api/linkedin/manager/campaigns/${campaign.id}/stop`)
+      .send({})
+      .expect(200);
+    await as(tokenA).delete(`/api/linkedin/manager/campaigns/${campaign.id}`).expect(200);
+    await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaign.id}`).expect(404);
+  });
+
+  it('only exposes safety-reducing member controls and releases the active lead claim on remove', async () => {
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Safe controls', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,LinkedIn URL\nMaya,Smith,Acme,https://linkedin.com/in/safe-maya\n'
+      },
+      NOW
+    );
+    const workflow = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows')
+        .send({
+          name: 'Safe flow',
+          steps: [
+            {
+              id: 'view',
+              action: 'profile_view',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {}
+            }
+          ]
+        })
+        .expect(201)
+    ).body.workflow;
+    const campaign = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({ name: 'Safety controls', leadListId: list.id, workflowId: workflow.id })
+        .expect(201)
+    ).body.campaign;
+    const detail = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaign.id}`).expect(200)
+    ).body;
+    const member = detail.members[0];
+    await as(tokenA).post(`/api/linkedin/manager/members/${member.id}/pause`).send({}).expect(200);
+    const paused = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaign.id}`).expect(200)
+    ).body.members[0];
+    expect(paused.status).toBe('paused');
+    await as(tokenA).delete(`/api/linkedin/manager/members/${member.id}`).expect(200);
+    const removed = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaign.id}`).expect(200)
+    ).body.members[0];
+    expect(removed.status).toBe('removed');
+  });
+
+  it('previews launch capacity and exposes wave, queue, control, duplicate, and member timeline operations', async () => {
+    // This case asserts campaign-day allocation, not working-hours behavior. Keep the
+    // seat open for the whole week so the test is deterministic on evenings/weekends.
+    await upsertSeat(
+      db,
+      A,
+      {
+        label: 'Owner A',
+        timezone: 'Europe/Zurich',
+        workingDays: [0, 1, 2, 3, 4, 5, 6],
+        workStartMinute: 0,
+        workEndMinute: 1440
+      },
+      NOW
+    );
+    const list = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/lead-lists')
+        .send({ name: 'Wave controls', sourceKind: 'csv' })
+        .expect(201)
+    ).body.list;
+    await importLeadCsv(
+      db,
+      {
+        workspaceId: A,
+        listId: list.id,
+        csv: 'First Name,Last Name,Company,LinkedIn URL\nMaya,Smith,Acme,https://linkedin.com/in/wave-maya\nNoah,Jones,Beta,https://linkedin.com/in/wave-noah\n'
+      },
+      NOW
+    );
+    const flow = {
+      name: 'Wave graph',
+      steps: [
+        {
+          id: 'view',
+          action: 'profile_view',
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: 'end',
+          config: {}
+        },
+        {
+          id: 'end',
+          action: 'end',
+          delayBefore: { amount: 0, unit: 'hours' },
+          config: { outcome: 'completed' }
+        }
+      ]
+    };
+    const validation = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/workflows/validate')
+        .send({ steps: flow.steps })
+        .expect(200)
+    ).body;
+    expect(validation).toMatchObject({ valid: true, issues: [] });
+    const workflow = (
+      await as(tokenA).post('/api/linkedin/manager/workflows').send(flow).expect(201)
+    ).body.workflow;
+    const preview = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns/preview')
+        .send({
+          leadListId: list.id,
+          workflowId: workflow.id,
+          admissionPolicy: { maxWaveSize: 1 }
+        })
+        .expect(200)
+    ).body.preview;
+    expect(preview.audience).toBe(2);
+    expect(preview.firstWaveSize).toBe(1);
+    expect(preview.dayOneCapacity.profile_view).toBeGreaterThan(0);
+
+    const created = (
+      await as(tokenA)
+        .post('/api/linkedin/manager/campaigns')
+        .send({
+          name: 'Wave operations',
+          leadListId: list.id,
+          workflowId: workflow.id,
+          priority: 'high',
+          admissionPolicy: { maxWaveSize: 1 }
+        })
+        .expect(201)
+    ).body;
+    expect(created.campaign.pendingCount).toBe(2);
+    const campaignId = created.campaign.id as string;
+    await as(tokenA)
+      .post(`/api/linkedin/manager/campaigns/${campaignId}/start`)
+      .send({})
+      .expect(200);
+    await as(tokenA).post('/api/linkedin/manager/tick').send({}).expect(200);
+
+    const operations = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaignId}/operations`).expect(200)
+    ).body;
+    expect(operations.queues.pending).toBe(1);
+    expect(operations.queues.allocatedCampaignDay.profile_view).toBe(1);
+    expect(
+      operations.queues.queuedReady +
+        operations.queues.scheduledFuture +
+        operations.queues.executing
+    ).toBe(1);
+    const activeMember = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaignId}`).expect(200)
+    ).body.members.find((value: { waveId: string | null }) => value.waveId);
+    expect(activeMember.lastAction).toMatchObject({ kind: 'profile_view', status: 'planned' });
+    expect(activeMember.lastAction.plannedFor).toEqual(expect.any(String));
+    expect(operations.waves).toHaveLength(1);
+    expect(operations.waves[0]).toMatchObject({ ordinal: 1, memberCount: 1 });
+    expect(operations.waves[0].stepFunnel[0]).toMatchObject({ stepId: 'view', planned: 1 });
+
+    await as(tokenA)
+      .patch(`/api/linkedin/manager/campaigns/${campaignId}/controls`)
+      .send({ priority: 'low' })
+      .expect(200);
+    await as(tokenA)
+      .patch(`/api/linkedin/manager/campaigns/${campaignId}/controls`)
+      .send({ admissionPolicy: { maxWaveSize: 2 } })
+      .expect(409);
+    await as(tokenA)
+      .post(`/api/linkedin/manager/campaigns/${campaignId}/pause`)
+      .send({})
+      .expect(200);
+    const controls = (
+      await as(tokenA)
+        .patch(`/api/linkedin/manager/campaigns/${campaignId}/controls`)
+        .send({
+          admissionPolicy: { maxWaveSize: 2, minWaveIntervalMinutes: 30 },
+          schedule: { workingDays: [1, 2, 3, 4, 5], workStartMinute: 540, workEndMinute: 1020 }
+        })
+        .expect(200)
+    ).body.campaign;
+    expect(controls.admissionPolicy.maxWaveSize).toBe(2);
+    expect(controls.schedule.workingDays).toEqual([1, 2, 3, 4, 5]);
+
+    const member = (
+      await as(tokenA).get(`/api/linkedin/manager/campaigns/${campaignId}`).expect(200)
+    ).body.members.find((value: { waveId: string | null }) => value.waveId);
+    const timeline = (
+      await as(tokenA).get(`/api/linkedin/manager/members/${member.id}/timeline`).expect(200)
+    ).body;
+    expect(timeline.events.some((event: { kind: string }) => event.kind === 'wave')).toBe(true);
+    expect(timeline.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'action',
+          stepId: 'view',
+          stepLabel: 'profile view',
+          senderKey: 'owner'
+        })
+      ])
+    );
+    await as(tokenA).post(`/api/linkedin/manager/members/${member.id}/skip`).send({}).expect(200);
+
+    const duplicate = (
+      await as(tokenA)
+        .post(`/api/linkedin/manager/campaigns/${campaignId}/duplicate`)
+        .send({ name: 'Wave copy' })
+        .expect(201)
+    ).body;
+    expect(duplicate.campaign).toMatchObject({ name: 'Wave copy', status: 'draft' });
+    expect(duplicate.campaign.id).not.toBe(campaignId);
+  });
+});

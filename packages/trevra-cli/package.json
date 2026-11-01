@@ -1,0 +1,39 @@
+{
+  "name": "trevra",
+  "version": "0.2.2",
+  "description": "Trevra companion CLI — run hosted LinkedIn automation through your own computer and browser.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "bin": {
+    "trevra": "bin/trevra.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.node.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olaryn-lab/trevra.git"
+  },
+  "homepage": "https://app.usetrevra.com",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "trevra",
+    "linkedin",
+    "companion",
+    "automation"
+  ],
+  "dependencies": {
+    "playwright": "^1.62.1",
+    "ws": "^8.21.3"
+  }
+}
