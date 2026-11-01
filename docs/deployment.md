@@ -1,0 +1,152 @@
+# Trevra deployment and data durability
+
+## PostgreSQL-only policy
+
+Trevra refuses to start without `DATABASE_URL`, and the URL must begin with `postgres://` or `postgresql://`. Both the commercial graph and Better Auth use PostgreSQL. No embedded database is present in the runtime image.
+
+## Migrations
+
+Application migrations are stored in `migrations/` and recorded in `schema_migrations`. `migrations/README.md` states the rules a migration file has to follow, including how a file opts out of its transaction for `CREATE INDEX CONCURRENTLY`.
+
+Applying migrations and opening a database are separate operations:
+
+- **Hosted** (`TREVRA_DEPLOYMENT_MODE=hosted`): run the migration job once per rollout, before the new revision receives traffic — `npm run db:migrate`, or `node dist-server/server/migrate-job.js` in the shipped image. Pods then verify the schema on boot and refuse to start if it is behind the build they are running. They never apply migrations themselves.
+- **Local or single-node self-host** (the default): `npm start`, `npm run dev` and the test harness apply pending migrations on the way up, so no extra step exists.
+- `DATABASE_AUTO_MIGRATE=true|false` overrides either default.
+
+The job uses a dedicated connection with no statement timeout — a data-rewriting migration over millions of rows is allowed to outlast the 30s request-pool limit — a short `lock_timeout` so a migration waiting on a live table fails fast instead of queueing traffic behind it, and one transaction per file so a failure part-way leaves the earlier files applied and the retry resumes. A session-scoped advisory lock lets several instances or two copies of the job start at once with only one applying anything.
+
+## Local development stack
+
+`compose.dev.yml` deliberately uses uncommon, independently configurable host ports from `.env.dev` and two PostgreSQL databases:
+
+- `postgres`: Trevra application data plus Better Auth users, sessions, and organizations;
+- `nango-db`: Nango provider configuration, encrypted credentials, sync records, and internal state.
+
+This keeps Nango infrastructure failures and schema changes outside Trevra's commercial ledger. Redis is also isolated to Nango.
+
+Run `npm run dev:setup` once before the first local stack start. It creates `.env.dev` when needed, generates the local Trevra/Companion and Nango encryption keys, and installs/registers the per-user Companion without pairing it. The normal `docker compose ... up` and `npm run dev` commands remain non-mutating and do not reinstall OS services.
+
+Persistent Docker volumes:
+
+- `trevra-postgres-data`;
+- `nango-postgres-data`;
+- `nango-redis-data`;
+- `trevra-node-modules`.
+
+Internal container ports remain standard, while host ports use the `TREVRA_*_PORT` and `NANGO_*_PORT` variables.
+
+FOSS/local authentication is provided directly by Better Auth using email/password credentials stored in Trevra's PostgreSQL database. Authward is intentionally absent from the local dependency graph. In managed hosted mode, Trevra disables its password login and delegates identity to Authward instead.
+
+Do not run `docker compose down -v` unless you intend to destroy all local data.
+
+## Cloud Run and Cloud SQL
+
+The Terraform configuration mounts Cloud SQL at `/cloudsql` and injects a PostgreSQL Unix-socket URL from Secret Manager. The runtime service account receives only Cloud SQL Client and access to Trevra's named secrets.
+
+Hosted Trevra also depends on the shared identity and commercial services:
+
+- `AUTHWARD_ISSUER=https://auth.olaryn.com` and `AUTHWARD_CLIENT_ID=trevra-web` establish the hosted browser identity boundary.
+- Billing is opt-in until the shared Billing/OpenMeter production service is deployed. When enabled, `BILLING_BASE_URL=https://billing.olaryn.com`, `BILLING_CLIENT_ID=trevra-billing`, and `BILLING_AUDIENCE=https://billing.olaryn.com` establish the shared commercial-service boundary.
+- `BILLING_CLIENT_SECRET` is the confidential Authward credential for `trevra-billing`. When non-empty, Terraform stores it in Secret Manager and injects the complete Billing configuration into both API and worker revisions. When empty, Terraform injects no Billing variables at all.
+
+The Billing secret must be the same credential configured for the `trevra-billing` client in hosted Authward. Rotating that client therefore requires updating the Terraform input and rolling Trevra after Authward accepts the new credential.
+
+Cloud Monitoring performs an external HTTPS check of `/api/health` every five minutes and sends an email alert after sustained failures. The same policy warns when the public TLS certificate has fewer than 15 days remaining. Confirm the monitoring notification email after deployment.
+
+Cloud SQL is configured with:
+
+- PostgreSQL 16;
+- regional high availability;
+- SSD storage with autoresize;
+- automated backups;
+- 14 retained backups;
+- seven days of point-in-time recovery logs;
+- Query Insights;
+- deletion protection by default.
+
+Keep Cloud Run and Cloud SQL in the same region. Size the connection pool using:
+
+```text
+maximum possible connections ≈ Cloud Run max instances × DATABASE_POOL_MAX
+```
+
+Leave headroom for Better Auth, migrations, administration, and failover. Trevra defaults to ten application connections and five Better Auth connections per instance. Reduce these values before increasing Cloud Run's maximum instance count.
+
+Every pool bound is per deployment: `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_MS`, `DATABASE_IDLE_TIMEOUT_MS`, `DATABASE_STATEMENT_TIMEOUT_MS`. When a pool does run out, the waiting caller receives `PostgreSQL pool exhausted: ...` naming its own stack frames and the pool census (`max`, `open`, `idle`, `waiting`) rather than a bare connect timeout, and any checkout held longer than `DATABASE_POOL_CHECKOUT_WARN_MS` (default 15000, 0 disables) logs the holder while it still holds it. Both lines name the code to fix; neither is a substitute for raising the ceiling.
+
+## Terraform state
+
+Generated database and application secrets are represented in Terraform state. `infra/gcp/backend.tf` therefore requires an encrypted, versioned GCS backend. Run `infra/gcp/bootstrap.sh` before `infra/gcp/deploy.sh`.
+
+Restrict access to the state bucket. Do not copy state files into source control or developer chat systems.
+
+## Custom domains and hosted identity
+
+`APP_ORIGIN` and `BETTER_AUTH_URL` must be final HTTPS origins. Configure the Cloud Run custom domain or external HTTPS load balancer before enabling production sign-in callbacks.
+
+Hosted Trevra does not own Google, GitHub, Microsoft, or Apple OAuth credentials. Configure those upstream providers on Authward and register Trevra's Authward callback (`${BETTER_AUTH_URL}/api/auth/oauth2/callback/authward`) with the `trevra-web` client there. Trevra receives only the Authward issuer/client credentials. Workspace Gmail and Calendar access remains a separate Nango authorization.
+
+Nango needs browser-reachable HTTPS endpoints for its API/dashboard and Connect UI. `NANGO_HOST` and `NANGO_PUBLIC_SERVER_URL` should point to the public Nango API origin from Trevra's production environment.
+
+## Self-hosted Nango
+
+The repository includes:
+
+- `compose.dev.yml` for local Nango;
+- `compose.nango.production.yml` for a long-running production host;
+- `.env.nango.production.example` for required configuration.
+
+The production Compose stack expects:
+
+- a Nango-specific Cloud SQL PostgreSQL instance or database;
+- a Redis endpoint such as Memorystore;
+- a VM service account with Cloud SQL Client permission;
+- an HTTPS reverse proxy or load balancer;
+- durable backups of the Nango encryption key.
+
+Do not use Trevra's PostgreSQL database credentials for Nango. A shared Cloud SQL instance may be acceptable at very small scale, but use separate databases and users at minimum. A separate instance gives stronger resource and failure isolation.
+
+Pin the Nango image to a tested version or immutable digest before production. Review the licensing and feature set of the selected self-hosted Nango edition.
+
+## Backup and restore controls
+
+Cloud SQL backups are not sufficient until restore is tested. Recommended routine:
+
+1. Keep automated backups and PITR enabled.
+2. Create an on-demand backup before risky application or provider migrations.
+3. Export logical backups periodically to a bucket with retention and object versioning.
+4. Restore into an isolated instance at least quarterly.
+5. Run application health checks and row-count/business invariants against the restored instance.
+6. Document recovery point and recovery time results.
+
+Nango's PostgreSQL data and encryption key must be backed up together. A database restore without the matching encryption key cannot decrypt stored provider credentials.
+
+## Deployment order
+
+1. Create DNS names for Trevra and Nango.
+2. Deploy and secure the Nango production stack.
+3. Configure Nango providers, callbacks, and Trevra canonical sync/action functions.
+4. Record the Nango API key and webhook signing key.
+5. Bootstrap the Terraform state bucket.
+6. Deploy Trevra through `infra/gcp/deploy.sh`.
+7. Map the Trevra custom domain and verify Better Auth callbacks.
+8. Point Nango webhooks to `https://<trevra-domain>/api/webhooks/nango`.
+9. Point Stripe webhooks to `https://<trevra-domain>/api/webhooks/stripe` when enabled.
+10. Perform an end-to-end test with provider sandbox accounts.
+
+## Cloud Run Compose reference
+
+`compose.gcp.yml` demonstrates the requested Cloud Run multi-container shape with a Cloud SQL Auth Proxy sidecar. Cloud Run Compose support is useful for previews and simple deployments, but the Terraform resources are the maintained production configuration because they express Cloud SQL HA, backups, IAM, Secret Manager, deletion protection, and remote state explicitly.
+
+## Native Trevra passkeys (opt-in)
+
+`TREVRA_NATIVE_PASSKEY_ENABLED=true` enables Trevra-domain WebAuthn only in
+hosted production with the legacy `trevra-web` Authward authority and canonical
+`APP_ORIGIN=https://app.usetrevra.com`. The default is disabled. First deploy
+Authward's `product-rp-passkeys.ts` Trevra origin and prove its exact CORS
+allowlist; then ship and enable the Trevra feature flag. Existing Authward RP
+passkeys do not work on the Trevra RP and are not migrated. The Trevra
+Setup → Workspace page contains new enrollment after a recent social/email
+sign-in. See `docs/release/2026-10-22-trevra-native-passkey-handover.md` for
+security checks and the supervised acceptance sequence.

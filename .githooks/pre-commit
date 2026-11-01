@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Pre-commit hook -- format staged files, typecheck, block large files.
+# Uses NUL-delimited Git paths throughout: research reports and other legitimate
+# filenames may contain spaces, tabs or unicode.
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+get_file_size() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    stat -f%z "$1" 2>/dev/null
+  else
+    stat -c%s "$1" 2>/dev/null
+  fi
+}
+
+FILES_TO_CHECK=()
+if (($# > 0)); then
+  FILES_TO_CHECK=("$@")
+else
+  mapfile -d '' -t FILES_TO_CHECK < <(git diff --cached --name-only -z --diff-filter=ACM)
+fi
+if ((${#FILES_TO_CHECK[@]} == 0)); then
+  echo "No staged files to check."
+  exit 0
+fi
+
+FORMAT_FILES=()
+TS_FILES=()
+for f in "${FILES_TO_CHECK[@]}"; do
+  case "$f" in
+    *.ts|*.tsx|*.js|*.jsx|*.json|*.css|*.scss|*.html|*.md|*.yml|*.yaml)
+      FORMAT_FILES+=("$f") ;;
+  esac
+  case "$f" in *.ts|*.tsx) TS_FILES+=("$f");; esac
+done
+
+if ((${#FORMAT_FILES[@]} > 0)); then
+  echo "Running Prettier on staged files..."
+  HAD_UNSTAGED=0
+  git diff --quiet || HAD_UNSTAGED=1
+  npx prettier --write -- "${FORMAT_FILES[@]}"
+  FORMATTED_FILES=()
+  mapfile -d '' -t FORMATTED_FILES < <(git diff --name-only -z -- "${FORMAT_FILES[@]}")
+  if ((${#FORMATTED_FILES[@]} > 0)); then
+    if ((HAD_UNSTAGED == 0)); then
+      echo "Auto-staging formatting changes..."
+      git add -- "${FORMATTED_FILES[@]}"
+    else
+      echo "FORMATTING APPLIED -- COMMIT ABORTED"
+      printf '  - %s\n' "${FORMATTED_FILES[@]}"
+      echo "(git commit --no-verify to bypass)"
+      exit 1
+    fi
+  fi
+fi
+
+if ((${#TS_FILES[@]} > 0)); then
+  echo "Running typecheck..."
+  if ! npm run -s typecheck; then
+    echo "Typecheck failed. Fix the issues above or use 'git commit --no-verify' to bypass."
+    exit 1
+  fi
+fi
+
+MAX_SIZE=$((10 * 1024 * 1024))
+LARGE_FILES=()
+for f in "${FILES_TO_CHECK[@]}"; do
+  if [[ -f "$f" ]]; then
+    size="$(get_file_size "$f")"
+    if [[ -n "$size" && "$size" -gt "$MAX_SIZE" ]]; then
+      LARGE_FILES+=("$f")
+    fi
+  fi
+done
+if ((${#LARGE_FILES[@]} > 0)); then
+  echo "Large files detected (>10MB):"
+  printf '  - %s\n' "${LARGE_FILES[@]}"
+  echo "Use 'git commit --no-verify' to bypass."
+  exit 1
+fi
+
+echo "All pre-commit checks passed."

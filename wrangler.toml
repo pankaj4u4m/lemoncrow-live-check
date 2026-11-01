@@ -1,0 +1,5 @@
+# Marketing site: static Vite output deployed to the existing Cloudflare Pages
+# project. The apex usetrevra.com is already attached to that Pages project.
+name = "trevra-site"
+compatibility_date = "2026-07-01"
+pages_build_output_dir = "./dist"

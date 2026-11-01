@@ -1,0 +1,1487 @@
+import { id, type Db } from '../db.js';
+import { normalizeExplicitPhone, resolveContact } from '../lead-capture/people.js';
+import { LeadCaptureError } from '../lead-capture/types.js';
+import {
+  createSuppression,
+  liftSuppressionsBySource,
+  withSuppressionBoundary
+} from '../suppressions.js';
+// `LinkedInApiError` and not a bare Error, for `deleteLeadList`'s refusal
+// alone: it is the only thing in this file a route must turn into a 409 rather
+// than a 400, and carrying the status on the error is how every other refusal
+// in this subsystem reaches the response without the route re-deciding it.
+// errors.ts is a leaf with no imports of its own, so this direction adds no
+// cycle.
+import { LinkedInApiError } from './errors.js';
+import {
+  canonicalProfileUrl,
+  leadDedupeKey,
+  normalizeLeadRow,
+  normalizeScrapedLead,
+  parseLeadCsv,
+  type LeadFieldMapping,
+  type NormalizedLeadInput
+} from './lead-import.js';
+import { LEAD_READ_LIMIT, getLeadSource, listLeads, type LeadSourceKind } from './leads.js';
+import { OWNER_SEAT_KEY } from './seats.js';
+
+/**
+ * HOW MANY CONTACTS ARE EVER READ OUT OF ONE LIST AT ONCE. The default and the
+ * ceiling, deliberately the same number, exported for the same reason
+ * `LEAD_READ_LIMIT` is: the route used to pass a literal 5000, this function
+ * used to default to 1000, and the screen printed "the first 1,000 are shown"
+ * over whichever of the two had actually happened. Three numbers for one fact
+ * is three chances to be wrong about it.
+ *
+ * Pair it with {@link countLeadContacts} (or `LinkedInLeadList.leadCount`,
+ * which is the same total) so a truncated page can say what it truncated.
+ */
+export const LEAD_CONTACT_READ_LIMIT = 5_000;
+
+export type LeadListSourceKind =
+  | 'csv'
+  | 'profile_urls'
+  | 'linkedin_search'
+  | 'sales_navigator'
+  | 'post_keyword'
+  | 'recruiter'
+  | 'group_members'
+  | 'event_attendees'
+  | 'company_employees'
+  | 'signal';
+
+export type LeadSignalKind = 'profile_viewed' | 'post_engaged' | 'event_attended' | 'job_changed';
+
+export interface LeadSignalIngestResult {
+  signalId: string;
+  contactId: string;
+  listId: string;
+  duplicateSignal: boolean;
+  insertedContact: boolean;
+  reusedContact: boolean;
+}
+
+export interface LinkedInLeadList {
+  id: string;
+  workspaceId: string;
+  seatKey: string;
+  name: string;
+  sourceKind: LeadListSourceKind;
+  sourceRef: string | null;
+  leadCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LinkedInLeadContact {
+  id: string;
+  workspaceId: string;
+  /**
+   * The list this person FIRST arrived in, or null once that list has been
+   * deleted.
+   *
+   * NULLABLE SINCE MIGRATION 053, and the null is the point. Until then this
+   * column was a hard owner -- NOT NULL, ON DELETE CASCADE -- so deleting a
+   * list would have deleted every person who happened to have entered the
+   * workspace through it, INCLUDING the ones sitting in five other lists.
+   * Migration 052 wrote that danger down in so many words and asked whoever
+   * added a delete route to fix the FK first; 053 is that fix and this is the
+   * type catching up with it. A person outlives the list they came in through.
+   *
+   * Reads that go through the membership table (`listLeadContacts`, and
+   * anything using `MEMBER_CONTACT_SELECT`) never see the null: there the
+   * column is the list actually being asked about.
+   */
+  listId: string | null;
+  /** Canonical GTM Person when deterministic identity has been resolved. */
+  personId: string | null;
+  personResolutionStatus: 'unresolved' | 'resolved' | 'insufficient_identity' | 'conflict';
+  firstName: string;
+  lastName: string;
+  company: string;
+  email: string | null;
+  emailSource: string | null;
+  emailProvenance: string | null;
+  emailConfidence: number | null;
+  emailVerificationStatus: string | null;
+  phone: string | null;
+  country: string | null;
+  profileUrl: string | null;
+  doNotContact: boolean;
+  customFields: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ListRow {
+  id: string;
+  workspace_id: string;
+  seat_key: string;
+  name: string;
+  source_kind: string;
+  source_ref: string | null;
+  lead_count: number;
+  created_at: string;
+  updated_at: string;
+}
+interface ContactRow {
+  id: string;
+  workspace_id: string;
+  list_id: string | null;
+  person_id: string | null;
+  person_resolution_status: string;
+  first_name: string;
+  last_name: string;
+  company: string;
+  email: string | null;
+  email_source: string | null;
+  email_provenance: string | null;
+  email_confidence: number | null;
+  email_verification_status: string | null;
+  phone: string | null;
+  country: string | null;
+  profile_url: string | null;
+  do_not_contact: boolean;
+  custom_fields_json: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+// The count comes off the MEMBERSHIP table, not off `linkedin_lead_contacts.
+// list_id`: since migration 051 a person may sit in several lists while still
+// being one contact row, and the column only records the list they first
+// landed in.
+const LIST_SELECT = `l.id,l.workspace_id,l.seat_key,l.name,l.source_kind,l.source_ref,l.created_at,l.updated_at,(SELECT COUNT(*)::int FROM linkedin_lead_list_members m WHERE m.list_id=l.id) AS lead_count`;
+const CONTACT_SELECT = `id,workspace_id,list_id,person_id,person_resolution_status,first_name,last_name,company,email,email_source,email_provenance,email_confidence,email_verification_status,phone,country,profile_url,do_not_contact,custom_fields_json,created_at,updated_at`;
+/** The same columns through the membership join, where `list_id` is the list asked for. */
+const MEMBER_CONTACT_SELECT = `c.id,c.workspace_id,m.list_id,c.person_id,c.person_resolution_status,c.first_name,c.last_name,c.company,c.email,c.email_source,c.email_provenance,c.email_confidence,c.email_verification_status,c.phone,c.country,c.profile_url,c.do_not_contact,c.custom_fields_json,c.created_at,c.updated_at`;
+
+function toList(row: ListRow): LinkedInLeadList {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    seatKey: row.seat_key,
+    name: row.name,
+    sourceKind: row.source_kind as LeadListSourceKind,
+    sourceRef: row.source_ref,
+    leadCount: Number(row.lead_count),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function customFieldsFromDb(value: unknown): Record<string, string> {
+  const raw =
+    typeof value === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(value) as unknown;
+          } catch {
+            return {};
+          }
+        })()
+      : value;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string'
+    )
+  );
+}
+
+function toContact(row: ContactRow): LinkedInLeadContact {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    listId: row.list_id,
+    personId: row.person_id,
+    personResolutionStatus:
+      row.person_resolution_status as LinkedInLeadContact['personResolutionStatus'],
+    firstName: row.first_name,
+    lastName: row.last_name,
+    company: row.company,
+    email: row.email,
+    emailSource: row.email_source,
+    emailProvenance: row.email_provenance,
+    emailConfidence: row.email_confidence === null ? null : Number(row.email_confidence),
+    emailVerificationStatus: row.email_verification_status,
+    phone: row.phone,
+    country: row.country,
+    profileUrl: row.profile_url,
+    doNotContact: Boolean(row.do_not_contact),
+    customFields: customFieldsFromDb(row.custom_fields_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+export function assertLeadSourceUrl(
+  kind: Extract<LeadListSourceKind, 'linkedin_search' | 'sales_navigator'>,
+  raw: string
+): string {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error('Lead source must be an absolute LinkedIn URL.');
+  }
+  if (!['linkedin.com', 'www.linkedin.com'].includes(url.hostname.toLowerCase()))
+    throw new Error('Lead source must be on linkedin.com.');
+  if (kind === 'linkedin_search' && !/^\/search\/results\/people\/?/i.test(url.pathname))
+    throw new Error('Basic LinkedIn source must be a People search-results URL.');
+  if (kind === 'sales_navigator' && !/^\/sales\/search\/people\/?/i.test(url.pathname))
+    throw new Error('Sales Navigator source must be a people-search URL.');
+  return url.toString();
+}
+
+export async function createLeadList(
+  db: Db,
+  input: {
+    workspaceId: string;
+    seatKey?: string;
+    name: string;
+    sourceKind?: LeadListSourceKind;
+    sourceRef?: string | null;
+  },
+  now: Date = new Date()
+): Promise<LinkedInLeadList> {
+  const name = input.name.trim();
+  if (!name) throw new Error('Lead list name is required.');
+  const sourceKind = input.sourceKind ?? 'csv';
+  const sourceRef =
+    sourceKind === 'linkedin_search'
+      ? assertLeadSourceUrl(sourceKind, input.sourceRef ?? '')
+      : sourceKind === 'sales_navigator'
+        ? input.sourceRef?.trim()
+          ? assertLeadSourceUrl(sourceKind, input.sourceRef)
+          : null // A manually uploaded Sales Navigator-style CSV has no search URL.
+        : input.sourceRef?.trim() || null;
+  const timestamp = now.toISOString();
+  const listId = id('lilst');
+  const seatKey = input.seatKey ?? OWNER_SEAT_KEY;
+  await db
+    .prepare(
+      `INSERT INTO linkedin_lead_lists (id,workspace_id,seat_key,name,source_kind,source_ref,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`
+    )
+    .run(listId, input.workspaceId, seatKey, name, sourceKind, sourceRef, timestamp, timestamp);
+  const row = await db
+    .prepare(
+      `SELECT ${LIST_SELECT} FROM linkedin_lead_lists l WHERE l.id=? AND l.workspace_id=? AND l.seat_key=?`
+    )
+    .get<ListRow>(listId, input.workspaceId, seatKey);
+  if (!row) throw new Error('Lead list could not be created.');
+  return toList(row);
+}
+
+/**
+ * Rename only the label; membership and campaign foreign keys use the stable
+ * list id, never this mutable display string. Unique names are per seat.
+ * Locks the row and uses the DB unique index to settle racing updates.
+ */
+export async function renameLeadList(
+  db: Db,
+  workspaceId: string,
+  listId: string,
+  rawName: string,
+  now = new Date()
+): Promise<LinkedInLeadList | undefined> {
+  const name = rawName.trim();
+  if (!name || name.length > 200)
+    throw new LinkedInApiError('List name must be between 1 and 200 characters.', 400);
+  return db.transaction(async (tx) => {
+    const row = await tx
+      .prepare(
+        'SELECT id,seat_key,name FROM linkedin_lead_lists WHERE workspace_id=? AND id=? FOR UPDATE'
+      )
+      .get<{ id: string; seat_key: string; name: string }>(workspaceId, listId);
+    if (!row) return undefined;
+    if (row.name !== name) {
+      try {
+        await tx
+          .prepare(
+            'UPDATE linkedin_lead_lists SET name=?,updated_at=?::timestamptz WHERE workspace_id=? AND id=?'
+          )
+          .run(name, now.toISOString(), workspaceId, listId);
+      } catch (error) {
+        if ((error as { code?: string })?.code === '23505')
+          throw new LinkedInApiError(
+            'A list with this name already exists on this LinkedIn account.',
+            409
+          );
+        throw error;
+      }
+    }
+    return getLeadList(tx, workspaceId, listId, row.seat_key);
+  });
+}
+export async function listLeadLists(
+  db: Db,
+  workspaceId: string,
+  seatKey = OWNER_SEAT_KEY
+): Promise<LinkedInLeadList[]> {
+  return (
+    await db
+      .prepare(
+        `SELECT ${LIST_SELECT} FROM linkedin_lead_lists l WHERE l.workspace_id=? AND l.seat_key=? ORDER BY l.updated_at DESC`
+      )
+      .all<ListRow>(workspaceId, seatKey)
+  ).map(toList);
+}
+
+export async function getLeadList(
+  db: Db,
+  workspaceId: string,
+  listId: string,
+  seatKey = OWNER_SEAT_KEY
+): Promise<LinkedInLeadList | undefined> {
+  const row = await db
+    .prepare(
+      `SELECT ${LIST_SELECT} FROM linkedin_lead_lists l WHERE l.workspace_id=? AND l.seat_key=? AND l.id=?`
+    )
+    .get<ListRow>(workspaceId, seatKey, listId);
+  return row ? toList(row) : undefined;
+}
+
+/**
+ * One page of a list's people, oldest membership first.
+ *
+ * READ THROUGH `linkedin_lead_list_members`, which is the only place list
+ * membership lives now. `linkedin_lead_contacts.list_id` still exists and is
+ * still NOT NULL, but it answers "which list did this person first arrive in",
+ * not "which lists are they in" -- see migration 051 and {@link insertLead}.
+ *
+ * BOUNDED, AND THE BOUND IS SAYABLE. Pair with {@link countLeadContacts}: a
+ * page of 5000 over a list of 6000 has to be able to say so, and the old
+ * signature returned an array with no total, which is why the screen printed a
+ * hardcoded sentence about the first thousand rows.
+ */
+export async function listLeadContacts(
+  db: Db,
+  workspaceId: string,
+  listId: string,
+  limit = LEAD_CONTACT_READ_LIMIT,
+  offset = 0
+): Promise<LinkedInLeadContact[]> {
+  return (
+    await db
+      .prepare(
+        `
+    SELECT ${MEMBER_CONTACT_SELECT}
+    FROM linkedin_lead_list_members m
+    JOIN linkedin_lead_contacts c ON c.id=m.contact_id AND c.workspace_id=m.workspace_id
+    WHERE m.workspace_id=? AND m.list_id=? ORDER BY m.created_at,c.id LIMIT ? OFFSET ?
+  `
+      )
+      .all<ContactRow>(
+        workspaceId,
+        listId,
+        Math.max(1, Math.min(limit, LEAD_CONTACT_READ_LIMIT)),
+        Math.max(0, Math.trunc(offset))
+      )
+  ).map(toContact);
+}
+
+/** A bounded review page; totals describe the complete list and the server-side filter. */
+export interface LeadContactReviewPage {
+  contacts: LinkedInLeadContact[];
+  /** Matching contacts after search/review filters, before pagination. */
+  total: number;
+  /** Every member of the list, irrespective of filters. */
+  listTotal: number;
+  /** Incomplete identities anywhere in the list, not just loaded rows. */
+  identityReviewCount: number;
+}
+
+const NEEDS_IDENTITY_SQL = `(
+  BTRIM(COALESCE(c.first_name,'')) = '' OR
+  BTRIM(COALESCE(c.last_name,'')) = '' OR
+  BTRIM(COALESCE(c.company,'')) = ''
+)`;
+const MEMBER_CONTACT_FROM = `
+  FROM linkedin_lead_list_members m
+  JOIN linkedin_lead_contacts c ON c.id=m.contact_id AND c.workspace_id=m.workspace_id
+`;
+
+/** Search/review all members before applying the bounded page, never just the first 5,000. */
+export async function readLeadContactReviewPage(
+  db: Db,
+  workspaceId: string,
+  listId: string,
+  input: { limit: number; offset: number; query?: string; needsIdentityOnly?: boolean }
+): Promise<LeadContactReviewPage> {
+  const query = (input.query ?? '').trim();
+  if (query.length > 200) throw new LinkedInApiError('Search must be 200 characters or fewer', 400);
+  const predicates = ['m.workspace_id=?', 'm.list_id=?'];
+  const params: Array<string> = [workspaceId, listId];
+  if (query) {
+    // POSITION treats user-supplied % and _ as literal characters rather than
+    // SQL wildcard operators and keeps every value in a prepared parameter.
+    predicates.push(
+      `POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ',c.first_name,c.last_name,c.company,c.email,c.profile_url))) > 0`
+    );
+    params.push(query);
+  }
+  if (input.needsIdentityOnly) predicates.push(NEEDS_IDENTITY_SQL);
+  const where = ` WHERE ${predicates.join(' AND ')}`;
+  const [rows, matches, all] = await Promise.all([
+    db
+      .prepare(
+        `SELECT ${MEMBER_CONTACT_SELECT}${MEMBER_CONTACT_FROM}${where}
+       ORDER BY m.created_at,c.id LIMIT ? OFFSET ?`
+      )
+      .all<ContactRow>(
+        ...params,
+        Math.max(1, Math.min(Math.trunc(input.limit), LEAD_CONTACT_READ_LIMIT)),
+        Math.max(0, Math.trunc(input.offset))
+      ),
+    db
+      .prepare(`SELECT COUNT(*)::int AS total${MEMBER_CONTACT_FROM}${where}`)
+      .get<{ total: number }>(...params),
+    db
+      .prepare(
+        `SELECT COUNT(*)::int AS list_total,
+      COUNT(*) FILTER (WHERE ${NEEDS_IDENTITY_SQL})::int AS identity_review_count
+      ${MEMBER_CONTACT_FROM} WHERE m.workspace_id=? AND m.list_id=?`
+      )
+      .get<{ list_total: number; identity_review_count: number }>(workspaceId, listId)
+  ]);
+  return {
+    contacts: rows.map(toContact),
+    total: Number(matches?.total ?? 0),
+    listTotal: Number(all?.list_total ?? 0),
+    identityReviewCount: Number(all?.identity_review_count ?? 0)
+  };
+}
+/**
+ * How many people are in this list, ignoring any page bound.
+ *
+ * The same number `LinkedInLeadList.leadCount` carries; exported separately so
+ * a caller holding only a list id does not have to re-read the list to say
+ * "showing 5,000 of 6,214".
+ */
+export async function countLeadContacts(
+  db: Db,
+  workspaceId: string,
+  listId: string
+): Promise<number> {
+  const row = await db
+    .prepare(
+      'SELECT COUNT(*)::int AS total FROM linkedin_lead_list_members WHERE workspace_id=? AND list_id=?'
+    )
+    .get<{ total: number }>(workspaceId, listId);
+  return Number(row?.total ?? 0);
+}
+
+/**
+ * THE FROM/WHERE EVERY "the contacts in list X" QUERY MUST NOW USE, as a
+ * fragment, because two of them live in a file this one may not edit.
+ *
+ * `linkedin_lead_contacts.list_id` is no longer the answer to "which list is
+ * this person in" -- since migration 051 it records only the list they FIRST
+ * arrived in, and membership lives in `linkedin_lead_list_members`. A query
+ * still reading the column sees a person in exactly one list, which is the bug
+ * this whole change exists to remove: a lead imported into a second list would
+ * be enrolled from neither.
+ *
+ * Drops in where `linkedin_lead_contacts c WHERE c.workspace_id=? AND
+ * c.list_id=?` used to be, binding the SAME two parameters in the same order,
+ * and keeps the alias `c` so nothing else in the surrounding statement moves.
+ */
+export const LEAD_LIST_CONTACTS_FROM_WHERE = `linkedin_lead_contacts c
+  JOIN linkedin_lead_list_members m ON m.contact_id=c.id AND m.workspace_id=c.workspace_id
+  WHERE m.workspace_id=? AND m.list_id=?`;
+
+/** What one insert did: a new contact, or the existing one it found instead. */
+export interface LeadInsertOutcome {
+  /** The contact this person is, new or already there. '' only when unfindable. */
+  contactId: string;
+  inserted: boolean;
+  /** The person already existed elsewhere and was ADDED to this list as well. */
+  reused: boolean;
+}
+
+async function linkCanonicalPerson(
+  db: Db,
+  workspaceId: string,
+  linkedinContactId: string,
+  lead: NormalizedLeadInput,
+  now: string
+): Promise<string | null> {
+  const email = lead.email?.trim() || null;
+  const linkedinUrl = lead.profileUrl?.trim() || null;
+  const phone = normalizeExplicitPhone(lead.phone);
+  if (!email && !linkedinUrl && !phone) {
+    await db
+      .prepare(
+        `UPDATE linkedin_lead_contacts
+         SET person_resolution_status=CASE WHEN person_id IS NULL THEN 'insufficient_identity' ELSE 'resolved' END,updated_at=?
+         WHERE workspace_id=? AND id=?`
+      )
+      .run(now, workspaceId, linkedinContactId);
+    return null;
+  }
+
+  const name =
+    [lead.firstName, lead.lastName]
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .join(' ') || null;
+  try {
+    const resolved = await resolveContact(
+      db,
+      workspaceId,
+      { name, email, phone, linkedinUrl },
+      new Date(now)
+    );
+    await db
+      .prepare(
+        `UPDATE linkedin_lead_contacts
+         SET person_id=?,person_resolution_status='resolved',updated_at=?
+         WHERE workspace_id=? AND id=?`
+      )
+      .run(resolved.contact.id, now, workspaceId, linkedinContactId);
+    return resolved.contact.id;
+  } catch (error) {
+    if (error instanceof LeadCaptureError && error.status === 409) {
+      await db
+        .prepare(
+          `UPDATE linkedin_lead_contacts
+           SET person_id=NULL,person_resolution_status='conflict',updated_at=?
+           WHERE workspace_id=? AND id=?`
+        )
+        .run(now, workspaceId, linkedinContactId);
+      return null;
+    }
+    if (error instanceof LeadCaptureError) throw new LinkedInApiError(error.message, error.status);
+    throw error;
+  }
+}
+
+/**
+ * Write one lead, or find the row that already is that person -- and put them
+ * in this list either way.
+ *
+ * `ON CONFLICT DO NOTHING` WITHOUT A TARGET, and that is the change migration
+ * 048 requires. Naming `(workspace_id,list_id,dedupe_key)` only handled the
+ * per-list guard; the workspace-wide indexes on LOWER(profile_url) and on
+ * `dedupe_key` would have raised 23505 and aborted the surrounding
+ * transaction, turning "you already have this person" into a failed import of
+ * the whole file.
+ *
+ * A CONFLICT IS ANSWERED WITH THE EXISTING CONTACT, NOT AN ERROR AND NOT A
+ * COPY. One person is one contact row per workspace -- that is what makes
+ * `idx_linkedin_campaign_members_one_active` mean anything.
+ *
+ * AND THEN THEY ARE ADDED TO THE LIST ANYWAY, WHICH IS THE PART THAT WAS
+ * MISSING. Membership used to be a single `list_id` column on the contact, so
+ * finding the existing row was the END of the story: the person stayed in
+ * whichever list they had first landed in and never appeared in this one.
+ * Importing 500 people into "Q3 founders" when 200 of them already sat in an
+ * older list silently produced a 300-row list, and the campaign built on it
+ * could never reach those 200 -- a quiet, unattributable hole in an outreach
+ * run. The brief constrains one CAMPAIGN per lead. It never said one LIST per
+ * lead, and the two were only ever conflated because one column was doing both
+ * jobs. `linkedin_lead_list_members` (migration 051) does the membership job
+ * now; the one-campaign claim is unaffected, because it is keyed on the
+ * contact id and there is still exactly one of those per person.
+ */
+/**
+ * Overlapping multi-row imports must visit identities in the same order.
+ * PostgreSQL otherwise detects a deadlock when two different lists insert
+ * the same contacts in opposite CSV/harvest order: each transaction holds the
+ * earlier contact while waiting for the other's later contact. Stable sorting
+ * retains source precedence for duplicate identity keys and never mutates the
+ * original parse/rejection rows. This is not a substitute for database unique
+ * constraints or a retry policy for other kinds of concurrent writes.
+ */
+function orderedLeadWrites(leads: readonly NormalizedLeadInput[]): NormalizedLeadInput[] {
+  return [...leads].sort((left, right) => {
+    const a = `${left.dedupeKey}\u0000${left.profileUrl ?? ''}`;
+    const b = `${right.dedupeKey}\u0000${right.profileUrl ?? ''}`;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+async function insertLead(
+  db: Db,
+  workspaceId: string,
+  listId: string,
+  lead: NormalizedLeadInput,
+  now: string
+): Promise<LeadInsertOutcome> {
+  const row = await db
+    .prepare(
+      `INSERT INTO linkedin_lead_contacts (id,workspace_id,list_id,first_name,last_name,company,email,email_source,email_provenance,phone,country,profile_url,dedupe_key,original_json,custom_fields_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb,?::jsonb,?,?) ON CONFLICT DO NOTHING RETURNING id`
+    )
+    .get<{ id: string }>(
+      id('lilead'),
+      workspaceId,
+      listId,
+      lead.firstName,
+      lead.lastName,
+      lead.company,
+      lead.email,
+      lead.email ? 'imported' : null,
+      lead.email ? 'imported' : null,
+      lead.phone,
+      lead.country,
+      lead.profileUrl,
+      lead.dedupeKey,
+      JSON.stringify(lead.original),
+      JSON.stringify(lead.customFields),
+      now,
+      now
+    );
+
+  // ONE LOOKUP FOR BOTH IDENTITIES. The insert can be refused by either
+  // workspace-wide index, and which one refused it is not reported, so the
+  // search has to cover the same ground they do: the `dedupe_key` a
+  // profile-less lead is identified by AND the profile URL, whose two
+  // spellings fold to one only under LOWER().
+  const contactId =
+    row?.id ??
+    (
+      await db
+        .prepare(
+          `
+    SELECT id FROM linkedin_lead_contacts
+    WHERE workspace_id=? AND (dedupe_key=? OR (?::text IS NOT NULL AND LOWER(profile_url)=LOWER(?)))
+    LIMIT 1
+  `
+        )
+        .get<{ id: string }>(workspaceId, lead.dedupeKey, lead.profileUrl, lead.profileUrl)
+    )?.id ??
+    '';
+  if (!contactId) return { contactId: '', inserted: false, reused: false };
+
+  // LinkedIn keeps channel evidence; canonical People owns human identity.
+  await linkCanonicalPerson(db, workspaceId, contactId, lead, now);
+
+  // A person reused from another list keeps one contact row, but new CSV enrichment is not lost.
+  // New non-empty custom fields win by key; built-in fields stay governed by their dedicated columns.
+  if (!row && Object.keys(lead.customFields).length > 0) {
+    await db
+      .prepare(
+        `UPDATE linkedin_lead_contacts
+         SET custom_fields_json=COALESCE(custom_fields_json,'{}'::jsonb) || ?::jsonb,updated_at=?
+         WHERE workspace_id=? AND id=?`
+      )
+      .run(JSON.stringify(lead.customFields), now, workspaceId, contactId);
+  }
+
+  const link = await db
+    .prepare(
+      'INSERT INTO linkedin_lead_list_members (workspace_id,list_id,contact_id,created_at) VALUES (?,?,?,?) ON CONFLICT DO NOTHING'
+    )
+    .run(workspaceId, listId, contactId, now);
+
+  // `reused` still means what its call sites print: "this person was already
+  // one of your leads and is now in this list too". A person who was ALREADY
+  // in this list adds no membership row and is a plain duplicate.
+  return { contactId, inserted: Boolean(row), reused: !row && link.changes > 0 };
+}
+
+export async function ingestLeadSignal(
+  db: Db,
+  input: {
+    workspaceId: string;
+    listId: string;
+    signalKind: LeadSignalKind;
+    idempotencyKey: string;
+    profileUrl: string;
+    firstName: string;
+    lastName?: string | null;
+    company?: string | null;
+    email?: string | null;
+    emailProvenance?: 'first_party' | 'imported' | 'manual' | 'external';
+    phone?: string | null;
+    country?: string | null;
+    sourceRef?: string | null;
+    occurredAt?: string | null;
+    customFields?: Record<string, string>;
+    metadata?: Record<string, unknown>;
+  },
+  now: Date = new Date()
+): Promise<LeadSignalIngestResult> {
+  const key = input.idempotencyKey.trim();
+  if (!key) throw new Error('Signal idempotency key is required.');
+  const list = await db
+    .prepare(`SELECT id,source_kind FROM linkedin_lead_lists WHERE workspace_id=? AND id=?`)
+    .get<{ id: string; source_kind: string }>(input.workspaceId, input.listId);
+  if (!list) throw new Error('Lead list not found.');
+  if (list.source_kind !== 'signal')
+    throw new Error('Inbound signals can only be written to a signal lead list.');
+
+  const normalized = normalizeScrapedLead({
+    profileUrl: input.profileUrl,
+    firstName: input.firstName,
+    lastName: input.lastName ?? '',
+    company: input.company ?? ''
+  });
+  if (!normalized)
+    throw new Error('Signal lead needs a valid LinkedIn profile URL and first name.');
+  normalized.email = input.email?.trim() || null;
+  normalized.phone = input.phone?.trim() || null;
+  normalized.country = input.country?.trim() || null;
+  normalized.customFields = { ...(input.customFields ?? {}) };
+  normalized.original = {
+    ...normalized.original,
+    signalKind: input.signalKind,
+    ...(input.sourceRef?.trim() ? { signalSource: input.sourceRef.trim() } : {})
+  };
+
+  const occurredAt = new Date(input.occurredAt ?? now.toISOString());
+  if (Number.isNaN(occurredAt.getTime()))
+    throw new Error('Signal occurredAt must be an ISO-8601 timestamp.');
+  const timestamp = now.toISOString();
+  let result: LeadSignalIngestResult | null = null;
+  await db.transaction(async (tx) => {
+    const existingSignal = await tx
+      .prepare(
+        `SELECT id,contact_id,list_id FROM linkedin_lead_signals WHERE workspace_id=? AND idempotency_key=?`
+      )
+      .get<{ id: string; contact_id: string; list_id: string }>(input.workspaceId, key);
+    if (existingSignal) {
+      result = {
+        signalId: existingSignal.id,
+        contactId: existingSignal.contact_id,
+        listId: existingSignal.list_id,
+        duplicateSignal: true,
+        insertedContact: false,
+        reusedContact: false
+      };
+      return;
+    }
+
+    const lead = await insertLead(tx, input.workspaceId, input.listId, normalized, timestamp);
+    if (!lead.contactId) throw new Error('Signal lead could not be stored.');
+    if (normalized.email) {
+      const provenance = input.emailProvenance ?? 'external';
+      await tx
+        .prepare(
+          `UPDATE linkedin_lead_contacts SET email_source=?,email_provenance=?,updated_at=? WHERE workspace_id=? AND id=?`
+        )
+        .run(provenance, provenance, timestamp, input.workspaceId, lead.contactId);
+    }
+    const signalId = id('lisig');
+    await tx
+      .prepare(
+        `INSERT INTO linkedin_lead_signals
+         (id,workspace_id,list_id,contact_id,signal_kind,idempotency_key,source_ref,occurred_at,metadata_json,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?::jsonb,?)`
+      )
+      .run(
+        signalId,
+        input.workspaceId,
+        input.listId,
+        lead.contactId,
+        input.signalKind,
+        key,
+        input.sourceRef?.trim() || null,
+        occurredAt.toISOString(),
+        JSON.stringify(input.metadata ?? {}),
+        timestamp
+      );
+    result = {
+      signalId,
+      contactId: lead.contactId,
+      listId: input.listId,
+      duplicateSignal: false,
+      insertedContact: lead.inserted,
+      reusedContact: lead.reused
+    };
+  });
+  if (!result) throw new Error('Signal could not be stored.');
+  return result;
+}
+
+export async function importLeadProfileUrls(
+  db: Db,
+  input: { workspaceId: string; seatKey?: string; listId: string; urls: readonly string[] },
+  now: Date = new Date()
+): Promise<{
+  inserted: number;
+  duplicates: number;
+  reused: number;
+  rejected: Array<{ value: string; reason: string }>;
+}> {
+  const list = await getLeadList(
+    db,
+    input.workspaceId,
+    input.listId,
+    input.seatKey ?? OWNER_SEAT_KEY
+  );
+  if (!list) throw new Error('Lead list not found.');
+  const nonempty = input.urls.map((value) => value.trim()).filter(Boolean);
+  const distinct = [...new Set(nonempty)];
+  const unique = distinct.slice(0, 10_000);
+  let inserted = 0;
+  // Only repeated inputs are duplicates. A valid unique item above the per-
+  // request ceiling has not been processed and must be called out as rejected,
+  // never silently counted as a duplicate imported elsewhere.
+  let duplicates = nonempty.length - distinct.length;
+  let reused = 0;
+  const overflow = distinct.slice(10_000).map((value) => ({
+    value,
+    reason: 'Profile URL import accepts at most 10,000 unique items per request; split the upload.'
+  }));
+  const rejected: Array<{ value: string; reason: string }> = [];
+  const timestamp = now.toISOString();
+  const valid: Array<{ raw: string; lead: NormalizedLeadInput }> = [];
+  for (const raw of unique) {
+    const profileUrl = canonicalProfileUrl(raw);
+    if (!profileUrl) {
+      rejected.push({ value: raw, reason: 'Not a valid LinkedIn /in/ profile URL.' });
+      continue;
+    }
+    const lead: NormalizedLeadInput = {
+      firstName: '',
+      lastName: '',
+      company: '',
+      email: null,
+      phone: null,
+      country: null,
+      profileUrl,
+      dedupeKey: '',
+      customFields: {},
+      original: { profileUrl, source: 'pasted_profile_url' }
+    };
+    lead.dedupeKey = leadDedupeKey(lead);
+    valid.push({ raw, lead });
+  }
+  // Paste imports participate in the same deterministic contact lock order as
+  // CSV and harvest imports, regardless of operator-provided URL order.
+  valid.sort((left, right) => {
+    const a = left.lead.dedupeKey;
+    const b = right.lead.dedupeKey;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  await db.transaction(async (tx) => {
+    for (const { raw, lead } of valid) {
+      const outcome = await insertLead(tx, input.workspaceId, input.listId, lead, timestamp);
+      if (!outcome.contactId) {
+        rejected.push({ value: raw, reason: 'Could not store this profile.' });
+        continue;
+      }
+      if (outcome.inserted) inserted += 1;
+      else {
+        duplicates += 1;
+        if (outcome.reused) reused += 1;
+      }
+    }
+  });
+  rejected.push(...overflow);
+  return { inserted, duplicates, reused, rejected };
+}
+
+export async function importLeadCsv(
+  db: Db,
+  input: {
+    workspaceId: string;
+    seatKey?: string;
+    listId: string;
+    csv: string;
+    mapping?: LeadFieldMapping;
+  },
+  now: Date = new Date()
+): Promise<{
+  inserted: number;
+  duplicates: number;
+  reused: number;
+  rejected: Array<{ row: number; reason: string }>;
+  mapping: LeadFieldMapping;
+  headers: string[];
+}> {
+  if (!(await getLeadList(db, input.workspaceId, input.listId, input.seatKey)))
+    throw new Error('Lead list not found.');
+  const parsed = parseLeadCsv(input.csv, input.mapping);
+  const timestamp = now.toISOString();
+  let inserted = 0;
+  let duplicates = 0;
+  let reused = 0;
+  // Deterministic identity order prevents two concurrently imported, reversed
+  // CSVs from holding one another's existing contact/Person locks in a cycle.
+  const accepted = orderedLeadWrites(parsed.accepted);
+  await db.transaction(async (tx) => {
+    for (const lead of accepted) {
+      const outcome = await insertLead(tx, input.workspaceId, input.listId, lead, timestamp);
+      if (outcome.inserted) inserted += 1;
+      else {
+        duplicates += 1;
+        // Counted apart from a same-list duplicate: "this person was already
+        // one of your leads and is now in this list too" is a different
+        // sentence from "you uploaded them twice", and only one of them means
+        // the file was wrong. Both are still `duplicates`, because neither
+        // created a person.
+        if (outcome.reused) reused += 1;
+      }
+    }
+    await tx
+      .prepare('UPDATE linkedin_lead_lists SET updated_at=? WHERE id=? AND workspace_id=?')
+      .run(timestamp, input.listId, input.workspaceId);
+  });
+  return {
+    inserted,
+    duplicates,
+    reused,
+    rejected: parsed.rejected.map(({ row, reason }) => ({ row, reason })),
+    mapping: parsed.mapping,
+    headers: parsed.headers
+  };
+}
+
+/** Which kind of list a harvested source materialises into. */
+const SOURCE_LIST_KIND: Record<LeadSourceKind, LeadListSourceKind> = {
+  search: 'linkedin_search',
+  sales_navigator: 'sales_navigator',
+  post: 'post_keyword',
+  content: 'post_keyword',
+  recruiter: 'recruiter',
+  group_members: 'group_members',
+  event_attendees: 'event_attendees',
+  company_employees: 'company_employees'
+};
+
+/**
+ * Materialise a lead source's harvest into a list a campaign can enrol from.
+ *
+ * THE GAP THIS CLOSES. `storeLeads` writes `linkedin_leads`, and campaigns
+ * enrol only from `linkedin_lead_contacts`. Those are two tables with no path
+ * between them, so a search that harvested 80 people could not send a single
+ * message -- the operator's only route was to export a CSV and upload it back
+ * into the product that already had the data.
+ *
+ * IT IS THE CSV PATH'S RULES, NOT A SECOND SET. The same scrub, the same
+ * first/last split and the same `dedupe_key`, because a harvested Maya Chen
+ * and an uploaded Maya Chen have to collide -- and they only collide if both
+ * writers computed identity the same way.
+ *
+ * A LEAD IS STILL NOT AN ACTION. This writes contacts; enrolling them in a
+ * campaign remains a separate decision a human makes.
+ *
+ * `leadIds` IS THE OPERATOR'S SELECTION AND IS OPTIONAL. The leads screen has
+ * always had working row selection -- "12 of 80 selected" -- and no way to
+ * send it anywhere, so Save imported all 80 regardless of what was ticked.
+ * When it is present, only those harvested rows are considered; when it is
+ * absent the whole source is imported exactly as before, which is what every
+ * existing caller and the worker still do. Ids that are not part of this
+ * source simply match nothing: a selection is a filter over what was
+ * harvested, never a way to reach another source's rows.
+ */
+export async function importLeadSourceContacts(
+  db: Db,
+  input: {
+    workspaceId: string;
+    seatKey?: string;
+    sourceId: string;
+    listId?: string;
+    listName?: string;
+    limit?: number;
+    leadIds?: readonly string[];
+  },
+  now: Date = new Date()
+): Promise<{
+  list: LinkedInLeadList;
+  inserted: number;
+  duplicates: number;
+  reused: number;
+  skipped: number;
+}> {
+  const seatKey = input.seatKey ?? OWNER_SEAT_KEY;
+  const source = await getLeadSource(db, input.workspaceId, input.sourceId, seatKey);
+  if (!source) throw new Error('Lead source not found.');
+
+  const list = input.listId
+    ? await getLeadList(db, input.workspaceId, input.listId, seatKey)
+    : await createLeadList(
+        db,
+        {
+          workspaceId: input.workspaceId,
+          seatKey,
+          name: input.listName?.trim() || `Lead source ${source.id}`,
+          sourceKind: SOURCE_LIST_KIND[source.kind] ?? 'csv',
+          sourceRef: source.url
+        },
+        now
+      );
+  if (!list) throw new Error('Lead list not found.');
+
+  // The same ceiling the leads screen reads with, so what an operator reviewed
+  // is what Save writes -- see LEAD_READ_LIMIT.
+  const all = await listLeads(
+    db,
+    input.workspaceId,
+    source.id,
+    input.limit ?? LEAD_READ_LIMIT,
+    seatKey
+  );
+  const selection = new Set(input.leadIds ?? []);
+  const harvested = selection.size > 0 ? all.filter((lead) => selection.has(lead.id)) : all;
+  const timestamp = now.toISOString();
+  let inserted = 0;
+  let duplicates = 0;
+  let reused = 0;
+  let skipped = 0;
+
+  // Apply the same identity order as CSV imports, including when the source
+  // returns a different order of the same profiles. Count invalid harvest rows
+  // before sorting; sorting is only for the database write lock order.
+  const normalizedLeads = harvested.map((lead) => normalizeScrapedLead(lead));
+  skipped = normalizedLeads.filter((lead) => !lead).length;
+  const ordered = orderedLeadWrites(
+    normalizedLeads.filter((lead): lead is NormalizedLeadInput => !!lead)
+  );
+  await db.transaction(async (tx) => {
+    for (const normalized of ordered) {
+      const outcome = await insertLead(tx, input.workspaceId, list.id, normalized, timestamp);
+      if (outcome.inserted) inserted += 1;
+      else {
+        duplicates += 1;
+        if (outcome.reused) reused += 1;
+      }
+    }
+    await tx
+      .prepare('UPDATE linkedin_lead_lists SET updated_at=? WHERE id=? AND workspace_id=?')
+      .run(timestamp, list.id, input.workspaceId);
+  });
+
+  const refreshed = await getLeadList(db, input.workspaceId, list.id);
+  return { list: refreshed ?? list, inserted, duplicates, reused, skipped };
+}
+
+export async function updateLeadContact(
+  db: Db,
+  input: {
+    workspaceId: string;
+    contactId: string;
+    firstName: string;
+    lastName: string;
+    company: string;
+    email?: string | null;
+    phone?: string | null;
+    country?: string | null;
+    profileUrl?: string | null;
+    doNotContact?: boolean;
+  },
+  now: Date = new Date()
+): Promise<LinkedInLeadContact> {
+  const normalized = normalizeLeadRow(
+    {
+      firstName: input.firstName,
+      lastName: input.lastName,
+      company: input.company,
+      email: input.email ?? '',
+      phone: input.phone ?? '',
+      country: input.country ?? '',
+      profileUrl: input.profileUrl ?? ''
+    },
+    {
+      firstName: 'firstName',
+      lastName: 'lastName',
+      company: 'company',
+      email: 'email',
+      phone: 'phone',
+      country: 'country',
+      profileUrl: 'profileUrl'
+    }
+  );
+  // Atomically publish the edited identity/DNC flag, canonical Person link,
+  // source suppression, and campaign re-evaluation. The same workspace lock
+  // protects public tracking evidence against an edit that was otherwise
+  // visible for a short period without its matching suppression.
+  return withSuppressionBoundary(db, input.workspaceId, async (tx) => {
+    // A WORKSPACE-WIDE INDEX WOULD RAISE A BARE 23505 HERE, which the API layer
+    // cannot tell apart from any other unique violation and reports as the
+    // generic "that LinkedIn manager name or active lead claim already exists" --
+    // a 409 that names neither the field nor the row and leaves an operator
+    // guessing which of six inputs was the problem.
+    //
+    // BOTH INDEXES ARE CHECKED, NOT JUST THE PROFILE ONE. The old pre-check
+    // covered `profile_url` alone, so editing a NAME or a COMPANY into another
+    // row's `dedupe_key` -- which is exactly what an operator does when they fix
+    // a typo in a duplicate they just spotted -- skipped it entirely and fell
+    // through to the raw constraint. One lookup covers the same ground both
+    // indexes do, and the refusal names what actually clashed.
+    const clash = await tx
+      .prepare(
+        `
+    SELECT id,first_name,last_name FROM linkedin_lead_contacts
+    WHERE workspace_id=? AND id<>? AND (dedupe_key=? OR (?::text IS NOT NULL AND LOWER(profile_url)=LOWER(?)))
+    LIMIT 1
+  `
+      )
+      .get<{ id: string; first_name: string; last_name: string }>(
+        input.workspaceId,
+        input.contactId,
+        normalized.dedupeKey,
+        normalized.profileUrl,
+        normalized.profileUrl
+      );
+    if (clash)
+      throw new Error(
+        leadClashMessage(normalized, `${clash.first_name} ${clash.last_name}`.trim())
+      );
+    const row = await tx
+      .prepare(
+        `UPDATE linkedin_lead_contacts SET first_name=?,last_name=?,company=?,email=?,email_source=CASE WHEN ?::boolean THEN 'manual' ELSE email_source END,email_provenance=CASE WHEN ?::boolean THEN 'manual' ELSE email_provenance END,phone=?,country=?,profile_url=?,dedupe_key=?,do_not_contact=COALESCE(?,do_not_contact),updated_at=? WHERE workspace_id=? AND id=? RETURNING ${CONTACT_SELECT}`
+      )
+      .get<ContactRow>(
+        normalized.firstName,
+        normalized.lastName,
+        normalized.company,
+        normalized.email,
+        input.email !== undefined,
+        input.email !== undefined,
+        normalized.phone,
+        normalized.country,
+        normalized.profileUrl,
+        normalized.dedupeKey,
+        input.doNotContact === undefined ? null : input.doNotContact,
+        now.toISOString(),
+        input.workspaceId,
+        input.contactId
+      );
+    if (!row) throw new Error('Lead not found.');
+    await linkCanonicalPerson(
+      tx,
+      input.workspaceId,
+      input.contactId,
+      normalized,
+      now.toISOString()
+    );
+    const refreshed = await tx
+      .prepare(`SELECT ${CONTACT_SELECT} FROM linkedin_lead_contacts WHERE workspace_id=? AND id=?`)
+      .get<ContactRow>(input.workspaceId, input.contactId);
+    if (!refreshed) throw new Error('Lead disappeared after Person convergence.');
+    const updated = toContact(refreshed);
+    if (input.doNotContact === true) {
+      if (updated.personId || updated.email || updated.profileUrl) {
+        await createSuppression(
+          tx,
+          {
+            workspaceId: input.workspaceId,
+            channel: 'linkedin',
+            personId: updated.personId,
+            email: updated.email,
+            linkedinUrl: updated.profileUrl,
+            reason: 'Marked do-not-contact in LinkedIn lead manager',
+            source: 'linkedin_lead',
+            sourceRef: input.contactId,
+            actorType: 'system'
+          },
+          now
+        );
+      }
+    } else if (input.doNotContact === false) {
+      await liftSuppressionsBySource(
+        tx,
+        {
+          workspaceId: input.workspaceId,
+          source: 'linkedin_lead',
+          sourceRef: input.contactId,
+          channel: 'linkedin',
+          actorType: 'system'
+        },
+        now
+      );
+    }
+    // Pasted-URL contacts have no name/company. They stay excluded until an
+    // operator completes identity; restoring eligibility must run the *whole*
+    // campaign policy again, not blindly flip excluded -> pending.
+    const awaitingIdentity = await tx
+      .prepare(
+        `SELECT DISTINCT campaign_id FROM linkedin_campaign_members
+       WHERE workspace_id=? AND contact_id=? AND admitted_at IS NULL
+         AND status='excluded'
+         AND exclusion_reason IN ('Missing lead identity','Workspace suppression','Do not contact')`
+      )
+      .all<{ campaign_id: string }>(input.workspaceId, input.contactId);
+    if (awaitingIdentity.length > 0) {
+      const { reevaluateCampaignExclusions } = await import('./managed-campaigns.js');
+      for (const member of awaitingIdentity)
+        await reevaluateCampaignExclusions(tx, input.workspaceId, member.campaign_id, now);
+    }
+    return updated;
+  });
+}
+
+/**
+ * WHICH IDENTITY THE EDIT COLLIDED ON, IN A SENTENCE.
+ *
+ * The three branches mirror `leadDedupeKey`'s exactly, because the key is what
+ * the index refused on: a lead with a profile URL is that profile, a lead with
+ * only an email is that address, and a lead with neither is a name at a
+ * company. Telling an operator "a lead already exists" without saying WHICH of
+ * the six fields they just typed made it true is the whole complaint.
+ */
+function leadClashMessage(edited: NormalizedLeadInput, who: string): string {
+  const other = who || 'another lead';
+  const rule = 'One person is one lead row, so that campaign claim cannot be split in two.';
+  if (edited.profileUrl)
+    return `The LinkedIn profile ${edited.profileUrl} already belongs to ${other} in this workspace. ${rule}`;
+  if (edited.email)
+    return `The email address ${edited.email} already belongs to ${other} in this workspace. ${rule}`;
+  return `${edited.firstName} ${edited.lastName} at ${edited.company} is already a lead in this workspace (${other}). ${rule} Give this row a LinkedIn profile or an email address if they are a different person of the same name.`;
+}
+
+/**
+ * Delete one person, everywhere.
+ *
+ * NOT JUST THE ROW -- THE PLANNED ACTIONS TOO, AND IN THE SAME TRANSACTION.
+ * The foreign keys cascade `linkedin_campaign_members` and
+ * `linkedin_manual_tasks` away, which reads like the whole cleanup and is not:
+ * `linkedin_actions.campaign_member_id` has NO foreign key (046 added it as a
+ * plain attribution column), so a planned, unclaimed invite or DM survived the
+ * delete with a dangling member id and the worker went on to FIRE IT AT THE
+ * PERSON THE OPERATOR HAD JUST REMOVED. That is the worst failure this
+ * subsystem has: not a missing message, an unwanted one, sent from the
+ * operator's own account after they told us to stop.
+ *
+ * SAME THREE RULES AS `removeCampaignMember`, WHICH ALREADY GOT THIS RIGHT --
+ * every status that has not left the building, only unclaimed, and 'skipped'
+ * rather than deleted, so the ledger still shows that the action existed and
+ * why it never went out. A row already claimed by a worker is left alone: it
+ * is mid-flight and the ledger, not this function, is what reconciles it.
+ *
+ * 'held' AS WELL AS 'planned', AND THE OMISSION WAS THE WORST BUG IN THIS FILE.
+ * This function predates migration 051, so it skipped 'planned' alone -- and a
+ * campaign that is PAUSED has parked its entire queue in 'held'. Delete a lead
+ * while the campaign they are in is paused and the sequence was:
+ *
+ *   1. the cascade removes the contact, their campaign membership and their
+ *      manual tasks, and the screen says the person is gone;
+ *   2. their held ledger rows survive it, because 'held' is not 'planned' and
+ *      `campaign_member_id` has no foreign key to cascade through -- they are
+ *      now orphans pointing at a member row that no longer exists;
+ *   3. somebody resumes the campaign, and `startManagedCampaign` moves EVERY
+ *      held row of that campaign back to 'planned' in one statement -- it has
+ *      no way to know which of them lost their person;
+ *   4. the worker claims them and sends.
+ *
+ * The result is an invite or a DM going out from the customer's own LinkedIn
+ * account, to somebody they explicitly deleted, days after they deleted them,
+ * and it cannot be recalled. `removeCampaignMember` and `stopManagedCampaign`
+ * both already say `IN ('planned','held')` for exactly this reason; this was
+ * the third door into the same state and the only one still open.
+ *
+ * THE SKIP RUNS FIRST. After the DELETE the cascade has taken the member rows
+ * with it and there is nothing left to find the actions by.
+ */
+export async function removeLeadContact(
+  db: Db,
+  workspaceId: string,
+  contactId: string
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await tx
+      .prepare(
+        `
+      UPDATE linkedin_actions SET status='skipped',recorded_at=NULL,claimed_at=NULL
+      WHERE workspace_id=? AND status IN ('planned','held') AND claimed_at IS NULL AND campaign_member_id IN (
+        SELECT id FROM linkedin_campaign_members WHERE workspace_id=? AND contact_id=?
+      )
+    `
+      )
+      .run(workspaceId, workspaceId, contactId);
+    const result = await tx
+      .prepare('DELETE FROM linkedin_lead_contacts WHERE workspace_id=? AND id=?')
+      .run(workspaceId, contactId);
+    return result.changes > 0;
+  });
+}
+
+/**
+ * The member states migration 046's `idx_linkedin_campaign_members_one_active`
+ * is partial on: the five that hold a contact's one-campaign claim.
+ *
+ * Spelled here rather than imported from `managed-campaigns.ts`, which owns the
+ * same list under the name `ACTIVE_MEMBER_STATUSES` -- that module imports THIS
+ * one (`getLeadList`), so importing it back would close a module cycle for a
+ * five-element array. The index in migration 046 is the source of truth for
+ * both copies, and it is the thing that would actually break if they drifted.
+ */
+const CLAIMING_MEMBER_STATUSES = ['pending', 'active', 'waiting', 'manual', 'paused'] as const;
+
+/**
+ * The campaign states that make a list undeletable.
+ *
+ * 'running' is obvious. 'paused' is the one worth arguing: a paused campaign is
+ * not a finished one -- `startManagedCampaign` will resume it, its members
+ * still hold their one-campaign claim, and its queue is sitting in 'held'
+ * waiting to be handed back. Deleting the list under it would leave a campaign
+ * that resumes into an empty list, having already lost the membership rows that
+ * told it who it was for. A pause is a reversible state and this is a
+ * destructive act; the operator stops the campaign first, and then the delete
+ * is a decision they made rather than one they discovered.
+ */
+const LIST_LOCKING_CAMPAIGN_STATUSES = ['running', 'paused'] as const;
+
+/**
+ * What deleting a list did, counted -- so a route can tell an operator what
+ * they just changed instead of returning 204 over the top of it.
+ */
+export interface LeadListDeletion {
+  listId: string;
+  name: string;
+  /**
+   * People taken out of THIS list. Every one of them is still a contact, and
+   * still in every other list they belong to (migration 052).
+   */
+  membershipsRemoved: number;
+  /**
+   * People whose ORIGIN list this was, and whose `list_id` is now null.
+   *
+   * NOT A DELETE COUNT. It is reported because it is the number an operator
+   * would otherwise have to guess at: "these N leads came in through this list
+   * and no longer record where they came from". Before migration 053 this was
+   * the number of people the delete would have DESTROYED.
+   */
+  contactsDetached: number;
+  /** Campaigns built on this list, whose `lead_list_id` the FK has set to null. */
+  campaignsDetached: number;
+  /** Members of those campaigns dropped out of their claiming state. */
+  membersRemoved: number;
+  /** Pending human checkpoints for those campaigns, cancelled. */
+  tasksCancelled: number;
+  /** Planned and held ledger rows for those campaigns, skipped so nothing sends. */
+  actionsSkipped: number;
+}
+
+/**
+ * Delete a lead list without deleting the people in it.
+ *
+ * THERE WAS NO ROUTE FOR THIS, AND THE SCHEMA IS WHY. Migration 046 made
+ * `linkedin_lead_contacts.list_id` NOT NULL with ON DELETE CASCADE, so the
+ * database's answer to "delete this list" was to delete every contact whose
+ * origin list it was -- and after migration 052 split membership into its own
+ * table, that included people sitting in five other lists and enrolled in
+ * other campaigns. Their campaign memberships and manual tasks would have gone
+ * with them by cascade, and their planned and held ledger rows would have
+ * SURVIVED as orphans (`campaign_member_id` carries no foreign key), to be
+ * resumed and sent later at people who no longer existed in the product. 052
+ * wrote that hazard down and asked for the FK to be fixed before this function
+ * was written; migration 053 fixes it, and this is the function it was fixed
+ * for.
+ *
+ * SO THE DELETE IS NOW ADDITIVE-SAFE, AND THIS FUNCTION HANDLES THE REST:
+ *
+ *   * it REFUSES while a running or paused campaign is built on the list, with
+ *     a 409 naming the campaign -- see `LIST_LOCKING_CAMPAIGN_STATUSES`;
+ *   * for every other campaign on the list (draft, completed, stopped) it
+ *     releases the work the way `stopManagedCampaign` does: members out of
+ *     their claiming state, pending manual tasks cancelled, and planned AND
+ *     HELD actions skipped. 'held' is not optional here for the same reason it
+ *     is not optional in `removeLeadContact` -- a held row that outlives the
+ *     thing it belongs to is an unwanted message waiting for somebody to press
+ *     Resume;
+ *   * `claimed_at IS NULL` is the same boundary every other writer draws: a
+ *     claimed row is in a browser right now and belongs to the worker holding
+ *     it;
+ *   * it reports what it did, because "deleted" is not an adequate answer to a
+ *     button that just removed 4,000 people from a list and unhooked two
+ *     campaigns.
+ *
+ * ORDER MATTERS AND IS THE REVERSE OF THE CASCADE. Everything is counted and
+ * released while the rows still exist to be found; the DELETE is last, and
+ * the FKs (`ON DELETE CASCADE` for memberships, `ON DELETE SET NULL` for
+ * contacts and for `linkedin_campaigns.lead_list_id`) finish the job.
+ *
+ * Returns undefined when there is no such list in this workspace, so a route
+ * can answer 404 without a second read.
+ */
+export async function deleteLeadList(
+  db: Db,
+  workspaceId: string,
+  listId: string
+): Promise<LeadListDeletion | undefined> {
+  return db.transaction(async (tx) => {
+    // FOR UPDATE: the refusal below and the delete at the bottom must see the
+    // same list, and a concurrent campaign start must not slip between them.
+    const list = await tx
+      .prepare('SELECT id,name FROM linkedin_lead_lists WHERE workspace_id=? AND id=? FOR UPDATE')
+      .get<{ id: string; name: string }>(workspaceId, listId);
+    if (!list) return undefined;
+
+    const blocking = await tx
+      .prepare(
+        `
+      SELECT name,status FROM linkedin_campaigns
+      WHERE workspace_id=? AND lead_list_id=? AND status = ANY(?::text[])
+      ORDER BY created_at LIMIT 3
+    `
+      )
+      .all<{ name: string; status: string }>(workspaceId, listId, [
+        ...LIST_LOCKING_CAMPAIGN_STATUSES
+      ]);
+    if (blocking.length > 0) {
+      const named = blocking.map((c) => `'${c.name}' (${c.status})`).join(', ');
+      throw new LinkedInApiError(
+        `This lead list is still driving ${named}. Stop ${blocking.length === 1 ? 'that campaign' : 'those campaigns'} first -- ` +
+          'a paused campaign is one somebody intends to resume, and resuming it into a deleted list would leave it running for nobody.',
+        409
+      );
+    }
+
+    const scope =
+      'campaign_id IN (SELECT id FROM linkedin_campaigns WHERE workspace_id=? AND lead_list_id=?)';
+
+    const members = await tx
+      .prepare(
+        `
+      UPDATE linkedin_campaign_members SET status='removed',next_eligible_at=NULL,updated_at=CURRENT_TIMESTAMP
+      WHERE workspace_id=? AND status = ANY(?::text[]) AND ${scope}
+    `
+      )
+      .run(workspaceId, [...CLAIMING_MEMBER_STATUSES], workspaceId, listId);
+
+    const tasks = await tx
+      .prepare(
+        `
+      UPDATE linkedin_manual_tasks SET status='cancelled'
+      WHERE workspace_id=? AND status='pending' AND ${scope}
+    `
+      )
+      .run(workspaceId, workspaceId, listId);
+
+    const actions = await tx
+      .prepare(
+        `
+      UPDATE linkedin_actions SET status='skipped',recorded_at=NULL,claimed_at=NULL
+      WHERE workspace_id=? AND status IN ('planned','held') AND claimed_at IS NULL AND ${scope}
+    `
+      )
+      .run(workspaceId, workspaceId, listId);
+
+    // Counted BEFORE the delete, because after it the FKs have already moved
+    // every one of these rows out of reach of the question.
+    const memberships = await tx
+      .prepare(
+        'SELECT COUNT(*)::int AS total FROM linkedin_lead_list_members WHERE workspace_id=? AND list_id=?'
+      )
+      .get<{ total: number }>(workspaceId, listId);
+    const contacts = await tx
+      .prepare(
+        'SELECT COUNT(*)::int AS total FROM linkedin_lead_contacts WHERE workspace_id=? AND list_id=?'
+      )
+      .get<{ total: number }>(workspaceId, listId);
+    const campaigns = await tx
+      .prepare(
+        'SELECT COUNT(*)::int AS total FROM linkedin_campaigns WHERE workspace_id=? AND lead_list_id=?'
+      )
+      .get<{ total: number }>(workspaceId, listId);
+
+    await tx
+      .prepare('DELETE FROM linkedin_lead_lists WHERE workspace_id=? AND id=?')
+      .run(workspaceId, listId);
+
+    return {
+      listId: list.id,
+      name: list.name,
+      membershipsRemoved: Number(memberships?.total ?? 0),
+      contactsDetached: Number(contacts?.total ?? 0),
+      campaignsDetached: Number(campaigns?.total ?? 0),
+      membersRemoved: members.changes,
+      tasksCancelled: tasks.changes,
+      actionsSkipped: actions.changes
+    };
+  });
+}

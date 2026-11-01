@@ -1,0 +1,3458 @@
+import { AccountMigration } from './AccountMigration';
+import { NativeTrevraPasskeySettings } from './NativeTrevraPasskeySettings';
+import { nativeTrevraSignIn } from './native-product-passkey';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import {
+  Bot,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  Compass,
+  Copy,
+  FileUp,
+  KeyRound,
+  Linkedin,
+  Link2,
+  House,
+  MessageCircle,
+  MoreHorizontal,
+  LoaderCircle,
+  LogOut,
+  Mail,
+  Pencil,
+  Play,
+  Plus,
+  Settings2,
+  ShieldCheck,
+  Terminal,
+  Trash2,
+  Unplug,
+  Workflow,
+  X
+} from 'lucide-react';
+import type {
+  AgentPrincipal,
+  AgentSetup,
+  AgentTokenSummary,
+  AvailableIntegration,
+  ConnectionSummary,
+  DashboardPayload,
+  WorkspacePolicy
+} from '../shared/types';
+import {
+  createAgentToken,
+  createPolicy,
+  getAgents,
+  createConnectSession,
+  ApiError,
+  deleteAgentCliToken,
+  deleteAgentKey,
+  deletePolicy,
+  disconnectIntegration,
+  endDemoSession,
+  ensureSession,
+  eraseWorkspace,
+  getAgentSetup,
+  getAgentTokens,
+  getDashboard,
+  getLinkedInManagerSeats,
+  getLinkedInWorkerStatus,
+  getPolicies,
+  getPublicConfig,
+  previewWorkspaceErasure,
+  revokeAgentToken,
+  saveAgentBudget,
+  saveAgentSchedule,
+  saveAgentCliConfig,
+  saveAgentCliToken,
+  saveAgentKey,
+  saveAgentModelConfig,
+  setAgentCliRiskAccepted,
+  startAgentRun,
+  startAuthwardMagicLink,
+  startDemoSession,
+  updatePolicy,
+  workspaceExportDownloadPath,
+  type WorkspaceErasurePreview
+} from './api';
+import { authClient, useIsWorkspaceOwner, useWorkspaceRole } from './auth-client';
+import { loginAuthError } from './auth-errors';
+import {
+  INTERACTION_EXPIRED_MESSAGE,
+  OAUTH_SESSION_RECOVERY_MESSAGE,
+  claimEmailContinuation,
+  resolveAuthError,
+  sessionStorageOrNull
+} from './auth-error';
+import { ActiveLinkedInAccountName } from './LinkedInActiveAccount';
+import { reloadOutreach } from './LinkedInSafety';
+import { LinkedInAccounts } from './LinkedInAccounts';
+import { CompanionPanel } from './LinkedInCompanion';
+import { LinkedInExclusions, relativeTime } from './LinkedInScreen';
+import { SenderIdentityPanel } from './SenderIdentityPanel';
+import { TeamSettingsView } from './TeamScreen';
+import { EmailChannelPanel } from './EmailChannelPanel';
+import { LeadCaptureSetup } from './LeadCaptureSetup';
+import { EnrichmentSetup } from './EnrichmentSetup';
+import { BillingSettings } from './BillingSettings';
+import { GitHubReposPanel } from './GitHubReposPanel';
+import { ResearchView } from './views/ResearchView';
+import { hostedRunBlocker } from './views/hostedRun';
+import { trackEvent, trackPageView } from './analytics';
+import { ConfirmDrawer, useDialog } from './ui/dialog';
+import { ActionRow, FormGrid, FormSection, OwnerOnlyNote } from './ui/forms';
+import { EmptyState, GridSpan, InlineActions, PageGrid, Panel } from './ui/layout';
+import { Button, Field, Input, Select, SwitchField, Textarea } from './ui/primitives';
+import { BrandMark } from './ui/BrandMark';
+import { HelpPanel, JumpPalette, ShortcutSheet } from './ui/HelpPanel';
+import { useShortcuts } from './ui/keys';
+import {
+  isLoginPath,
+  navigate,
+  replaceNavigate,
+  useRoute,
+  type Route,
+  type Section
+} from './ui/route';
+import { SeatPauseButton, StopBar, useStopControls } from './ui/StopBar';
+import { LedgerView } from './views/LedgerView';
+import { LoopCostView, LoopView } from './views/LoopView';
+import { OutreachView } from './views/OutreachView';
+import { initials, money, prettyProvider, usd } from './views/format';
+
+/** Task names, not internal architecture. Every existing route stays reachable.
+ * On phones, the two infrequent destinations live under More. */
+type NavDestination = { path: string; icon: React.ReactNode; label: string };
+const NAV_MAIN: NavDestination[] = [
+  { path: '/loop', icon: <House size={18} />, label: 'Today' },
+  { path: '/outreach', icon: <Linkedin size={18} />, label: 'Campaigns' },
+  { path: '/outreach/inbox', icon: <MessageCircle size={18} />, label: 'Messages' },
+  { path: '/research', icon: <Compass size={18} />, label: 'Ideas' }
+];
+const NAV_MORE: NavDestination[] = [
+  { path: '/ledger', icon: <Workflow size={18} />, label: 'Activity' },
+  { path: '/setup/workspace', icon: <Settings2 size={18} />, label: 'Settings' }
+];
+function navActive(route: Route, path: string): boolean {
+  if (path === '/outreach/inbox') return route.section === 'outreach' && route.sub === 'inbox';
+  if (path === '/outreach') return route.section === 'outreach' && route.sub !== 'inbox';
+  if (path === '/setup/workspace') return route.section === 'setup';
+  return route.section === path.slice(1);
+}
+
+type ToastMessage = { message: string; undo?: () => void };
+
+const reducedMotion = () =>
+  typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
+const HOSTED_MARKETING_SITE_URL =
+  typeof window !== 'undefined' && window.location.hostname.startsWith('app.')
+    ? `${window.location.protocol}//${window.location.hostname.slice(4)}`
+    : 'https://usetrevra.com';
+
+function GoogleMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 18 18" width="18" height="18">
+      <path
+        fill="#4285F4"
+        d="M17.64 9.205c0-.638-.057-1.252-.164-1.841H9v3.482h4.844a4.14 4.14 0 0 1-1.797 2.715v2.258h2.909c1.702-1.567 2.684-3.875 2.684-6.614Z"
+      />
+      <path
+        fill="#34A853"
+        d="M9 18c2.43 0 4.467-.806 5.956-2.181l-2.909-2.258c-.806.54-1.835.859-3.047.859-2.344 0-4.328-1.585-5.037-3.715H.956v2.333A9 9 0 0 0 9 18Z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M3.963 10.705A5.41 5.41 0 0 1 3.682 9c0-.592.102-1.167.281-1.705V4.962H.956A9 9 0 0 0 0 9c0 1.452.347 2.827.956 4.038l3.007-2.333Z"
+      />
+      <path
+        fill="#EA4335"
+        d="M9 3.58c1.321 0 2.507.454 3.441 1.346l2.581-2.581C13.463.892 11.426 0 9 0A9 9 0 0 0 .956 4.962l3.007 2.333C4.672 5.165 6.656 3.58 9 3.58Z"
+      />
+    </svg>
+  );
+}
+
+/** Provider glyphs match the shared Olaryn sign-in contract. */
+function MicrosoftMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 18 18" width="20" height="20">
+      <path d="M0 0h8.5v8.5H0z" fill="#F25022" />
+      <path d="M9.5 0H18v8.5H9.5z" fill="#7FBA00" />
+      <path d="M0 9.5h8.5V18H0z" fill="#00A4EF" />
+      <path d="M9.5 9.5H18V18H9.5z" fill="#FFB900" />
+    </svg>
+  );
+}
+
+function GithubMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+      <path d="M12 .7a11.3 11.3 0 0 0-3.57 22.02c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.02-.7.08-.68.08-.68 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.28-5.13-1.25-5.13-5.58 0-1.23.44-2.24 1.16-3.03-.12-.28-.5-1.43.11-2.98 0 0 .95-.3 3.1 1.16A10.78 10.78 0 0 1 12 6.2c.96 0 1.93.13 2.83.38 2.15-1.46 3.09-1.16 3.09-1.16.62 1.55.23 2.7.11 2.98.72.79 1.16 1.8 1.16 3.03 0 4.34-2.64 5.29-5.15 5.57.4.35.76 1.04.76 2.1v3.08c0 .3.2.65.78.54A11.3 11.3 0 0 0 12 .7Z" />
+    </svg>
+  );
+}
+
+/**
+ * The header plus the incident bar below it, sharing one seat read.
+ * `useStopControls` is called once here and shared by the header pause control
+ * and the StopBar below it.
+ */
+function ShellTop({
+  route,
+  setOverlay,
+  signOut,
+  setToast
+}: {
+  route: Route;
+  setOverlay: (overlay: 'help' | 'shortcuts' | 'jump' | null) => void;
+  signOut: () => Promise<void>;
+  setToast: (message: string) => void;
+}) {
+  const controls = useStopControls(setToast);
+  return (
+    <>
+      <header className="topbar">
+        <div className="topbar-title">
+          <h1>{viewTitle(route)}</h1>
+          {route.section === 'outreach' && (
+            <div className="top-context" aria-label="Current context">
+              <span>
+                <strong>LinkedIn</strong> <ActiveLinkedInAccountName />
+              </span>
+            </div>
+          )}
+        </div>
+        <div className="top-actions">
+          <SeatPauseButton controls={controls} />
+          <button
+            className="icon-button"
+            aria-label="What this screen is for"
+            title="What this screen is for"
+            onClick={() => setOverlay('help')}
+          >
+            <CircleHelp size={18} />
+          </button>
+          <ThemeToggle />
+          <a
+            className="icon-button"
+            aria-label="Identity settings"
+            title="Identity settings"
+            href="/api/auth/account"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <KeyRound size={18} />
+          </a>
+          <button
+            className="icon-button"
+            aria-label="Sign out"
+            title="Sign out"
+            onClick={() => void signOut()}
+          >
+            <LogOut size={18} />
+          </button>
+        </div>
+      </header>
+
+      {/* One incident surface, on every route. It is never a nav item and it
+        survives below 760px, where the sidebar does not. */}
+      <StopBar controls={controls} />
+    </>
+  );
+}
+
+export function App() {
+  const [data, setData] = useState<DashboardPayload | null>(null);
+  const [error, setError] = useState('');
+  const [needsAuth, setNeedsAuth] = useState<boolean | null>(null);
+  const [route, go] = useRoute();
+
+  /*
+   * A ROUTE CHANGE HAS TO LAND SOMEWHERE.
+   *
+   * `navigate` replaced the whole main region and moved nothing. A keyboard or
+   * screen-reader user who activated a nav item stayed parked on that nav
+   * item, with no announcement that the screen behind it had changed and no
+   * way into the new content but to tab past the rest of the sidebar. `main`
+   * already carries `tabIndex={-1}` for the skip link above; this hands it the
+   * same focus on every in-app navigation. The first render is skipped, so a
+   * fresh page load leaves focus where the browser put it.
+   */
+  const settledFirstRoute = useRef(false);
+  useEffect(() => {
+    if (!settledFirstRoute.current) {
+      settledFirstRoute.current = true;
+      return;
+    }
+    document.getElementById('main')?.focus({ preventScroll: true });
+  }, [route.path]);
+
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [toast, setToastState] = useState<ToastMessage | null>(null);
+  const [overlay, setOverlay] = useState<'help' | 'shortcuts' | 'jump' | null>(null);
+  const setToast = (message: string) => setToastState(message ? { message } : null);
+  const [loadStalled, setLoadStalled] = useState(false);
+  const loadToken = useRef(0);
+  const loadStallTimer = useRef<number | null>(null);
+
+  const load = async () => {
+    const token = ++loadToken.current;
+    setLoadStalled(false);
+    if (loadStallTimer.current !== null) window.clearTimeout(loadStallTimer.current);
+    loadStallTimer.current = window.setTimeout(() => {
+      if (loadToken.current === token) setLoadStalled(true);
+    }, 12_000);
+    try {
+      setError('');
+      await ensureSession();
+      const next = await getDashboard();
+      if (loadToken.current !== token) return;
+      setData(next);
+      setNeedsAuth(false);
+      // The authenticated shell must not remain at /login after signup or
+      // passkey/email sign-in. Deep links to app routes are preserved.
+      if (isLoginPath(window.location.pathname)) replaceNavigate('/loop');
+    } catch (err) {
+      if (loadToken.current !== token) return;
+      if (err instanceof ApiError && err.status === 401) {
+        setData(null);
+        setNeedsAuth(true);
+        return;
+      }
+      setError(err instanceof Error ? err.message : 'Unable to load Trevra');
+    } finally {
+      if (loadToken.current === token && loadStallTimer.current !== null) {
+        window.clearTimeout(loadStallTimer.current);
+        loadStallTimer.current = null;
+      }
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    return () => {
+      if (loadStallTimer.current !== null) window.clearTimeout(loadStallTimer.current);
+    };
+  }, []);
+  useEffect(() => {
+    trackPageView();
+  }, [route.path]);
+  useEffect(() => {
+    if (!toast || toast.undo) return;
+    const hold = Math.min(14_000, Math.max(7_000, toast.message.length * 60));
+    const timer = window.setTimeout(() => setToastState(null), hold);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  useShortcuts({
+    onJump: () => setOverlay('jump'),
+    onSheet: () => setOverlay('shortcuts'),
+    suspended: overlay !== null
+  });
+
+  const signOut = async () => {
+    let authwardLogoutUrl: string | null = null;
+    try {
+      const response = await fetch('/api/auth/authward-logout-url', {
+        method: 'POST',
+        credentials: 'include'
+      });
+      if (response.ok) {
+        const body = (await response.json()) as { url?: string | null };
+        authwardLogoutUrl = body.url ?? null;
+      }
+    } catch {
+      // Local logout must still succeed if the identity provider is unavailable.
+    }
+
+    await Promise.allSettled([authClient.signOut(), endDemoSession()]);
+    setData(null);
+    setNeedsAuth(true);
+    if (authwardLogoutUrl) {
+      window.location.assign(authwardLogoutUrl);
+      return;
+    }
+    navigate('/');
+  };
+
+  const loadingGate = (
+    <div className="center-state">
+      <LoaderCircle className="spin" /> <span>Loading Trevra…</span>
+    </div>
+  );
+  const stalledGate = (
+    <div className="center-state error">
+      <p>Still trying to reach Trevra. This is taking longer than it should.</p>
+      <button onClick={() => void load()}>Try again</button>
+    </div>
+  );
+
+  if (needsAuth === null) return loadStalled ? stalledGate : loadingGate;
+  if (needsAuth)
+    return (
+      <AuthScreen
+        onAuthenticated={load}
+        onBack={() => window.location.assign(HOSTED_MARKETING_SITE_URL)}
+      />
+    );
+  if (!data && !error) return loadStalled ? stalledGate : loadingGate;
+  if (error)
+    return (
+      <div className="center-state error">
+        <p>{error}</p>
+        <button onClick={() => void load()}>Try again</button>
+      </div>
+    );
+  if (!data) return null;
+
+  return (
+    <div className="app-shell ui-standard">
+      <a
+        className="skip-link"
+        href="#main"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById('main')?.focus({ preventScroll: false });
+        }}
+      >
+        Skip to what is on this screen
+      </a>
+
+      <aside className="sidebar">
+        <div className="brand">
+          <span className="brand-mark">
+            <BrandMark />
+          </span>
+          <span>Trevra</span>
+        </div>
+        <WorkspaceSwitcher
+          activeWorkspaceId={data.workspace.id}
+          activeWorkspaceName={data.workspace.name}
+          onSwitched={async () => {
+            await load();
+            await reloadOutreach();
+          }}
+        />
+        <nav aria-label="Main navigation">
+          {NAV_MAIN.map((item) => (
+            <NavButton
+              key={item.path}
+              active={navActive(route, item.path)}
+              icon={item.icon}
+              label={item.label}
+              href={item.path}
+            />
+          ))}
+          <div className="sidebar-nav-more">
+            <span className="sidebar-nav-caption">More</span>
+            {NAV_MORE.map((item) => (
+              <NavButton
+                key={item.path}
+                active={navActive(route, item.path)}
+                icon={item.icon}
+                label={item.label}
+                href={item.path}
+              />
+            ))}
+          </div>
+        </nav>
+      </aside>
+
+      <main className="main" id="main" tabIndex={-1}>
+        <ShellTop route={route} setOverlay={setOverlay} signOut={signOut} setToast={setToast} />
+
+        {route.section === 'loop' &&
+          (route.sub === 'cost' ? (
+            <LoopCostView onNavigate={go} />
+          ) : (
+            <LoopView data={data} onNavigate={go} />
+          ))}
+
+        {route.section === 'outreach' && (
+          <OutreachView route={route} setToast={setToast} onNavigate={go} />
+        )}
+
+        {route.section === 'ledger' && (
+          <LedgerView runId={route.id} setToast={setToast} onNavigate={go} />
+        )}
+
+        {route.section === 'research' && (
+          <ResearchView connections={data.connections} setToast={setToast} onNavigate={go} />
+        )}
+
+        {route.section === 'setup' && (
+          <SetupView
+            route={route}
+            data={data}
+            reload={load}
+            setToast={setToast}
+            busyId={busyId}
+            setBusyId={setBusyId}
+            onNavigate={go}
+          />
+        )}
+      </main>
+
+      <nav className="mobile-tabbar" aria-label="Main navigation">
+        {NAV_MAIN.map((item) => (
+          <a
+            key={item.path}
+            href={item.path}
+            className={navActive(route, item.path) ? 'is-active' : undefined}
+            aria-current={navActive(route, item.path) ? 'page' : undefined}
+          >
+            {item.icon}
+            <span>{item.label}</span>
+          </a>
+        ))}
+        <details
+          key={route.path}
+          className={
+            'mobile-more' +
+            (NAV_MORE.some((item) => navActive(route, item.path)) ? ' is-active' : '')
+          }
+        >
+          <summary aria-label="More pages">
+            <MoreHorizontal size={19} aria-hidden="true" />
+            <span>More</span>
+          </summary>
+          <div className="mobile-more-links">
+            {NAV_MORE.map((item) => (
+              <a
+                key={item.path}
+                href={item.path}
+                aria-current={navActive(route, item.path) ? 'page' : undefined}
+              >
+                {item.icon}
+                {item.label}
+              </a>
+            ))}
+          </div>
+        </details>
+      </nav>
+
+      {overlay === 'help' && <HelpPanel route={route} onClose={() => setOverlay(null)} />}
+      {overlay === 'shortcuts' && <ShortcutSheet onClose={() => setOverlay(null)} />}
+      {overlay === 'jump' && <JumpPalette onGo={go} onClose={() => setOverlay(null)} />}
+
+      {createPortal(
+        <div
+          className="toast"
+          role="status"
+          style={toast ? { cursor: 'default' } : HIDDEN_LIVE_REGION}
+        >
+          {toast && (
+            <>
+              <Check size={16} />
+              <span>{toast.message}</span>
+              {toast.undo && (
+                <button className="ghost-button" onClick={toast.undo}>
+                  Undo
+                </button>
+              )}
+              <button
+                className="ghost-button"
+                aria-label="Dismiss this message"
+                onClick={() => setToastState(null)}
+              >
+                <X size={14} />
+              </button>
+            </>
+          )}
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+function ThemeToggle() {
+  return (
+    <button
+      type="button"
+      className="icon-button theme-toggle"
+      data-theme-toggle
+      aria-label="Switch theme"
+    >
+      <svg
+        className="icon-light"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M2 12h2M20 12h2" />
+      </svg>
+      <svg
+        className="icon-dark"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        aria-hidden="true"
+      >
+        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+      </svg>
+    </button>
+  );
+}
+
+/* `display: none` takes a live region out of the accessibility tree, so the
+   first message would arrive at a region the reader never saw appear. Empty, it
+   stays mounted and unseen instead. */
+const HIDDEN_LIVE_REGION: React.CSSProperties = {
+  position: 'fixed',
+  width: 1,
+  height: 1,
+  margin: -1,
+  padding: 0,
+  border: 0,
+  overflow: 'hidden',
+  clipPath: 'inset(50%)',
+  whiteSpace: 'nowrap',
+  pointerEvents: 'none'
+};
+
+/** Setup has four live screens: Access, Workspace, Lead capture, and Billing. */
+const SETUP_TABS = [
+  { sub: 'workspace', label: 'Connections', path: '/setup/workspace' },
+  { sub: 'capture', label: 'Lead capture', path: '/setup/capture' },
+  { sub: 'billing', label: 'Billing', path: '/setup/billing' },
+  { sub: '', label: 'Advanced', path: '/setup' }
+] as const;
+
+function SetupView({
+  route,
+  data,
+  reload,
+  setToast,
+  busyId,
+  setBusyId,
+  onNavigate
+}: {
+  route: Route;
+  data: DashboardPayload;
+  reload: () => Promise<void>;
+  setToast: (message: string) => void;
+  busyId: string | null;
+  setBusyId: (id: string | null) => void;
+  onNavigate: (path: string) => void;
+}) {
+  const sub = route.sub;
+  // `/setup/team/:id` is the accept-invitation link from an email. It is a
+  // full screen with no tabs: the reader has no workspace to configure yet.
+  const invitationId = sub === 'team' ? route.id : null;
+  const role = useWorkspaceRole();
+  const isOwner = role === 'owner';
+
+  if (invitationId) {
+    return (
+      <TeamSettingsView route={route} setToast={setToast} reload={reload} onNavigate={onNavigate} />
+    );
+  }
+
+  const onWorkspace = sub === 'workspace';
+  const onCapture = sub === 'capture';
+  const onBilling = sub === 'billing';
+
+  return (
+    <div className="page-stack">
+      <nav className="setup-nav" aria-label="Setup sections">
+        {SETUP_TABS.map((tab) => (
+          <a
+            key={tab.path}
+            href={tab.path}
+            className={tab.sub === sub ? 'is-active' : undefined}
+            aria-current={tab.sub === sub ? 'page' : undefined}
+          >
+            {tab.label}
+          </a>
+        ))}
+      </nav>
+
+      {onCapture ? (
+        <LeadCaptureSetup setToast={setToast} />
+      ) : onBilling ? (
+        <BillingSettings />
+      ) : onWorkspace ? (
+        <div className="workspace-settings page-stack">
+          <header className="workspace-settings-intro">
+            <h2>Connect your workspace</h2>
+            <p>Start with the accounts you use for outreach. Other settings are grouped below.</p>
+          </header>
+          <section
+            className="workspace-settings-section"
+            aria-labelledby="workspace-connections-title"
+          >
+            <h3 id="workspace-connections-title">Connections &amp; sending</h3>
+            <PageGrid columns={2}>
+              <GridSpan full>
+                <ConnectionsView
+                  data={data}
+                  reload={reload}
+                  setToast={setToast}
+                  busyId={busyId}
+                  setBusyId={setBusyId}
+                />
+              </GridSpan>
+              <EmailChannelPanel setToast={setToast} />
+              <SenderIdentityPanel setToast={setToast} role={role} />
+            </PageGrid>
+          </section>
+          <details className="workspace-settings-group">
+            <summary>
+              <span>
+                <strong>Account &amp; team</strong>
+                <small>Sign-in methods, account migration and members</small>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </summary>
+            <div className="workspace-settings-group-body">
+              <PageGrid columns={2}>
+                <AccountMigration />
+                <NativeTrevraPasskeySettings />
+                <GridSpan full>
+                  <TeamSettingsView
+                    route={route}
+                    setToast={setToast}
+                    reload={reload}
+                    onNavigate={onNavigate}
+                  />
+                </GridSpan>
+              </PageGrid>
+            </div>
+          </details>
+          <details className="workspace-settings-group">
+            <summary>
+              <span>
+                <strong>Safety &amp; advanced settings</strong>
+                <small>Contact exclusions, limits, enrichment and other integrations</small>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </summary>
+            <div className="workspace-settings-group-body">
+              <PageGrid columns={2}>
+                <LinkedInExclusions setToast={setToast} />
+                <LimitsView setToast={setToast} />
+                <EnrichmentSetup setToast={setToast} />
+                <GitHubReposPanel setToast={setToast} />
+                {isOwner && (
+                  <GridSpan full>
+                    <WorkspaceDataBlock setToast={setToast} />
+                  </GridSpan>
+                )}
+              </PageGrid>
+            </div>
+          </details>
+        </div>
+      ) : (
+        <PageGrid columns={1}>
+          <AgentAccessPanel setToast={setToast} />
+          <HostedAgentPanel
+            setToast={setToast}
+            onInspectRun={(runId) => onNavigate(`/ledger/run/${runId}`)}
+          />
+        </PageGrid>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The one way the sign-in screen begins an Authward authorization: Better
+ * Auth's generic OAuth start (fresh state + PKCE), which sends the browser to
+ * Authward and back through the registered legacy callback URL, forwarded
+ * internally to Better Auth 1.7's /callback/authward handler. The social
+ * buttons pass only allowed upstream providers. OAuth state/PKCE and
+ * redirect_uri are owned by Better Auth, never supplied through params.
+ */
+function startAuthwardSignIn(upstreamProvider?: string, authMethod?: 'passkey') {
+  const allowed = ['google', 'github', 'microsoft', 'apple'];
+  return authClient.signIn.social({
+    provider: 'authward',
+    callbackURL: `${window.location.origin}/loop`,
+    errorCallbackURL: `${window.location.origin}/login`,
+    additionalParams: {
+      resource: 'https://api.usetrevra.com',
+      ...(upstreamProvider && allowed.includes(upstreamProvider)
+        ? { upstream_provider: upstreamProvider }
+        : {}),
+      ...(authMethod === 'passkey' ? { auth_method: 'passkey', prompt: 'login' } : {})
+    }
+  });
+}
+
+function AuthScreen({
+  onAuthenticated,
+  onBack
+}: {
+  onAuthenticated: () => Promise<void>;
+  onBack: () => void;
+}) {
+  const [mode, setMode] = useState<'signin' | 'signup'>('signin');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [socialBusy, setSocialBusy] = useState<string | null>(null);
+  const [authError, setAuthError] = useState('');
+  const [authwardEnabled, setAuthwardEnabled] = useState(false);
+  const [passkeyEnabled, setPasskeyEnabled] = useState(false);
+  const [socialProviders, setSocialProviders] = useState<string[]>([]);
+  const [magicLinkEnabled, setMagicLinkEnabled] = useState(false);
+  const [showEmail, setShowEmail] = useState(false);
+  const [magicLinkSentTo, setMagicLinkSentTo] = useState<string | null>(null);
+  const [emailPasswordEnabled, setEmailPasswordEnabled] = useState(false);
+
+  useEffect(() => {
+    void getPublicConfig()
+      .then((config) => {
+        setAuthwardEnabled(config.authwardAuthEnabled);
+        setPasskeyEnabled(config.passkeyAuthEnabled === true);
+        setSocialProviders(config.socialAuthProviders);
+        setMagicLinkEnabled(config.magicLinkAuthEnabled);
+        setEmailPasswordEnabled(config.emailPasswordAuthEnabled);
+      })
+      .catch(() => undefined);
+
+    const params = new URLSearchParams(window.location.search);
+    let cleanAuthQuery = false;
+    if (params.get('auth_email_sent') === '1') {
+      const sentTo =
+        params.get('auth_email') ?? window.sessionStorage.getItem('trevra.pendingAuthEmail');
+      if (sentTo) {
+        setEmail(sentTo);
+        setMagicLinkSentTo(sentTo);
+      }
+      window.sessionStorage.removeItem('trevra.pendingAuthEmail');
+      params.delete('auth_email_sent');
+      params.delete('auth_email');
+      cleanAuthQuery = true;
+    }
+    // Preserve friendly errors for ordinary OAuth/magic-link failures, while
+    // allowing one bounded retry for Authward's expired signed interaction.
+    const callbackError = params.get('error');
+    if (callbackError !== null) {
+      const message = loginAuthError(params);
+      if (message) setAuthError(message);
+      params.delete('error');
+      cleanAuthQuery = true;
+    }
+    let restartSignIn = false;
+    let restartFailureMessage = INTERACTION_EXPIRED_MESSAGE;
+    if (params.get('authward_session_ready') === '1') {
+      // The user's email link has established an Authward session in the
+      // browser that opened it. This is only a navigation hint: our next
+      // OAuth transaction still verifies state, PKCE, issuer and subject.
+      // Do not reuse the original (potentially cross-browser) authorization.
+      if (callbackError === null && claimEmailContinuation(sessionStorageOrNull())) {
+        restartSignIn = true;
+        restartFailureMessage =
+          'Email verification succeeded, but sign-in could not finish. Try again here.';
+        setAuthError('');
+      } else if (callbackError === null) {
+        setAuthError('Email sign-in could not finish automatically. Choose a sign-in method.');
+      }
+      params.delete('authward_session_ready');
+      cleanAuthQuery = true;
+    }
+    if (callbackError === 'oauth_code_verification_failed') {
+      // An emailed Authward link may open in another browser, which does not
+      // have the original Trevra OAuth state/PKCE cookie. After Authward
+      // establishes its session, a fresh Trevra OAuth request in *this* tab
+      // can complete normally. Never retry unboundedly.
+      const outcome = resolveAuthError('oauth_code_verification_failed', sessionStorageOrNull());
+      if (outcome.kind === 'restart') {
+        restartSignIn = true;
+        restartFailureMessage = OAUTH_SESSION_RECOVERY_MESSAGE;
+        setAuthError('');
+      } else {
+        setAuthError(outcome.message);
+      }
+    }
+    if (params.has('auth_error')) {
+      const outcome = resolveAuthError(params.get('auth_error') ?? '', sessionStorageOrNull());
+      if (outcome.kind === 'restart') restartSignIn = true;
+      else setAuthError(outcome.message);
+      params.delete('auth_error');
+      cleanAuthQuery = true;
+    }
+    if (params.has('error_description')) {
+      params.delete('error_description');
+      cleanAuthQuery = true;
+    }
+    if (cleanAuthQuery) {
+      const query = params.toString();
+      window.history.replaceState(
+        null,
+        '',
+        `${window.location.pathname}${query ? `?${query}` : ''}`
+      );
+    }
+    if (restartSignIn) {
+      // The authorization request behind a late sign-in link expired at
+      // Authward: start a fresh one (see auth-error.ts for the loop guard).
+      setBusy(true);
+      const showExpired = () => {
+        setAuthError(restartFailureMessage);
+        setBusy(false);
+      };
+      void startAuthwardSignIn().then((result) => {
+        if (result?.error) showExpired();
+      }, showExpired);
+    }
+  }, []);
+
+  const signInWithPasskey = async () => {
+    if (!passkeyEnabled) return;
+    setSocialBusy('passkey');
+    setAuthError('');
+    try {
+      await nativeTrevraSignIn();
+      await onAuthenticated();
+    } catch {
+      setAuthError('Passkey sign-in could not be completed. Try another sign-in method.');
+      setSocialBusy(null);
+    }
+  };
+
+  const signInWithSocialProvider = async (provider: string) => {
+    setSocialBusy(provider);
+    setAuthError('');
+    if (provider === 'google') trackEvent('google_auth_started');
+    try {
+      const result = await startAuthwardSignIn(provider);
+      if (result?.error) {
+        setAuthError('Sign-in is temporarily unavailable. Please try again later.');
+        setSocialBusy(null);
+      }
+    } catch {
+      setAuthError('Sign-in is temporarily unavailable. Please try again later.');
+      setSocialBusy(null);
+    }
+  };
+
+  const sendMagicLink = async () => {
+    setBusy(true);
+    setAuthError('');
+    setMagicLinkSentTo(null);
+    try {
+      const normalizedEmail = email.trim();
+      if (!authwardEnabled) {
+        setAuthError('Email sign-in is temporarily unavailable.');
+        return;
+      }
+      await startAuthwardMagicLink(normalizedEmail);
+      setMagicLinkSentTo(normalizedEmail);
+    } catch {
+      setAuthError('Could not send a sign-in link. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submit = async () => {
+    setBusy(true);
+    setAuthError('');
+    if (mode === 'signup') trackEvent('email_signup_submitted');
+    try {
+      const result =
+        mode === 'signup'
+          ? await authClient.signUp.email({ name: name.trim(), email: email.trim(), password })
+          : await authClient.signIn.email({ email: email.trim(), password });
+      if (result.error) {
+        setAuthError(result.error.message ?? 'Authentication failed');
+        return;
+      }
+      await onAuthenticated();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Authentication failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const switchMode = () => {
+    const next = mode === 'signin' ? 'signup' : 'signin';
+    setMode(next);
+    setAuthError('');
+    if (next === 'signup') trackEvent('signup_started');
+  };
+
+  return (
+    <main className="marketing-runtime">
+      <div className="auth-shell auth-shell-centered">
+        <div className="auth-login-theme ol-auth-theme">
+          <ThemeToggle />
+        </div>
+        <section className="auth-story">
+          <a
+            className="brand auth-brand"
+            href="/"
+            onClick={(event) => {
+              event.preventDefault();
+              onBack();
+            }}
+          >
+            <span className="brand-mark">
+              <BrandMark />
+            </span>
+            <span>Trevra</span>
+          </a>
+          <div>
+            <h1>More conversations. Less busywork.</h1>
+            <p>Find people, prepare campaigns, and handle replies in one place.</p>
+          </div>
+          <div className="auth-proof-list">
+            <span>
+              <Check size={16} /> Find people worth contacting
+            </span>
+            <span>
+              <Check size={16} /> Review messages before sending
+            </span>
+            <span>
+              <Check size={16} /> Keep replies in one place
+            </span>
+            <span>
+              <Check size={16} /> Pause outreach whenever needed
+            </span>
+          </div>
+        </section>
+        <section className="auth-panel ol-auth-page" id="get-started">
+          <div className="auth-card ol-auth-card">
+            <div className="auth-signin-brand ol-auth-brand">
+              <BrandMark />
+              <span>Trevra</span>
+            </div>
+            <div className="ol-auth-intro">
+              <h2 className="ol-auth-title">
+                {magicLinkSentTo
+                  ? 'Check your email'
+                  : magicLinkEnabled
+                    ? 'Welcome to Trevra'
+                    : mode === 'signin'
+                      ? 'Welcome to Trevra'
+                      : 'Create your workspace'}
+              </h2>
+              <p className="ol-auth-subtitle">
+                {magicLinkSentTo
+                  ? 'A secure sign-in link is on its way.'
+                  : magicLinkEnabled
+                    ? 'Sign in to your workspace.'
+                    : mode === 'signin'
+                      ? 'Sign in to your workspace.'
+                      : 'Create a Trevra workspace.'}
+              </p>
+            </div>
+            <div className="ol-auth-methods">
+              {passkeyEnabled && !magicLinkSentTo && (
+                <button
+                  type="button"
+                  className="google-auth-button ol-auth-action ol-auth-primary"
+                  disabled={busy || socialBusy !== null}
+                  onClick={() => void signInWithPasskey()}
+                >
+                  {socialBusy === 'passkey' ? (
+                    <LoaderCircle className="spin" size={17} />
+                  ) : (
+                    <KeyRound size={17} />
+                  )}
+                  <span className="ol-auth-method-label">Continue with passkey</span>
+                </button>
+              )}
+              {socialProviders.length > 0 &&
+                !magicLinkSentTo &&
+                socialProviders.map((provider, index) => {
+                  const label =
+                    provider === 'google'
+                      ? 'Google'
+                      : provider === 'github'
+                        ? 'GitHub'
+                        : provider === 'microsoft'
+                          ? 'Microsoft'
+                          : provider === 'apple'
+                            ? 'Apple'
+                            : provider.charAt(0).toUpperCase() + provider.slice(1);
+                  return (
+                    <button
+                      key={provider}
+                      className={
+                        'google-auth-button ol-auth-action ' +
+                        (index === 0 && !passkeyEnabled ? 'ol-auth-primary' : '')
+                      }
+                      disabled={busy || socialBusy !== null}
+                      onClick={() => void signInWithSocialProvider(provider)}
+                    >
+                      {socialBusy === provider ? (
+                        <LoaderCircle className="spin" size={17} />
+                      ) : provider === 'google' ? (
+                        <GoogleMark />
+                      ) : provider === 'microsoft' ? (
+                        <MicrosoftMark />
+                      ) : provider === 'github' ? (
+                        <GithubMark />
+                      ) : (
+                        <ShieldCheck size={17} />
+                      )}
+                      <span className="ol-auth-method-label">Continue with {label}</span>
+                    </button>
+                  );
+                })}
+              {magicLinkEnabled &&
+                (magicLinkSentTo ? (
+                  <div className="auth-email-sent" role="status" aria-live="polite">
+                    <span className="auth-email-sent-icon" aria-hidden="true">
+                      <Check size={20} />
+                    </span>
+                    <div>
+                      <p>
+                        We sent a secure sign-in link to <strong>{magicLinkSentTo}</strong>.
+                      </p>
+                      <p className="auth-consent">
+                        The link expires in 15 minutes and can be used once.
+                      </p>
+                    </div>
+                    <button
+                      className="primary-button auth-submit"
+                      disabled={busy || socialBusy !== null}
+                      onClick={() => void sendMagicLink()}
+                    >
+                      {busy ? <LoaderCircle className="spin" size={16} /> : <Mail size={16} />}
+                      Resend link
+                    </button>
+                    <button
+                      className="auth-text-button"
+                      disabled={busy || socialBusy !== null}
+                      onClick={() => {
+                        setMagicLinkSentTo(null);
+                        window.sessionStorage.removeItem('trevra.pendingAuthEmail');
+                      }}
+                    >
+                      Use a different email
+                    </button>
+                  </div>
+                ) : (
+                  <div className="auth-expandable-email ol-auth-expand">
+                    <button
+                      type="button"
+                      className="google-auth-button ol-auth-action"
+                      aria-expanded={showEmail}
+                      aria-controls="trevra-email-form"
+                      onClick={() => setShowEmail((value) => !value)}
+                      disabled={busy || socialBusy !== null}
+                    >
+                      <Mail size={17} />
+                      <span className="ol-auth-method-label">Continue with email</span>
+                    </button>
+                    {showEmail && (
+                      <div id="trevra-email-form" className="auth-email-fields ol-auth-email-body">
+                        <label>
+                          Email address
+                          <input
+                            type="email"
+                            autoComplete="email"
+                            value={email}
+                            onChange={(event) => {
+                              setEmail(event.target.value);
+                              setMagicLinkSentTo(null);
+                            }}
+                            placeholder="you@company.com"
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' && email.trim()) void sendMagicLink();
+                            }}
+                          />
+                        </label>
+                        <button
+                          className="primary-button auth-submit ol-auth-submit"
+                          disabled={busy || socialBusy !== null || !email.trim()}
+                          onClick={() => void sendMagicLink()}
+                        >
+                          {busy ? (
+                            <LoaderCircle className="spin" size={16} />
+                          ) : (
+                            <ShieldCheck size={16} />
+                          )}
+                          Email me a sign-in link
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+            </div>
+            {emailPasswordEnabled && (
+              <>
+                {mode === 'signup' && (
+                  <label>
+                    Name
+                    <input
+                      autoComplete="name"
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                      placeholder="Alex Morgan"
+                    />
+                  </label>
+                )}
+                <label>
+                  Email
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="you@company.com"
+                  />
+                </label>
+                <label>
+                  Password
+                  <input
+                    type="password"
+                    autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="At least 10 characters"
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') void submit();
+                    }}
+                  />
+                </label>
+              </>
+            )}
+            {authError && (
+              <div className="error-banner" role="alert">
+                {authError}{' '}
+                <button type="button" className="auth-text-button" onClick={() => setAuthError('')}>
+                  Try again
+                </button>
+              </div>
+            )}
+            {emailPasswordEnabled && (
+              <button
+                className="primary-button auth-submit"
+                disabled={
+                  busy ||
+                  socialBusy !== null ||
+                  !email ||
+                  password.length < 10 ||
+                  (mode === 'signup' && !name.trim())
+                }
+                onClick={() => void submit()}
+              >
+                {busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+                {mode === 'signin' ? 'Sign in' : 'Create workspace'}
+              </button>
+            )}
+            {import.meta.env.DEV && (
+              <button
+                className="ghost-button auth-submit"
+                disabled={busy || socialBusy !== null}
+                onClick={() => void startDemoSession().then(onAuthenticated)}
+              >
+                Open demo
+              </button>
+            )}
+            {emailPasswordEnabled && (
+              <button className="auth-switch" onClick={switchMode}>
+                {mode === 'signin' ? 'Create an account' : 'Sign in instead'}
+              </button>
+            )}
+            <div className="ol-auth-footer">
+              <button className="auth-switch" onClick={onBack}>
+                ← Back to site
+              </button>
+              <p className="auth-consent">
+                By continuing, you agree to the <a href="/terms">Terms</a> and{' '}
+                <a href="/privacy">Privacy Notice</a>.
+              </p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+/** One CLI's connect command: its own label, its own Copy button, its own
+ * reveal-state note. Both Claude Code and Codex render one of these, always
+ * together -- no toggle decides which one a founder sees. */
+function AgentCommandBox({
+  label,
+  command,
+  copied,
+  onCopy
+}: {
+  label: string;
+  command: string;
+  copied: boolean;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="agent-command">
+      <div className="agent-command-head">
+        <span>{label}</span>
+        <button className="secondary-button" onClick={onCopy}>
+          {copied ? (
+            <>
+              <Check size={15} /> Copied
+            </>
+          ) : (
+            <>
+              <Copy size={15} /> Copy
+            </>
+          )}
+        </button>
+      </div>
+      <pre>
+        <code>{command}</code>
+      </pre>
+    </div>
+  );
+}
+
+/**
+ * Connect Claude Code or Codex in one click.
+ *
+ * This is the most important button in the product: the operator is an agent,
+ * so a workspace no agent can reach does nothing. It used to be seven manual
+ * steps at the bottom of Autopilot -- name a token, create it, copy it, then
+ * hand-assemble a command from the docs. Now it mints the token and hands back
+ * the exact line to paste, with the real host and token already in it.
+ *
+ * The token is shown ONCE. It is stored as a hash, so the command is built
+ * here, in the browser, at the only moment the secret exists.
+ */
+function AgentAccessPanel({ setToast }: { setToast: (message: string) => void }) {
+  const [agents, setAgents] = useState<AgentPrincipal[]>([]);
+  const [tokens, setTokens] = useState<AgentTokenSummary[]>([]);
+  const [agentId, setAgentId] = useState('');
+  const [revealed, setRevealed] = useState('');
+  const [apiBaseUrl, setApiBaseUrl] = useState('');
+  const [busy, setBusy] = useState('');
+  const [copiedTarget, setCopiedTarget] = useState<'claude' | 'codex' | ''>('');
+  const [confirmRevoke, setConfirmRevoke] = useState<AgentTokenSummary | null>(null);
+  const [confirmHide, setConfirmHide] = useState(false);
+
+  const reload = async () => {
+    const [nextAgents, nextTokens] = await Promise.all([getAgents(), getAgentTokens()]);
+    setAgents(nextAgents);
+    setTokens(nextTokens);
+    setAgentId((current) =>
+      current && nextAgents.some((agent) => agent.id === current && agent.status === 'active')
+        ? current
+        : (nextAgents.find((agent) => agent.status === 'active' && agent.isDefault)?.id ??
+          nextAgents.find((agent) => agent.status === 'active')?.id ??
+          '')
+    );
+  };
+
+  useEffect(() => {
+    void reload().catch(() => undefined);
+    void getPublicConfig()
+      .then((config) => setApiBaseUrl(config.apiBaseUrl ?? window.location.origin))
+      .catch(() => setApiBaseUrl(window.location.origin));
+  }, []);
+
+  useEffect(() => {
+    if (!revealed) return;
+    const protectReveal = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', protectReveal);
+    return () => window.removeEventListener('beforeunload', protectReveal);
+  }, [revealed]);
+
+  const active = tokens.filter((token) => !token.revokedAt);
+
+  const create = async () => {
+    setBusy('create');
+    try {
+      const created = await createAgentToken({
+        agentId: agentId || undefined,
+        name: 'Agent access · ' + new Date().toLocaleDateString()
+      });
+      setCopiedTarget('');
+      setRevealed(created.token);
+      await reload();
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Could not create the token');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const revoke = async (tokenId: string) => {
+    setBusy(tokenId);
+    try {
+      await revokeAgentToken(tokenId);
+      await reload();
+      setToast('Access revoked. Any session using that token is now locked out.');
+    } catch (error) {
+      setToast(
+        error instanceof Error
+          ? error.message
+          : 'Could not revoke that token. Try again in a moment.'
+      );
+    } finally {
+      setBusy('');
+      setConfirmRevoke(null);
+    }
+  };
+
+  const mcpUrl = (apiBaseUrl || window.location.origin) + '/api/agent/mcp';
+  const claudeCommand =
+    'claude mcp add trevra --scope project --transport http ' +
+    mcpUrl +
+    ' --header "Authorization: Bearer ' +
+    revealed +
+    '"';
+  const codexCommand =
+    'export TREVRA_AGENT_TOKEN=' +
+    revealed +
+    '\ncodex mcp add trevra --url ' +
+    mcpUrl +
+    ' --bearer-token-env-var TREVRA_AGENT_TOKEN';
+
+  const copy = async (which: 'claude' | 'codex', command: string) => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setToast('Command copied — paste it in your terminal');
+      setCopiedTarget(which);
+      window.setTimeout(() => setCopiedTarget(''), 2000);
+    } catch {
+      setToast('Could not copy. Select the command and copy it manually.');
+    }
+  };
+
+  const hideReveal = () => {
+    setRevealed('');
+    setCopiedTarget('');
+    setConfirmHide(false);
+    setToast('One-time token hidden. The saved access remains active.');
+  };
+
+  return (
+    <Panel
+      className="agent-panel"
+      id="setup-agent"
+      icon={<Terminal size={18} />}
+      title="Connect Claude Code or Codex"
+      description="Create one workspace-scoped token, then paste the generated command in your terminal."
+    >
+      {agents.length > 0 && (
+        <FormGrid>
+          <Field label="Agent">
+            <Select value={agentId} onChange={(event) => setAgentId(event.target.value)}>
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id} disabled={agent.status !== 'active'}>
+                  {agent.name}
+                  {agent.status === 'active' ? '' : ' · ' + agent.status}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </FormGrid>
+      )}
+
+      {!revealed ? (
+        <>
+          <p className="li-hint">
+            New access tokens are shown only once. Save the generated command before closing it.
+          </p>
+          <InlineActions>
+            <Button variant="primary" onClick={() => void create()} disabled={busy === 'create'}>
+              {busy === 'create' ? (
+                <LoaderCircle className="spin" size={16} />
+              ) : (
+                <KeyRound size={16} />
+              )}
+              Create access
+            </Button>
+          </InlineActions>
+        </>
+      ) : (
+        <>
+          <div className="agent-access-reveal" role="status">
+            <ShieldCheck size={18} />
+            <div>
+              <strong>Access created — save a command now</strong>
+              <p>Leaving this page or hiding the reveal permanently removes the token from view.</p>
+            </div>
+          </div>
+
+          <AgentCommandBox
+            label="Claude Code"
+            command={claudeCommand}
+            copied={copiedTarget === 'claude'}
+            onCopy={() => void copy('claude', claudeCommand)}
+          />
+
+          <AgentCommandBox
+            label="Codex"
+            command={codexCommand}
+            copied={copiedTarget === 'codex'}
+            onCopy={() => void copy('codex', codexCommand)}
+          />
+
+          <div className="agent-reveal-actions">
+            <button className="secondary-button" type="button" onClick={() => setConfirmHide(true)}>
+              I saved these commands
+            </button>
+          </div>
+        </>
+      )}
+
+      {tokens.length > 0 && (
+        <details className="agent-token-history">
+          <summary>
+            Existing access · {active.length} active / {tokens.length} total
+          </summary>
+          <div className="agent-token-list">
+            {tokens.map((token) => (
+              <article key={token.id} className={token.revokedAt ? 'is-revoked' : undefined}>
+                <div>
+                  <strong>{token.agentName}</strong>
+                  <span>{token.name}</span>
+                  <code>{token.prefix}…</code>
+                </div>
+                <span>
+                  {token.revokedAt
+                    ? 'Revoked'
+                    : token.lastUsedAt
+                      ? 'Last used ' + new Date(token.lastUsedAt).toLocaleString()
+                      : 'Not used yet'}
+                </span>
+                {!token.revokedAt && (
+                  <button
+                    className="ghost-button danger"
+                    disabled={busy === token.id}
+                    onClick={() => setConfirmRevoke(token)}
+                  >
+                    {busy === token.id ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : (
+                      <Trash2 size={15} />
+                    )}{' '}
+                    Revoke
+                  </button>
+                )}
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {confirmHide && (
+        <ConfirmDrawer
+          title="Hide this one-time token?"
+          tone="caution"
+          body={
+            <>
+              <p>
+                Confirm only after you have pasted every command you need. Trevra cannot reveal this
+                token again after it leaves the screen.
+              </p>
+              <p>The access stays active until you revoke it.</p>
+            </>
+          }
+          confirmLabel="I saved it — hide token"
+          onCancel={() => setConfirmHide(false)}
+          onConfirm={hideReveal}
+        />
+      )}
+
+      {confirmRevoke && (
+        <ConfirmDrawer
+          title="Revoke this access?"
+          tone="danger"
+          body={
+            <>
+              <p>
+                <strong>{confirmRevoke.name}</strong> (<code>{confirmRevoke.prefix}…</code>) stops
+                working the moment you revoke it. Any Claude Code or Codex session holding that
+                token loses this workspace mid-job.
+              </p>
+              <p>
+                Revoking cannot be undone. You can create fresh access straight afterwards, but you
+                have to paste the new command everywhere this token was used.
+              </p>
+            </>
+          }
+          confirmLabel="Revoke this access"
+          busy={busy === confirmRevoke.id}
+          onCancel={() => setConfirmRevoke(null)}
+          onConfirm={() => void revoke(confirmRevoke.id)}
+        />
+      )}
+    </Panel>
+  );
+}
+/**
+ * Turn a failure from the setup routes into something a founder can act on.
+ *
+ * A status code is not an explanation. The 400s are already written for a
+ * person -- the server owns the endpoint rules and says them in words -- so
+ * those pass through, with the field name swapped for the thing it names.
+ */
+function agentSetupMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) {
+    if (error.status === 404)
+      return 'This workspace is on a build that does not run Trevra’s own agent yet. Your own agent above still works.';
+    if (error.status === 409)
+      return 'Nothing ran: spending is switched off, or this month’s cap is already used up.';
+    if (error.status === 429) return 'Too many attempts in a row. Wait a minute, then try again.';
+    if (error.status >= 500) return 'Trevra could not save that. Try again in a moment.';
+    return error.message
+      .replace(/^baseUrl /, 'The endpoint address ')
+      .replace(/^model is required$/, 'Name the model you want it to use.');
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+const DEFAULT_AUTOPILOT_GOAL =
+  'Review current priorities, conversations, signals, and anything waiting for a decision, then prepare the GTM work that is worth a human looking at.';
+const AUTOPILOT_CADENCES = [
+  { minutes: 60, label: 'Every hour' },
+  { minutes: 240, label: 'Every 4 hours' },
+  { minutes: 720, label: 'Every 12 hours' },
+  { minutes: 1440, label: 'Every day' }
+] as const;
+
+/**
+ * Trevra's agent, running on the operator's own key.
+ *
+ * The second way to be the operator (app-spec §2): identical permissions to
+ * the laptop agent, on Trevra's side, so it keeps working when the laptop is
+ * shut. Nothing here can approve or send -- see app-spec §11.
+ *
+ * One deliberate absence.
+ *
+ * There is no reveal, no "show key", no copy-key control. Plaintext leaves
+ * exactly one internal function on the server, at the moment of a model call,
+ * and no route returns it at any privilege -- so such a control could not be
+ * wired to anything, and adding one is a server redesign, not a UI change.
+ *
+ * The screen is organized by human decisions, not server endpoints: choose the
+ * Agent once, configure one model-access method at a time, then set spending,
+ * Autopilot and one-off work in separate sections. Each section owns its save
+ * so changing one concern cannot accidentally submit another.
+ *
+ * State switches still write immediately. Turning spending or Autopilot off
+ * must take effect in one click rather than waiting for a second Save action.
+ */
+function HostedAgentPanel({
+  setToast,
+  onInspectRun
+}: {
+  setToast: (message: string) => void;
+  onInspectRun: (runId: string) => void;
+}) {
+  // The model endpoint, key, subscription token, spending limit and Autopilot
+  // writes are owner-only on the server. While the role is pending neither
+  // those controls nor the member line render.
+  const role = useWorkspaceRole();
+  const isOwner = role === 'owner';
+  const [setup, setSetup] = useState<AgentSetup | null>(null);
+  const [agents, setAgents] = useState<AgentPrincipal[]>([]);
+  const [agentId, setAgentId] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [problem, setProblem] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [model, setModel] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [replacingKey, setReplacingKey] = useState(false);
+  const [capDollars, setCapDollars] = useState('20');
+  const [goal, setGoal] = useState('');
+  const [scheduleGoal, setScheduleGoal] = useState(DEFAULT_AUTOPILOT_GOAL);
+  const [scheduleInterval, setScheduleInterval] = useState(1440);
+  const [confirmRemoveKey, setConfirmRemoveKey] = useState(false);
+  // The third way to run the hosted agent: a workspace's own Claude/Codex
+  // subscription (docs/cli-agent-and-hosted.md). Mirrors the BYOK state above.
+  const [cliKind, setCliKind] = useState<'claude' | 'codex'>('claude');
+  const [cliModel, setCliModel] = useState('');
+  const [cliToken, setCliToken] = useState('');
+  const [replacingCliToken, setReplacingCliToken] = useState(false);
+  const [confirmRemoveCliToken, setConfirmRemoveCliToken] = useState(false);
+  const [accessMethod, setAccessMethod] = useState<'api' | 'subscription'>('api');
+
+  useEffect(() => {
+    void Promise.all([getAgentSetup(), getAgents()])
+      .then(([next, nextAgents]) => {
+        setAgents(nextAgents);
+        if (!next) return;
+        setSetup(next);
+        setBaseUrl(next.config?.baseUrl ?? '');
+        setModel(next.config?.model ?? '');
+        setCapDollars(String(Math.round(next.budget.monthlyCapCents / 100)));
+        setAgentId(
+          next.schedule?.agentId &&
+            nextAgents.some(
+              (agent) => agent.id === next.schedule?.agentId && agent.status === 'active'
+            )
+            ? next.schedule.agentId
+            : (nextAgents.find((agent) => agent.status === 'active' && agent.isDefault)?.id ??
+                nextAgents.find((agent) => agent.status === 'active')?.id ??
+                '')
+        );
+        setScheduleGoal(next.schedule?.goal ?? DEFAULT_AUTOPILOT_GOAL);
+        setScheduleInterval(next.schedule?.intervalMinutes ?? 1440);
+        if (next.cli.config) {
+          setCliKind(next.cli.config.cli);
+          setCliModel(next.cli.config.model);
+        }
+        const cliReady = Boolean(next.cli.config && next.cli.riskAccepted && next.cli.tokenStored);
+        const apiConfigured = Boolean(next.config || next.secret);
+        setAccessMethod(
+          cliReady || (!apiConfigured && Boolean(next.cli.config)) ? 'subscription' : 'api'
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => setLoaded(true));
+  }, []);
+
+  const removeKey = async () => {
+    setBusy('key-remove');
+    setProblem('');
+    try {
+      await deleteAgentKey();
+      setSetup((current) => current && { ...current, secret: null });
+      setApiKey('');
+      setReplacingKey(false);
+      setToast('Key removed here. Revoke it at your provider too.');
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not remove the key'));
+    } finally {
+      setBusy('');
+      setConfirmRemoveKey(false);
+    }
+  };
+
+  const removeCliToken = async () => {
+    setBusy('cli-token-remove');
+    setProblem('');
+    try {
+      await deleteAgentCliToken();
+      setSetup((current) => current && { ...current, cli: { ...current.cli, tokenStored: false } });
+      setCliToken('');
+      setReplacingCliToken(false);
+      setToast(
+        'Subscription token removed here. If you are unsure why, revoke the session at your provider too.'
+      );
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not remove the subscription token'));
+    } finally {
+      setBusy('');
+      setConfirmRemoveCliToken(false);
+    }
+  };
+
+  // Its own write, not part of Save, for the same reason the spend switch is:
+  // revoking consent must take effect in one click, and must never be a side
+  // effect of saving something else.
+  const setCliRisk = async (accepted: boolean) => {
+    setBusy('cli-risk');
+    setProblem('');
+    try {
+      const riskAccepted = await setAgentCliRiskAccepted(accepted);
+      setSetup((current) => current && { ...current, cli: { ...current.cli, riskAccepted } });
+      setToast(
+        accepted
+          ? 'Risk accepted. You can now store a subscription token below.'
+          : 'Risk acceptance withdrawn. The subscription CLI will not run until you accept it again.'
+      );
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not change the risk acceptance'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // Its own write, not part of Save: an off switch that needs a second click
+  // to take effect is not an off switch.
+  const setSpending = async (enabled: boolean) => {
+    setBusy('spend');
+    setProblem('');
+    try {
+      const budget = await saveAgentBudget({ enabled });
+      setSetup((current) => current && { ...current, budget });
+      setToast(
+        enabled
+          ? `Spending on, up to ${usd(budget.monthlyCapCents)} a month.`
+          : 'Spending off. Trevra will not pay for another model call.'
+      );
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not change the spending switch'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const setAutopilot = async (enabled: boolean) => {
+    if (!scheduleGoal.trim() || !agentId) return;
+    setBusy('schedule-toggle');
+    setProblem('');
+    try {
+      const schedule = await saveAgentSchedule({
+        enabled,
+        goal: scheduleGoal.trim(),
+        intervalMinutes: scheduleInterval,
+        agentId
+      });
+      setSetup((current) => current && { ...current, schedule });
+      setToast(
+        enabled
+          ? 'GTM Autopilot is on. Trevra will keep preparing the next work on this cadence.'
+          : 'GTM Autopilot is off. Scheduled agent runs will not start.'
+      );
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not change GTM Autopilot'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const saveAutopilot = async () => {
+    if (!scheduleGoal.trim() || !agentId) return;
+    setBusy('schedule-save');
+    setProblem('');
+    try {
+      const schedule = await saveAgentSchedule({
+        goal: scheduleGoal.trim(),
+        intervalMinutes: scheduleInterval,
+        agentId
+      });
+      setSetup((current) => current && { ...current, schedule });
+      setToast('GTM Autopilot instructions saved.');
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not save GTM Autopilot'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const runNow = async () => {
+    const job = goal.trim();
+    if (!job) return;
+    setBusy('run');
+    setProblem('');
+    try {
+      const run = await startAgentRun({ agentId: agentId || undefined, goal: job });
+      setToast('Started. Every step it takes shows up in the run ledger as it happens.');
+      onInspectRun(run.id);
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not start the run'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // Nothing at all rather than a broken panel: a build without the hosted
+  // agent has no such route, and "this feature is not here" is not a question
+  // to hand a founder.
+  if (!loaded || !setup) return null;
+
+  const { available, config, secret, budget } = setup;
+
+  // Nothing at all when the deployment cannot encrypt a key: there is
+  // nowhere to put one, so there is nothing here to set up or paste.
+  // AgentAccessPanel above is unaffected and still renders.
+  if (!available) return null;
+
+  const capCents = Math.round(Number(capDollars) * 100);
+  const capValid =
+    Number.isFinite(Number(capDollars)) && Number(capDollars) >= 0 && Number(capDollars) <= 10_000;
+
+  const dirtyConfig = config
+    ? baseUrl.trim() !== config.baseUrl || model.trim() !== config.model
+    : Boolean(baseUrl.trim() || model.trim());
+  const dirtyKey = apiKey.trim().length > 0;
+  const dirtyCap = capValid && capCents !== budget.monthlyCapCents;
+
+  const cliSetup = setup.cli;
+  const dirtyCliConfig = cliSetup.config
+    ? cliKind !== cliSetup.config.cli || cliModel.trim() !== cliSetup.config.model
+    : Boolean(cliModel.trim());
+  const cliConfigSaved = Boolean(cliSetup.config) && !dirtyCliConfig;
+  const dirtyCliToken = cliSetup.riskAccepted && cliToken.trim().length > 0;
+  const apiAccessDirty = dirtyConfig || dirtyKey;
+  const subscriptionAccessDirty = dirtyCliConfig || dirtyCliToken;
+  const modelAccessDirty = accessMethod === 'api' ? apiAccessDirty : subscriptionAccessDirty;
+
+  const saveModelAccess = async () => {
+    if (accessMethod === 'api') {
+      if (!baseUrl.trim() || !model.trim()) {
+        setProblem('Add both the endpoint and model before saving API access.');
+        return;
+      }
+      if (!secret && !apiKey.trim()) {
+        setProblem('Paste the API key Trevra should use before saving model access.');
+        return;
+      }
+    } else if (!cliModel.trim()) {
+      setProblem('Name the model your subscription CLI should use before saving.');
+      return;
+    }
+
+    setBusy('model-access-save');
+    setProblem('');
+    try {
+      if (accessMethod === 'api') {
+        if (dirtyConfig) {
+          const next = await saveAgentModelConfig({
+            baseUrl: baseUrl.trim(),
+            model: model.trim()
+          });
+          setSetup((current) => current && { ...current, config: next });
+        }
+        if (dirtyKey) {
+          const next = await saveAgentKey({ apiKey: apiKey.trim() });
+          setSetup((current) => current && { ...current, secret: next });
+          setApiKey('');
+          setReplacingKey(false);
+        }
+        setToast('API model access saved.');
+      } else {
+        if (dirtyCliConfig) {
+          const next = await saveAgentCliConfig({ cli: cliKind, model: cliModel.trim() });
+          setSetup((current) => current && { ...current, cli: { ...current.cli, config: next } });
+        }
+        if (dirtyCliToken) {
+          await saveAgentCliToken({ token: cliToken.trim() });
+          setSetup(
+            (current) => current && { ...current, cli: { ...current.cli, tokenStored: true } }
+          );
+          setCliToken('');
+          setReplacingCliToken(false);
+        }
+        setToast('Subscription model access saved.');
+      }
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not save model access'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // Its own write, not part of Save: the cap sits in the same panel as the
+  // endpoint, the key and the subscription CLI, but changing it must never
+  // also submit whatever else on the panel happens to be dirty. Its own
+  // button, right next to the amount, calls only this.
+  const saveCap = async () => {
+    if (!capValid) {
+      setProblem('Set a monthly cap between $0 and $10,000.');
+      return;
+    }
+    setBusy('cap-save');
+    setProblem('');
+    try {
+      const next = await saveAgentBudget({ monthlyCapCents: capCents });
+      setSetup((current) => current && { ...current, budget: next });
+      setCapDollars(String(Math.round(next.monthlyCapCents / 100)));
+      setToast(`Cap saved: ${usd(next.monthlyCapCents)} a month.`);
+    } catch (error) {
+      setProblem(agentSetupMessage(error, 'Could not save the cap'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const capReached = budget.spentCents >= budget.monthlyCapCents && budget.monthlyCapCents > 0;
+
+  // Two independent ways to be ready to run: a stored key against a configured
+  // endpoint (BYOK), or a fully accepted subscription CLI. Either is enough --
+  // this only asks for both when neither is done.
+  const byokReady = Boolean(config && secret);
+  const cliReady = Boolean(cliSetup.config && cliSetup.riskAccepted && cliSetup.tokenStored);
+
+  const runBlocker = hostedRunBlocker({
+    role,
+    dirtyCap,
+    modelAccessDirty,
+    modelAccessMissing: !byokReady && !cliReady,
+    spendingEnabled: budget.enabled,
+    capReached,
+    monthlyCapCents: budget.monthlyCapCents,
+    agentId,
+    goal
+  });
+
+  const modelAccessCanSave =
+    modelAccessDirty &&
+    (accessMethod === 'api'
+      ? Boolean(baseUrl.trim() && model.trim() && (secret || apiKey.trim()))
+      : Boolean(cliModel.trim()));
+
+  const scheduleDirty =
+    !setup.schedule ||
+    setup.schedule.goal !== scheduleGoal.trim() ||
+    setup.schedule.intervalMinutes !== scheduleInterval ||
+    setup.schedule.agentId !== agentId;
+
+  const agentField = (label = 'Agent') => (
+    <Field label={label}>
+      <Select value={agentId} onChange={(event) => setAgentId(event.target.value)}>
+        {agents.map((agent) => (
+          <option key={agent.id} value={agent.id} disabled={agent.status !== 'active'}>
+            {agent.name}
+            {agent.status === 'active' ? '' : ` · ${agent.status}`}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  );
+
+  const goalField = (label: string) => (
+    <Field label={label} hint={runBlocker ?? undefined}>
+      <Textarea
+        rows={5}
+        value={goal}
+        onChange={(event) => setGoal(event.target.value)}
+        placeholder="Review inbound replies and prepare the next GTM follow-ups worth my attention."
+      />
+    </Field>
+  );
+
+  return (
+    <Panel
+      className="agent-panel byok-panel"
+      icon={<Bot size={18} />}
+      title="Hosted agent"
+      description="Let Trevra keep this Agent working when your computer is offline. Configure model access, limits, automation, and one-off runs here."
+    >
+      {problem && <div className="error-banner byok-error">{problem}</div>}
+
+      <FormSection
+        title="Agent"
+        description="Run once uses this Agent; saving Autopilot applies the same selection to its schedule."
+      >
+        <FormGrid>{agentField('Selected Agent')}</FormGrid>
+      </FormSection>
+
+      {role === 'member' && (
+        <FormSection
+          title="Model access"
+          description="How hosted runs reach a model, and what they may spend."
+        >
+          <p className="byok-method-note">
+            {byokReady || cliReady
+              ? 'Model access is configured.'
+              : 'Model access is not set up yet.'}{' '}
+            Model spending is {budget.enabled ? 'on' : 'off'}, with {usd(budget.spentCents)} of{' '}
+            {usd(budget.monthlyCapCents)} used this month.
+          </p>
+          <OwnerOnlyNote>change model access or the spending limit</OwnerOnlyNote>
+        </FormSection>
+      )}
+
+      {isOwner && (
+        <FormSection
+          title="Model access"
+          description="Configure one credential path at a time. If both paths are ready, Trevra uses the subscription path first."
+        >
+          <FormGrid>
+            <Field label="Method to configure">
+              <Select
+                value={accessMethod}
+                onChange={(event) => setAccessMethod(event.target.value as 'api' | 'subscription')}
+              >
+                <option value="api">API key</option>
+                <option value="subscription">Claude/Codex subscription</option>
+              </Select>
+            </Field>
+          </FormGrid>
+
+          {byokReady && cliReady && (
+            <p className="byok-method-note">
+              Both methods are ready. Hosted runs use the workspace subscription first; API access
+              remains stored if that subscription setup is removed.
+            </p>
+          )}
+
+          {accessMethod === 'api' ? (
+            <>
+              <FormGrid layout="split">
+                <Field label="Endpoint">
+                  <Input
+                    value={baseUrl}
+                    onChange={(event) => setBaseUrl(event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Field>
+                <Field label="Model">
+                  <Input
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                    placeholder="Model name from your provider"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Field>
+              </FormGrid>
+
+              {secret && !replacingKey ? (
+                <div className="byok-key-stored">
+                  <span className="byok-key-mask">
+                    <KeyRound size={16} /> •••• {secret.last4}
+                  </span>
+                  <span>
+                    {secret.label ? `${secret.label} · ` : ''}Added{' '}
+                    {new Date(secret.createdAt).toLocaleDateString()}
+                  </span>
+                  <div className="byok-key-actions">
+                    <Button onClick={() => setReplacingKey(true)}>Replace</Button>
+                    <Button
+                      variant="ghost"
+                      className="danger"
+                      disabled={busy === 'key-remove'}
+                      onClick={() => setConfirmRemoveKey(true)}
+                    >
+                      {busy === 'key-remove' ? (
+                        <LoaderCircle className="spin" size={15} />
+                      ) : (
+                        <Trash2 size={15} />
+                      )}{' '}
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <FormGrid>
+                    <Field label={secret ? 'New API key' : 'API key'}>
+                      <Input
+                        type="password"
+                        value={apiKey}
+                        onChange={(event) => setApiKey(event.target.value)}
+                        placeholder="Paste the key here"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </Field>
+                  </FormGrid>
+                  {secret && (
+                    <ActionRow>
+                      <Button
+                        variant="ghost"
+                        onClick={() => {
+                          setReplacingKey(false);
+                          setApiKey('');
+                        }}
+                      >
+                        Cancel replacement
+                      </Button>
+                    </ActionRow>
+                  )}
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              <FormGrid layout="split">
+                <Field label="Subscription">
+                  <Select
+                    value={cliKind}
+                    onChange={(event) => setCliKind(event.target.value as 'claude' | 'codex')}
+                  >
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                  </Select>
+                </Field>
+                <Field label="Model">
+                  <Input
+                    value={cliModel}
+                    onChange={(event) => setCliModel(event.target.value)}
+                    placeholder="Model name used by the subscription CLI"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Field>
+              </FormGrid>
+
+              <SwitchField
+                className="is-caution"
+                label="Accept subscription risk"
+                description="Using a personal subscription for unattended Trevra runs may breach your provider's terms."
+                checked={cliSetup.riskAccepted}
+                disabled={busy === 'cli-risk' || !cliConfigSaved}
+                onChange={(event) => void setCliRisk(event.target.checked)}
+              />
+              {!cliConfigSaved && (
+                <p className="byok-method-note">
+                  Save the subscription and model first. Then you can accept the risk and store its
+                  token.
+                </p>
+              )}
+
+              {cliSetup.riskAccepted &&
+                (cliSetup.tokenStored && !replacingCliToken ? (
+                  <div className="byok-key-stored">
+                    <span className="byok-key-mask">
+                      <KeyRound size={16} /> Subscription token stored
+                    </span>
+                    <span />
+                    <div className="byok-key-actions">
+                      <Button onClick={() => setReplacingCliToken(true)}>Replace</Button>
+                      <Button
+                        variant="ghost"
+                        className="danger"
+                        disabled={busy === 'cli-token-remove'}
+                        onClick={() => setConfirmRemoveCliToken(true)}
+                      >
+                        {busy === 'cli-token-remove' ? (
+                          <LoaderCircle className="spin" size={15} />
+                        ) : (
+                          <Trash2 size={15} />
+                        )}{' '}
+                        Remove
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <FormGrid>
+                      <Field
+                        label={
+                          cliSetup.tokenStored ? 'New subscription token' : 'Subscription token'
+                        }
+                      >
+                        <Input
+                          type="password"
+                          value={cliToken}
+                          onChange={(event) => setCliToken(event.target.value)}
+                          placeholder="Paste the token here"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </Field>
+                    </FormGrid>
+                    {cliSetup.tokenStored && (
+                      <ActionRow>
+                        <Button
+                          variant="ghost"
+                          onClick={() => {
+                            setReplacingCliToken(false);
+                            setCliToken('');
+                          }}
+                        >
+                          Cancel replacement
+                        </Button>
+                      </ActionRow>
+                    )}
+                  </>
+                ))}
+            </>
+          )}
+
+          <ActionRow
+            note={
+              accessMethod === 'api'
+                ? secret
+                  ? 'The stored API key is encrypted and cannot be revealed again.'
+                  : 'Trevra stores the key encrypted and never shows it again.'
+                : cliSetup.riskAccepted
+                  ? 'The subscription token is stored encrypted and cannot be revealed again.'
+                  : 'Subscription access stays off until the risk is accepted.'
+            }
+          >
+            <Button
+              disabled={!modelAccessCanSave || busy === 'model-access-save'}
+              onClick={() => void saveModelAccess()}
+            >
+              {busy === 'model-access-save' ? (
+                <LoaderCircle className="spin" size={15} />
+              ) : (
+                <Check size={15} />
+              )}{' '}
+              Save model access
+            </Button>
+          </ActionRow>
+        </FormSection>
+      )}
+
+      {isOwner && (
+        <FormSection
+          title="Spending limit"
+          description="Control whether hosted runs may use paid model access and set the monthly hard limit."
+        >
+          <SwitchField
+            label="Allow model spending"
+            description="When off, scheduled and one-off hosted runs cannot make model calls."
+            checked={budget.enabled}
+            disabled={busy === 'spend'}
+            onChange={(event) => void setSpending(event.target.checked)}
+          />
+          <FormGrid>
+            <Field label="Monthly maximum" hint="Hard workspace limit for hosted model calls.">
+              <span className="byok-amount">
+                <small>$</small>
+                <Input
+                  type="number"
+                  min="0"
+                  max="10000"
+                  step="1"
+                  value={capDollars}
+                  onChange={(event) => setCapDollars(event.target.value)}
+                />
+              </span>
+            </Field>
+          </FormGrid>
+          <ActionRow note={`${usd(budget.spentCents)} spent in the current period.`}>
+            <Button
+              disabled={!capValid || !dirtyCap || busy === 'cap-save'}
+              onClick={() => void saveCap()}
+            >
+              {busy === 'cap-save' ? (
+                <LoaderCircle className="spin" size={14} />
+              ) : (
+                <Check size={14} />
+              )}{' '}
+              Save spending limit
+            </Button>
+          </ActionRow>
+        </FormSection>
+      )}
+
+      {role === 'member' && (
+        <FormSection
+          title="Autopilot"
+          description="Run this Agent automatically on a cadence with one standing GTM job."
+        >
+          <p className="byok-schedule-status">
+            {setup.schedule
+              ? `${setup.schedule.enabled ? 'Running' : 'Paused'} · last run ${
+                  setup.schedule.lastRunAt
+                    ? new Date(setup.schedule.lastRunAt).toLocaleString()
+                    : 'never'
+                }`
+              : 'Autopilot is not set up.'}
+          </p>
+          <OwnerOnlyNote>change Autopilot</OwnerOnlyNote>
+        </FormSection>
+      )}
+
+      {isOwner && (
+        <FormSection
+          title="Autopilot"
+          description="Run this Agent automatically on a cadence with one standing GTM job."
+        >
+          <SwitchField
+            label="Run automatically"
+            description="When on, Trevra starts this Agent on the schedule below without waiting for your computer."
+            checked={Boolean(setup.schedule?.enabled)}
+            disabled={busy === 'schedule-toggle' || !scheduleGoal.trim() || !agentId}
+            onChange={(event) => void setAutopilot(event.target.checked)}
+          />
+          <FormGrid>
+            <Field label="Cadence">
+              <Select
+                value={scheduleInterval}
+                onChange={(event) => setScheduleInterval(Number(event.target.value))}
+              >
+                {AUTOPILOT_CADENCES.map((cadence) => (
+                  <option key={cadence.minutes} value={cadence.minutes}>
+                    {cadence.label}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </FormGrid>
+          <FormGrid>
+            <Field label="Standing job">
+              <Textarea
+                rows={5}
+                value={scheduleGoal}
+                onChange={(event) => setScheduleGoal(event.target.value)}
+              />
+            </Field>
+          </FormGrid>
+          {setup.schedule && (
+            <p className="byok-schedule-status">
+              {setup.schedule.enabled ? 'Running' : 'Paused'} · last run{' '}
+              {setup.schedule.lastRunAt
+                ? new Date(setup.schedule.lastRunAt).toLocaleString()
+                : 'never'}{' '}
+              · next {new Date(setup.schedule.nextRunAt ?? Date.now()).toLocaleString()}
+            </p>
+          )}
+          {!budget.enabled && (
+            <p className="byok-schedule-status">
+              Autopilot can be configured while spending is off, but scheduled model runs will not
+              start until spending is enabled.
+            </p>
+          )}
+          <ActionRow>
+            <Button
+              disabled={
+                !scheduleDirty || !scheduleGoal.trim() || !agentId || busy === 'schedule-save'
+              }
+              onClick={() => void saveAutopilot()}
+            >
+              {busy === 'schedule-save' ? (
+                <LoaderCircle className="spin" size={15} />
+              ) : (
+                <Check size={15} />
+              )}{' '}
+              Save Autopilot
+            </Button>
+          </ActionRow>
+        </FormSection>
+      )}
+
+      <FormSection
+        title="Run once"
+        description="Run one job now without changing the standing Autopilot job."
+      >
+        <FormGrid>{goalField('Job')}</FormGrid>
+        <ActionRow>
+          <Button
+            variant="primary"
+            disabled={Boolean(runBlocker) || busy === 'run'}
+            onClick={() => void runNow()}
+          >
+            {busy === 'run' ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />} Run
+            now
+          </Button>
+        </ActionRow>
+      </FormSection>
+
+      {isOwner && confirmRemoveKey && secret && (
+        <ConfirmDrawer
+          title="Remove this key from Trevra?"
+          tone="danger"
+          body={
+            <>
+              <p>
+                Trevra deletes its encrypted copy of •••• {secret.last4}. Nothing here can read a
+                key back out, so there is nothing to restore — you would have to paste it again from
+                your provider.
+              </p>
+              <p>
+                Anything Trevra’s agent is doing stops at its next model call. Your own agent on
+                your laptop is unaffected and keeps working.
+              </p>
+              <p>
+                <strong>This does not revoke the key at your provider.</strong> If it may have
+                leaked, revoke it there as well.
+              </p>
+            </>
+          }
+          confirmLabel="Remove this key"
+          busy={busy === 'key-remove'}
+          onCancel={() => setConfirmRemoveKey(false)}
+          onConfirm={() => void removeKey()}
+        />
+      )}
+
+      {isOwner && confirmRemoveCliToken && (
+        <ConfirmDrawer
+          title="Remove this subscription token from Trevra?"
+          tone="danger"
+          body={
+            <>
+              <p>
+                Trevra deletes its encrypted copy of the token. Nothing here can read a token back
+                out, so there is nothing to restore — you would have to create and paste a new one.
+              </p>
+              <p>
+                The subscription CLI stops running this workspace's agent at its next step. Your own
+                agent above and Trevra's key-based agent, if either is set up, are unaffected.
+              </p>
+              <p>
+                <strong>This does not sign the session out at Claude or OpenAI.</strong> If it may
+                have leaked, revoke it there as well.
+              </p>
+            </>
+          }
+          confirmLabel="Remove this token"
+          busy={busy === 'cli-token-remove'}
+          onCancel={() => setConfirmRemoveCliToken(false)}
+          onConfirm={() => void removeCliToken()}
+        />
+      )}
+    </Panel>
+  );
+}
+type LinkedInDrawerTarget = { kind: 'account'; seatKey: string; label: string };
+
+function LinkedInConnectionDrawer({
+  target,
+  setToast,
+  onClose
+}: {
+  target: LinkedInDrawerTarget;
+  setToast: (message: string) => void;
+  onClose: () => void;
+}) {
+  const dialog = useRef<HTMLElement>(null);
+  useDialog(dialog, onClose);
+
+  return createPortal(
+    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        ref={dialog}
+        className="drawer linkedin-connection-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label={target.label}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className="drawer-kicker">LinkedIn</span>
+            <h3>{target.label}</h3>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="Close LinkedIn panel"
+            onClick={onClose}
+          >
+            <X size={18} />
+          </button>
+        </header>
+        <div className="drawer-body linkedin-connection-drawer-body">
+          <LinkedInAccounts
+            setToast={setToast}
+            compact
+            focusSeatKey={target.seatKey}
+            onClose={onClose}
+          />
+        </div>
+      </section>
+    </div>,
+    document.body
+  );
+}
+function ConnectionsView({
+  data,
+  reload,
+  setToast,
+  busyId,
+  setBusyId
+}: {
+  data: DashboardPayload;
+  reload: () => Promise<void>;
+  setToast: (message: string) => void;
+  busyId: string | null;
+  setBusyId: (id: string | null) => void;
+}) {
+  const [confirmDisconnect, setConfirmDisconnect] = useState<ConnectionSummary | null>(null);
+  const [linkedinDrawer, setLinkedinDrawer] = useState<LinkedInDrawerTarget | null>(null);
+  const [addConnectionMode, setAddConnectionMode] = useState<'choose' | 'linkedin' | null>(null);
+  const [linkedinAccounts, setLinkedinAccounts] = useState<Array<{
+    seatKey: string;
+    label: string;
+  }> | null>(null);
+  const [companionBrowser, setCompanionBrowser] = useState(false);
+  const available: AvailableIntegration[] = data.availableIntegrations.filter(
+    (item) => item.mode !== 'import'
+  );
+  const addable = available.filter((item) => !item.connected);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([getLinkedInManagerSeats(), getLinkedInWorkerStatus().catch(() => null)])
+      .then(([accounts, worker]) => {
+        if (!cancelled) {
+          setLinkedinAccounts(
+            accounts.map((account) => ({ seatKey: account.seatKey, label: account.label }))
+          );
+          setCompanionBrowser(Boolean(worker?.companionBrowser));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLinkedinAccounts(null);
+          setCompanionBrowser(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [linkedinDrawer, addConnectionMode]);
+
+  const openConnect = async (key: string) => {
+    setBusyId(key);
+    try {
+      const session = await createConnectSession([key]);
+      const { default: Nango } = await import('@nangohq/frontend');
+      const nango = new Nango({ connectSessionToken: session.token, host: session.browser_host });
+      nango.openConnectUI({
+        sessionToken: session.token,
+        onEvent: (event) => {
+          if (event.type === 'close') {
+            void reload();
+            setToast('Connection flow closed. Trevra will sync when authorization completes.');
+          }
+        }
+      });
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'Unable to connect');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <>
+      <Panel
+        id="connections"
+        title="Connections"
+        description="External services and accounts Trevra can work with."
+        actions={
+          addConnectionMode === null ? (
+            <Button onClick={() => setAddConnectionMode('choose')}>
+              <Plus size={14} /> Add connection
+            </Button>
+          ) : undefined
+        }
+      >
+        {addConnectionMode === 'choose' && (
+          <div className="connection-add-panel">
+            <div className="workspace-subsection-heading">
+              <div>
+                <h4>Add connection</h4>
+                <p>Choose what you want to connect to this workspace.</p>
+              </div>
+            </div>
+            <div className="connection-add-options">
+              <button
+                className="connection-add-option"
+                type="button"
+                onClick={() => setAddConnectionMode('linkedin')}
+              >
+                <span className="integration-logo">
+                  <Linkedin size={18} />
+                </span>
+                <span>
+                  <strong>LinkedIn account</strong>
+                  <small>Add another LinkedIn account to this workspace.</small>
+                </span>
+                <ChevronRight size={17} />
+              </button>
+
+              {addable.map((item) => (
+                <button
+                  className="connection-add-option"
+                  type="button"
+                  key={item.key}
+                  disabled={busyId === item.key}
+                  onClick={() => {
+                    setAddConnectionMode(null);
+                    void openConnect(item.key);
+                  }}
+                >
+                  <span className="integration-logo">{initials(item.name)}</span>
+                  <span>
+                    <strong>{item.name}</strong>
+                    <small>{item.description}</small>
+                  </span>
+                  {busyId === item.key ? (
+                    <LoaderCircle className="spin" size={17} />
+                  ) : (
+                    <ChevronRight size={17} />
+                  )}
+                </button>
+              ))}
+            </div>
+            <div className="panel-footer">
+              <span />
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => setAddConnectionMode(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {addConnectionMode === 'linkedin' && (
+          <div className="connection-add-panel connection-add-linkedin">
+            <LinkedInAccounts
+              setToast={setToast}
+              compact
+              startAdding
+              onClose={() => setAddConnectionMode(null)}
+            />
+          </div>
+        )}
+
+        <div className="connection-grid">
+          {data.connections.map((connection) => (
+            <article className="connection-card" key={connection.id}>
+              <span className="integration-logo">{initials(connection.provider)}</span>
+              <div>
+                <h4 aria-level={3}>{prettyProvider(connection.provider)}</h4>
+                <p>{connection.displayName ?? connection.providerConfigKey}</p>
+                <span className={`connection-status ${connection.status}`}>
+                  {connection.isDemo ? 'Demo' : connection.status.replace('_', ' ')}
+                </span>
+                {connection.lastSyncedAt && <p>Synced {relativeTime(connection.lastSyncedAt)}</p>}
+                {connection.lastError && <p>{connection.lastError}</p>}
+              </div>
+              <div className="connection-actions">
+                {(connection.status === 'needs_reauth' || connection.status === 'error') && (
+                  <button
+                    className="secondary-button"
+                    disabled={busyId === connection.providerConfigKey}
+                    onClick={() => void openConnect(connection.providerConfigKey)}
+                  >
+                    {busyId === connection.providerConfigKey ? (
+                      <LoaderCircle className="spin" size={16} />
+                    ) : (
+                      <Link2 size={16} />
+                    )}
+                    Reconnect
+                  </button>
+                )}
+                {!connection.isDemo && (
+                  <button
+                    className="icon-button danger"
+                    aria-label={`Disconnect ${prettyProvider(connection.provider)}`}
+                    title={`Disconnect ${prettyProvider(connection.provider)}`}
+                    disabled={busyId === connection.id}
+                    onClick={() => setConfirmDisconnect(connection)}
+                  >
+                    <Unplug size={17} />
+                  </button>
+                )}
+              </div>
+            </article>
+          ))}
+
+          <article className="connection-card connection-card-linkedin">
+            <span className="integration-logo">
+              <Linkedin size={18} />
+            </span>
+            <div>
+              <h4 aria-level={3}>LinkedIn</h4>
+              {linkedinAccounts && linkedinAccounts.length > 0 ? (
+                <div className="connection-account-list" aria-label="Connected LinkedIn accounts">
+                  {linkedinAccounts.map((account) => (
+                    <button
+                      key={account.seatKey}
+                      className="connection-account-link"
+                      type="button"
+                      onClick={() =>
+                        setLinkedinDrawer({
+                          kind: 'account',
+                          seatKey: account.seatKey,
+                          label: account.label
+                        })
+                      }
+                    >
+                      {account.label}
+                    </button>
+                  ))}
+                </div>
+              ) : linkedinAccounts === null ? (
+                <span className="connection-status disconnected">Checking…</span>
+              ) : (
+                <span className="connection-status disconnected">Not connected</span>
+              )}
+            </div>
+          </article>
+        </div>
+      </Panel>
+
+      {companionBrowser && <CompanionPanel setToast={setToast} />}
+
+      {linkedinDrawer && (
+        <LinkedInConnectionDrawer
+          target={linkedinDrawer}
+          setToast={setToast}
+          onClose={() => setLinkedinDrawer(null)}
+        />
+      )}
+
+      {confirmDisconnect && (
+        <ConfirmDrawer
+          title={`Disconnect ${prettyProvider(confirmDisconnect.provider)}?`}
+          tone="danger"
+          body={
+            <p>
+              Trevra will stop syncing this connection. Existing run history and ledger records stay
+              intact.
+            </p>
+          }
+          confirmLabel="Disconnect"
+          busy={busyId === confirmDisconnect.id}
+          onCancel={() => setConfirmDisconnect(null)}
+          onConfirm={() => {
+            const id = confirmDisconnect.id;
+            setBusyId(id);
+            void disconnectIntegration(id)
+              .then(async () => {
+                setConfirmDisconnect(null);
+                await reload();
+                setToast('Connection disconnected');
+              })
+              .catch((err) => setToast(err instanceof Error ? err.message : 'Unable to disconnect'))
+              .finally(() => setBusyId(null));
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+const SIDE_EFFECT_CHOICES = [
+  { value: 'external-write', label: 'Sends or changes something outside your business' },
+  { value: 'network-read', label: 'Reads something from outside' },
+  { value: 'none', label: 'Thinks only, nothing leaves Trevra' }
+] as const;
+const ACTOR_CHOICES = [
+  { value: 'agent', label: 'Your agent' },
+  { value: 'user', label: 'You' },
+  { value: 'system', label: 'Trevra, on a schedule' }
+] as const;
+
+const ENVIRONMENT_CHOICES = [
+  { value: 'production', label: 'Your live workspace' },
+  { value: 'development', label: 'A development copy' },
+  { value: 'test', label: 'Automated tests' }
+] as const;
+
+type ConditionChoice = { value: string; label: string };
+
+type ConditionDraft = {
+  sideEffects: string[];
+};
+
+const EMPTY_CONDITIONS: ConditionDraft = {
+  sideEffects: []
+};
+
+const conditionLabel = (choices: readonly ConditionChoice[], value: string) =>
+  choices.find((choice) => choice.value === value)?.label ?? value;
+
+/** A list matches if ANY entry matches, so these read as "or". */
+const orList = (parts: string[]) =>
+  parts.length <= 1 ? (parts[0] ?? '') : `${parts.slice(0, -1).join(', ')} or ${parts.at(-1)}`;
+
+const asStringList = (value: unknown): string[] => (Array.isArray(value) ? value.map(String) : []);
+const asNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+/**
+ * Emit exactly the object the server matches on, with empty keys omitted:
+ * `{sideEffects: []}` matches nothing, so sending it would silently disarm the
+ * rule the founder just wrote.
+ *
+ * `base` is the raw conditions of the policy being edited (omitted for a new
+ * one). The form only models `sideEffects`, but a policy authored before it
+ * shrank may carry maxAmount/minConfidence/maxRecipients/actorTypes/
+ * environments -- keys this form never shows and so must never delete.
+ * Those ride forward unchanged; only `sideEffects` is replaced by the form.
+ */
+function buildConditions(
+  draft: ConditionDraft,
+  base: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const conditions: Record<string, unknown> = { ...base };
+  if (draft.sideEffects.length > 0) conditions.sideEffects = draft.sideEffects;
+  else delete conditions.sideEffects;
+  return conditions;
+}
+
+/** The saved rule, as a sentence a founder can check. Never as JSON. */
+function describePolicy(
+  effect: WorkspacePolicy['effect'],
+  conditions: Record<string, unknown>
+): string {
+  const verb =
+    effect === 'deny'
+      ? 'Blocks it'
+      : effect === 'allow'
+        ? 'Lets it run without asking'
+        : 'Asks you first';
+  const clauses: string[] = [];
+  const sideEffects = asStringList(conditions.sideEffects);
+  if (sideEffects.length > 0)
+    clauses.push(
+      `it ${orList(sideEffects.map((value) => conditionLabel(SIDE_EFFECT_CHOICES, value).toLowerCase()))}`
+    );
+  const actorTypes = asStringList(conditions.actorTypes);
+  if (actorTypes.length > 0)
+    clauses.push(
+      `${orList(actorTypes.map((value) => conditionLabel(ACTOR_CHOICES, value).toLowerCase()))} is the one acting`
+    );
+  const environments = asStringList(conditions.environments);
+  if (environments.length > 0)
+    clauses.push(
+      `it runs in ${orList(environments.map((value) => conditionLabel(ENVIRONMENT_CHOICES, value).toLowerCase()))}`
+    );
+  const playbookIds = asStringList(conditions.playbookIds);
+  if (playbookIds.length > 0) clauses.push(`the job is ${orList(playbookIds)}`);
+  const skillIds = asStringList(conditions.skillIds);
+  if (skillIds.length > 0) clauses.push(`the step is ${orList(skillIds)}`);
+  const maxAmount = asNumber(conditions.maxAmount);
+  if (maxAmount !== null) clauses.push(`the amount is ${money(maxAmount)} or less`);
+  const minConfidence = asNumber(conditions.minConfidence);
+  if (minConfidence !== null)
+    clauses.push(`Trevra is at least ${Math.round(minConfidence * 100)}% sure`);
+  const maxRecipients = asNumber(conditions.maxRecipients);
+  if (maxRecipients !== null)
+    clauses.push(
+      `it reaches ${maxRecipients} ${maxRecipients === 1 ? 'person' : 'people'} or fewer`
+    );
+  return clauses.length === 0 ? `${verb}, every time.` : `${verb} when ${clauses.join(', and ')}.`;
+}
+
+/** The inverse of buildConditions: pre-fills the draft form from a saved
+ * policy's stored conditions, so editing one starts from what is already
+ * there instead of a blank form. */
+function conditionDraftFromPolicy(conditions: Record<string, unknown>): ConditionDraft {
+  // Ignores any other condition keys a saved policy may carry (actorTypes,
+  // environments, thresholds, ...) -- this draft no longer models them, and
+  // does not need to: describePolicy renders those keys straight from the
+  // policy record, and buildConditions is handed the policy's raw conditions
+  // as its `base` on save, so those keys survive the round-trip untouched
+  // even though this draft never shows them.
+  return { sideEffects: asStringList(conditions.sideEffects) };
+}
+
+function ConditionChecklist({
+  legend,
+  choices,
+  selected,
+  onToggle
+}: {
+  legend: string;
+  choices: readonly ConditionChoice[];
+  selected: string[];
+  onToggle: (value: string) => void;
+}) {
+  return (
+    <fieldset className="condition-group">
+      <legend>{legend}</legend>
+      {choices.map((choice) => (
+        <label key={choice.value}>
+          <input
+            type="checkbox"
+            checked={selected.includes(choice.value)}
+            onChange={() => onToggle(choice.value)}
+          />
+          <span>{choice.label}</span>
+        </label>
+      ))}
+    </fieldset>
+  );
+}
+
+/**
+ * The two fields the form stopped asking for.
+ *
+ * `actionPattern` is required by the server schema and `skill:*` is what every
+ * policy this UI has ever written used; `priority` only breaks ties between
+ * rules nobody has been able to author more than one of.
+ */
+const POLICY_DEFAULTS = { actionPattern: 'skill:*', priority: 100 } as const;
+
+function LimitsView({ setToast }: { setToast: (message: string) => void }) {
+  // The shared owner signal (`useIsWorkspaceOwner`, auth-client.ts): a
+  // member never sees New/Edit/Delete/the switch flash before disappearing.
+  const isOwner = useIsWorkspaceOwner();
+  const [busy, setBusy] = useState('');
+  const [policies, setPolicies] = useState<WorkspacePolicy[]>([]);
+  const [policiesLoaded, setPoliciesLoaded] = useState(false);
+  const [policyLoadError, setPolicyLoadError] = useState('');
+  const [confirmDeletePolicy, setConfirmDeletePolicy] = useState<WorkspacePolicy | null>(null);
+  // The form renders on demand, not on every visit -- most workspaces read
+  // this list far more often than they write to it. `editingPolicy` is null
+  // for a new policy and set for one being edited in place.
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingPolicy, setEditingPolicy] = useState<WorkspacePolicy | null>(null);
+  const [policyDraft, setPolicyDraft] = useState({
+    name: 'Ask me before anything leaves my business',
+    effect: 'require_approval' as WorkspacePolicy['effect']
+  });
+  const [conditionDraft, setConditionDraft] = useState<ConditionDraft>({
+    ...EMPTY_CONDITIONS,
+    sideEffects: ['external-write']
+  });
+
+  const toggleCondition = (key: 'sideEffects', value: string) =>
+    setConditionDraft((current) => ({
+      ...current,
+      [key]: current[key].includes(value)
+        ? current[key].filter((entry) => entry !== value)
+        : [...current[key], value]
+    }));
+
+  useEffect(() => {
+    void getPolicies()
+      .then((next) => {
+        setPolicies(next);
+        setPolicyLoadError('');
+      })
+      .catch(() => setPolicyLoadError('Unable to read workspace limits.'))
+      .finally(() => setPoliciesLoaded(true));
+  }, []);
+
+  const resetDraft = () => {
+    setPolicyDraft({
+      name: 'Ask me before anything leaves my business',
+      effect: 'require_approval'
+    });
+    setConditionDraft({ ...EMPTY_CONDITIONS, sideEffects: ['external-write'] });
+  };
+
+  const openNewPolicyForm = () => {
+    setEditingPolicy(null);
+    resetDraft();
+    setFormOpen(true);
+  };
+
+  // Pre-fills the same form a new policy uses, so editing one is "change what
+  // is wrong, then save" instead of deleting it and retyping every field.
+  const openEditPolicyForm = (policy: WorkspacePolicy) => {
+    setEditingPolicy(policy);
+    setPolicyDraft({
+      name: policy.name,
+      effect: policy.effect
+    });
+    setConditionDraft(conditionDraftFromPolicy(policy.conditions));
+    setFormOpen(true);
+  };
+
+  const closeForm = () => {
+    setFormOpen(false);
+    setEditingPolicy(null);
+  };
+
+  const savePolicy = async () => {
+    if (!policyDraft.name.trim()) return;
+    // `POLICY_DEFAULTS` still rides along on every write: the form only
+    // exposes name, effect and side-effects now, but the PATCH body must not
+    // blank actionPattern/priority just because this form stopped showing
+    // them.
+    const payload = {
+      name: policyDraft.name.trim(),
+      actionPattern: POLICY_DEFAULTS.actionPattern,
+      effect: policyDraft.effect,
+      priority: POLICY_DEFAULTS.priority,
+      conditions: buildConditions(conditionDraft, editingPolicy?.conditions)
+    };
+    setBusy(editingPolicy ? 'policy-edit' : 'policy-create');
+    try {
+      if (editingPolicy) {
+        // The form has no enabled/disabled control -- that lives on the row's
+        // own toggle -- so an edit must carry the policy's current `enabled`
+        // forward rather than force it back on.
+        setPolicies(
+          await updatePolicy(editingPolicy.id, { ...payload, enabled: editingPolicy.enabled })
+        );
+        setToast('Limit updated.');
+      } else {
+        setPolicies(await createPolicy({ ...payload, enabled: true }));
+        setToast('Limit saved');
+      }
+      closeForm();
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'Unable to save this limit');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const removePolicy = async (policyId: string) => {
+    setBusy(policyId);
+    try {
+      await deletePolicy(policyId);
+      setPolicies(await getPolicies());
+      if (editingPolicy?.id === policyId) closeForm();
+      setToast('Limit deleted.');
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : 'Could not delete that limit.');
+    } finally {
+      setBusy('');
+      setConfirmDeletePolicy(null);
+    }
+  };
+
+  const saving = busy === 'policy-create' || busy === 'policy-edit';
+  const draftIncomplete = !policyDraft.name.trim();
+
+  return (
+    <>
+      <Panel
+        className="policy-panel"
+        id="limits"
+        icon={<ShieldCheck size={18} />}
+        title="Hard limits"
+        description="Workspace-wide guardrails that constrain what Trevra and its Agents may do."
+        actions={
+          isOwner && !formOpen ? (
+            <Button onClick={openNewPolicyForm}>
+              <ShieldCheck size={14} /> New policy
+            </Button>
+          ) : undefined
+        }
+      >
+        {formOpen && (
+          <>
+            <FormGrid layout="split">
+              <Field label="Name it">
+                <Input
+                  value={policyDraft.name}
+                  onChange={(event) => setPolicyDraft({ ...policyDraft, name: event.target.value })}
+                />
+              </Field>
+              <Field label="What happens">
+                <Select
+                  value={policyDraft.effect}
+                  onChange={(event) =>
+                    setPolicyDraft({
+                      ...policyDraft,
+                      effect: event.target.value as WorkspacePolicy['effect']
+                    })
+                  }
+                >
+                  <option value="allow">Let it run</option>
+                  <option value="require_approval">Ask me first</option>
+                  <option value="deny">Block it</option>
+                </Select>
+              </Field>
+            </FormGrid>
+            <fieldset className="policy-conditions">
+              <legend>When does it apply?</legend>
+              <div className="condition-groups">
+                <ConditionChecklist
+                  legend="What is being done"
+                  choices={SIDE_EFFECT_CHOICES}
+                  selected={conditionDraft.sideEffects}
+                  onToggle={(value) => toggleCondition('sideEffects', value)}
+                />
+              </div>
+            </fieldset>
+            <ActionRow>
+              <Button variant="ghost" disabled={saving} onClick={closeForm}>
+                Cancel
+              </Button>
+              <Button disabled={saving || draftIncomplete} onClick={() => void savePolicy()}>
+                {saving ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}{' '}
+                {editingPolicy ? 'Save changes' : 'Add limit'}
+              </Button>
+            </ActionRow>
+          </>
+        )}
+
+        {policyLoadError ? (
+          <div className="error-banner">{policyLoadError}</div>
+        ) : !policiesLoaded ? (
+          <p className="empty-copy">Reading workspace limits…</p>
+        ) : policies.length === 0 && !formOpen ? (
+          <EmptyState
+            description={
+              isOwner
+                ? 'No custom limits yet. Add a policy when this workspace needs an extra guardrail.'
+                : 'No custom workspace limits have been added.'
+            }
+          />
+        ) : null}
+
+        <div className="workspace-policy-list">
+          {policies.map((policy) => (
+            <article key={policy.id}>
+              <div>
+                <strong>{policy.name}</strong>
+                <code>{policy.actionPattern}</code>
+              </div>
+              <p className="policy-summary">{describePolicy(policy.effect, policy.conditions)}</p>
+              {isOwner && (
+                <div className="mgr-actions">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    disabled={busy === `policy-toggle-${policy.id}`}
+                    onClick={async () => {
+                      setBusy(`policy-toggle-${policy.id}`);
+                      try {
+                        setPolicies(await updatePolicy(policy.id, { enabled: !policy.enabled }));
+                      } catch (error) {
+                        setToast(agentSetupMessage(error, 'Could not change that limit.'));
+                      } finally {
+                        setBusy('');
+                      }
+                    }}
+                  >
+                    {policy.enabled ? 'On' : 'Off'}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={busy === policy.id}
+                    onClick={() => openEditPolicyForm(policy)}
+                  >
+                    <Pencil size={15} /> Edit
+                  </button>
+                  <button
+                    className="ghost-button danger"
+                    disabled={busy === policy.id}
+                    onClick={() => setConfirmDeletePolicy(policy)}
+                  >
+                    {busy === policy.id ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : (
+                      <Trash2 size={15} />
+                    )}{' '}
+                    Delete
+                  </button>
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      </Panel>
+
+      {confirmDeletePolicy && (
+        <ConfirmDrawer
+          title="Delete this limit?"
+          tone="danger"
+          body={
+            <>
+              <p>
+                <strong>{confirmDeletePolicy.name}</strong> —{' '}
+                {describePolicy(confirmDeletePolicy.effect, confirmDeletePolicy.conditions)}
+              </p>
+              <p>Deleting it takes that guardrail off immediately. There is no undo.</p>
+            </>
+          }
+          confirmLabel="Delete this limit"
+          busy={busy === confirmDeletePolicy.id}
+          onCancel={() => setConfirmDeletePolicy(null)}
+          onConfirm={() => void removePolicy(confirmDeletePolicy.id)}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * The export the privacy policy promises, and the erasure it promises after
+ * it. Both routes have existed and been tested since the workspace shipped;
+ * neither had a way in.
+ */
+function WorkspaceDataBlock({ setToast }: { setToast: (message: string) => void }) {
+  const [preview, setPreview] = useState<WorkspaceErasurePreview | null>(null);
+  const [confirmErase, setConfirmErase] = useState(false);
+  const [typed, setTyped] = useState('');
+  const [eraseError, setEraseError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const closeDrawer = () => {
+    setConfirmErase(false);
+    setTyped('');
+    setEraseError(null);
+  };
+
+  // `ConfirmDrawer` has no `disabled` prop -- the gate lives here instead of
+  // on the button. A click that does not satisfy it never reaches the DELETE;
+  // it only ever surfaces why, through the drawer's own `error` banner.
+  const confirmErasure = async () => {
+    if (!preview) return;
+    if (!preview.erasable || preview.inFlight.length > 0) {
+      setEraseError('Stop what is listed above first.');
+      return;
+    }
+    if (typed !== preview.confirmationPhrase) {
+      setEraseError(`Type ${preview.confirmationPhrase} to confirm.`);
+      return;
+    }
+    setBusy(true);
+    setEraseError(null);
+    try {
+      await eraseWorkspace(typed);
+      // The server clears the session on success -- a full page load, not a
+      // refetch, since there is nothing left here to refetch into.
+      window.location.assign('/login');
+    } catch (error) {
+      setEraseError(agentSetupMessage(error, 'Could not erase this workspace.'));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel
+      className="workspace-data-panel"
+      id="workspace-data"
+      title="Workspace data"
+      description="Download a copy of this workspace or permanently remove it from Trevra."
+    >
+      <div className="workspace-data-actions">
+        <a className="secondary-button" href={workspaceExportDownloadPath()} download>
+          Export everything
+        </a>
+
+        <details className="workspace-danger">
+          <summary>Danger zone</summary>
+          <div className="workspace-danger-body">
+            <p>
+              Erasing the workspace is permanent and signs this workspace out when it completes.
+            </p>
+            <button
+              type="button"
+              className="ghost-button danger"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                try {
+                  const next = await previewWorkspaceErasure();
+                  setPreview(next);
+                  setEraseError(null);
+                  setTyped('');
+                  setConfirmErase(true);
+                } catch (error) {
+                  setToast(agentSetupMessage(error, 'Could not read what erasure would remove.'));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              Erase this workspace
+            </button>
+          </div>
+        </details>
+      </div>
+
+      {confirmErase && preview && (
+        <ConfirmDrawer
+          title="Erase this workspace"
+          tone="danger"
+          body={
+            <>
+              <p>
+                {preview.totalRows} rows across {preview.inventory.length} tables. Not reversible.
+              </p>
+              {preview.inFlight.length > 0 && (
+                <ul>
+                  {preview.inFlight.map((reason) => (
+                    <li key={reason}>{reason}</li>
+                  ))}
+                </ul>
+              )}
+              <label>
+                Type {preview.confirmationPhrase}
+                <input value={typed} onChange={(event) => setTyped(event.target.value)} />
+              </label>
+            </>
+          }
+          confirmLabel="Erase"
+          onCancel={closeDrawer}
+          onConfirm={() => void confirmErasure()}
+        />
+      )}
+    </Panel>
+  );
+}
+
+function WorkspaceSwitcher({
+  activeWorkspaceId,
+  activeWorkspaceName,
+  onSwitched
+}: {
+  activeWorkspaceId: string;
+  activeWorkspaceName: string;
+  onSwitched: () => Promise<void>;
+}) {
+  const { data: organizations } = authClient.useListOrganizations();
+  const [switching, setSwitching] = useState(false);
+  const options =
+    organizations && organizations.length > 0
+      ? organizations
+      : [{ id: activeWorkspaceId, name: activeWorkspaceName }];
+  const switchTo = async (organizationId: string) => {
+    if (!organizationId || organizationId === activeWorkspaceId) return;
+    setSwitching(true);
+    try {
+      await authClient.organization.setActive({ organizationId });
+      await onSwitched();
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  return (
+    <div className="sidebar-workspace">
+      <Select
+        className="workspace-switcher"
+        disabled={switching}
+        value={activeWorkspaceId}
+        onChange={(event) => void switchTo(event.target.value)}
+        aria-label="Switch workspace"
+        title={options.length > 1 ? 'Switch workspace' : activeWorkspaceName}
+      >
+        {options.map((organization) => (
+          <option key={organization.id} value={organization.id}>
+            {organization.name}
+          </option>
+        ))}
+      </Select>
+    </div>
+  );
+}
+
+/*
+ * A DESTINATION IS A LINK.
+ *
+ * These were `<button onClick={go(path)}>`, which meant the five places this
+ * app has could not be middle-clicked, cmd-clicked, opened in a second tab or
+ * copied as an address -- and carried `aria-current="page"`, a link semantic,
+ * on an element that was not one. The shell already intercepts in-app anchor
+ * clicks in one place (`ui/route.ts`), so an `<a href>` still navigates
+ * without a page load; it just also behaves like the address it is.
+ */
+function NavButton({
+  active,
+  icon,
+  label,
+  href
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  href: string;
+}) {
+  return (
+    <a
+      className={`nav-item ${active ? 'active' : ''}`}
+      aria-current={active ? 'page' : undefined}
+      href={href}
+    >
+      {icon}
+      {label}
+    </a>
+  );
+}
+
+function viewTitle(route: Route): string {
+  if (route.section === 'loop') return route.sub === 'cost' ? 'Usage and cost' : 'Today';
+  if (route.section === 'outreach') {
+    if (route.sub === 'inbound') return 'New leads';
+    if (route.sub === 'inbox') return 'Messages';
+    if (route.sub === 'opportunities') return 'Deals';
+    if (route.sub === 'posts') return 'Social posts';
+    if (route.sub === 'new') return 'New campaign';
+    if (route.sub === 'campaign') return 'Campaign';
+    if (route.sub === 'workflow') return 'Campaign workflow';
+    return 'Campaigns';
+  }
+  if (route.section === 'ledger') return 'Activity';
+  if (route.section === 'research') return 'Ideas';
+  if (route.section === 'setup') {
+    if (route.sub === 'workspace') return 'Connections and settings';
+    if (route.sub === 'capture') return 'Lead capture';
+    if (route.sub === 'billing') return 'Billing';
+    return 'Advanced settings';
+  }
+  return 'Today';
+}
