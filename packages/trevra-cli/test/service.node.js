@@ -1,0 +1,435 @@
+import assert from 'node:assert/strict';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import { WebSocketServer } from 'ws';
+import { isNewerVersion, officialCompanionPackage, parseVersion } from '../lib/update.js';
+import {
+  installStablePackage,
+  installUserCommand,
+  renderLaunchAgent,
+  renderSystemdUnit,
+  renderWindowsRegistration,
+  servicePaths
+} from '../lib/service.js';
+
+test('installed LinkedIn service keeps autonomous Chrome minimized and recovery visible', () => {
+  const cli = readFileSync(fileURLToPath(new URL('../bin/trevra.js', import.meta.url)), 'utf8');
+  assert.match(cli, /headlessBrowser: false/);
+  assert.match(cli, /minimizedBrowser: true/);
+  assert.match(cli, /runVisibleRecovery\(config, visibleSeatKey\)/);
+  assert.doesNotMatch(cli, /headlessBrowser: true/);
+
+  // Autonomous work minimizes for real, through the browser, once the DevTools
+  // endpoint is up -- the launch switch it used to rely on does not exist.
+  assert.match(cli, /if \(minimized && !headless\) await minimizeBrowser\(handle, seatKey\)/);
+  assert.doesNotMatch(cli, /--start-minimized/);
+
+  // Recovery is the one path that is supposed to interrupt the member, so it
+  // asks for a browser with no minimize at all and raises a window an earlier
+  // autonomous run may have left minimized.
+  const recovery = cli.slice(cli.indexOf('async function runVisibleRecovery'));
+  assert.match(
+    recovery,
+    /ensureBrowser\(config\.workspaceId, seatKey, \{ headless: false, raise: true \}\)/
+  );
+  assert.doesNotMatch(recovery, /minimized: true/);
+  assert.match(cli, /raiseBrowserWindows\(\{/);
+
+  // The relay reuses the browser once per action and must never pull it
+  // forward; only the two interrupting journeys opt into a raise.
+  assert.equal(cli.match(/raise: true/g)?.length, 2);
+});
+
+test('the browser_opening log reports the mode asked for, not one it cannot know yet', () => {
+  const cli = readFileSync(fileURLToPath(new URL('../bin/trevra.js', import.meta.url)), 'utf8');
+  // 0.2.9 logged `mode=minimized` before Chrome had even drawn the window and
+  // was wrong every single time. The achieved state is a separate event now.
+  assert.match(
+    cli,
+    /const browserMode = headless \? 'background' : minimized \? 'minimizing' : 'visible';/
+  );
+  assert.match(cli, /activity\('browser_minimized', `seat=\$\{seatKey\} windows=/);
+  assert.match(cli, /activity\('browser_minimize_failed'/);
+});
+test('companion keeps the DevTools endpoint reader required by browser reuse', () => {
+  const cli = readFileSync(fileURLToPath(new URL('../bin/trevra.js', import.meta.url)), 'utf8');
+  assert.match(cli, /function readDevToolsEndpoint\(profileDir\)/);
+  assert.match(cli, /const onDisk = readDevToolsEndpoint\(profileDir\)/);
+});
+
+test('an open relay is kept alive and reports whether its close was expected', () => {
+  const cli = readFileSync(fileURLToPath(new URL('../bin/trevra.js', import.meta.url)), 'utf8');
+  // Trevra waits up to two minutes between actions, so a relay with no
+  // keepalive on it is a relay that dies in the gap and takes the rest of the
+  // batch with it. Chrome answers protocol pings itself.
+  assert.match(cli, /relay\.heartbeat = setInterval\(/);
+  assert.match(cli, /local\.ping\(\)/);
+  // `relay.expectClose`, never `relays.get(...)`: every other path deletes the
+  // map entry before this event fires, so the lookup form logged expected=false
+  // for every close the companion has ever made, deliberate ones included.
+  assert.match(
+    cli,
+    /activity\('relay_closed', `relay=\$\{relayShort\} expected=\$\{relay\.expectClose\}`\)/
+  );
+  assert.doesNotMatch(cli, /expected=\$\{Boolean\(current\?\.expectClose\)\}/);
+});
+
+test('service paths stay under the user home and never use the project checkout', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-service-test-'));
+  try {
+    const linux = servicePaths(home, 'linux');
+    assert.equal(
+      linux.definition,
+      join(home, '.config', 'systemd', 'user', 'trevra-linkedin.service')
+    );
+    assert.equal(
+      linux.cliPath,
+      join(home, '.trevra', 'service', 'node_modules', 'trevra', 'bin', 'trevra.js')
+    );
+    assert.equal(linux.userCommand, join(home, '.local', 'bin', 'trevra'));
+
+    const mac = servicePaths(home, 'darwin');
+    assert.equal(
+      mac.definition,
+      join(home, 'Library', 'LaunchAgents', 'com.trevra.linkedin.plist')
+    );
+
+    const windows = servicePaths(home, 'win32');
+    assert.equal(windows.manager, 'Task Scheduler');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('setup installs once without pairing and is idempotent', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-setup-test-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'trevra-setup-package-'));
+  const fakeBin = mkdtempSync(join(tmpdir(), 'trevra-setup-bin-'));
+  try {
+    const currentVersion = String(
+      JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+        .version
+    );
+    mkdirSync(join(fixture, 'bin'), { recursive: true });
+    writeFileSync(
+      join(fixture, 'package.json'),
+      JSON.stringify({
+        name: 'trevra',
+        version: currentVersion,
+        type: 'module',
+        bin: { trevra: 'bin/trevra.js' },
+        files: ['bin']
+      })
+    );
+    writeFileSync(join(fixture, 'bin', 'trevra.js'), '#!/usr/bin/env node\nprocess.exit(0);\n');
+    const systemctl = join(fakeBin, 'systemctl');
+    writeFileSync(systemctl, '#!/bin/sh\nexit 0\n');
+    chmodSync(systemctl, 0o755);
+
+    const cli = fileURLToPath(new URL('../bin/trevra.js', import.meta.url));
+    const env = {
+      ...process.env,
+      HOME: home,
+      PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+      TREVRA_COMPANION_INSTALL_SPEC: fixture
+    };
+    const first = spawnSync(process.execPath, [cli, 'linkedin', 'setup'], {
+      env,
+      encoding: 'utf8'
+    });
+    assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`);
+    assert.match(first.stdout, /Companion installed\. Pair this computer/i);
+    assert.equal(
+      JSON.parse(
+        readFileSync(
+          join(home, '.trevra', 'service', 'node_modules', 'trevra', 'package.json'),
+          'utf8'
+        )
+      ).version,
+      currentVersion
+    );
+    assert.ok(
+      readFileSync(join(home, '.config', 'systemd', 'user', 'trevra-linkedin.service'), 'utf8')
+    );
+
+    // Prove a same-version rerun does not touch the install source again.
+    rmSync(fixture, { recursive: true, force: true });
+    const second = spawnSync(process.execPath, [cli, 'linkedin', 'setup'], {
+      env,
+      encoding: 'utf8'
+    });
+    assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`);
+    assert.match(second.stdout, /already installed and ready to pair/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(fixture, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('background service exits cleanly while waiting for first pairing', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-unpaired-run-test-'));
+  try {
+    const cli = fileURLToPath(new URL('../bin/trevra.js', import.meta.url));
+    const result = spawnSync(process.execPath, [cli, 'linkedin', 'run'], {
+      env: { ...process.env, HOME: home },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const log = readFileSync(join(home, '.trevra', 'logs', 'linkedin-companion.log'), 'utf8');
+    assert.match(log, /service_waiting_for_pairing/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('auto-update accepts only newer plain semver releases from the official package path', () => {
+  assert.deepEqual(parseVersion('0.2.0'), [0, 2, 0]);
+  assert.equal(parseVersion('v0.2.0'), null);
+  assert.equal(isNewerVersion('0.2.0', '0.2.1'), true);
+  assert.equal(isNewerVersion('0.2.0', '0.3.0'), true);
+  assert.equal(isNewerVersion('0.2.0', '0.2.0'), false);
+  assert.equal(isNewerVersion('0.2.0', '0.1.9'), false);
+  assert.equal(isNewerVersion('0.2.0', 'latest'), false);
+  assert.equal(
+    officialCompanionPackage('1.4.2'),
+    'https://github.com/olaryn-lab/trevra/releases/download/companion-v1.4.2/trevra-1.4.2.tgz'
+  );
+  assert.throws(() => officialCompanionPackage('../../evil'));
+});
+
+test('background companion auto-updates before accepting relay work', async () => {
+  // The target must be strictly newer than whatever this checkout's own
+  // package.json currently says -- CI's release job runs `npm version
+  // "$VERSION"` (bumping package.json to the release-in-progress version)
+  // *before* `npm test`. A hardcoded '0.2.3' here only worked by accident
+  // while nothing had ever bumped past it; once a real release version
+  // reached or passed it, isNewerVersion() correctly saw nothing to update,
+  // the child never exited, and the test hung. Deriving the target from the
+  // live version keeps this true regardless of what CI bumped it to.
+  const currentVersion = String(
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+      .version
+  );
+  const [major, minor, patch] = parseVersion(currentVersion);
+  const targetVersion = `${major}.${minor}.${patch + 1}`;
+
+  const home = mkdtempSync(join(tmpdir(), 'trevra-auto-update-test-'));
+  const updatePackage = mkdtempSync(join(tmpdir(), 'trevra-update-package-'));
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  let child;
+  try {
+    mkdirSync(join(updatePackage, 'bin'), { recursive: true });
+    writeFileSync(
+      join(updatePackage, 'package.json'),
+      JSON.stringify({
+        name: 'trevra',
+        version: targetVersion,
+        type: 'module',
+        bin: { trevra: 'bin/trevra.js' },
+        files: ['bin']
+      })
+    );
+    writeFileSync(
+      join(updatePackage, 'bin', 'trevra.js'),
+      `#!/usr/bin/env node\nconsole.log("${targetVersion}")\n`
+    );
+
+    await new Promise((resolve) => server.once('listening', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    server.on('connection', (socket) => {
+      socket.send(JSON.stringify({ type: 'hello', companionVersion: targetVersion }));
+    });
+
+    mkdirSync(join(home, '.trevra'), { recursive: true });
+    writeFileSync(
+      join(home, '.trevra', 'companion.json'),
+      JSON.stringify({
+        url: `http://127.0.0.1:${address.port}`,
+        token: 'trv_cmp_test_token_for_update',
+        workspaceId: 'ws_update_test',
+        deviceId: 'dev_update_test',
+        label: 'Update test'
+      })
+    );
+
+    const cli = fileURLToPath(new URL('../bin/trevra.js', import.meta.url));
+    child = spawn(process.execPath, [cli, 'linkedin', 'run'], {
+      env: { ...process.env, HOME: home, TREVRA_COMPANION_UPDATE_SPEC: updatePackage },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    // Captured so a timeout failure explains *why* the child is stuck (e.g. its
+    // own nested `npm install` output) instead of a bare "did not exit" --
+    // that silence is what made the first-ever CI run of this test look like a
+    // 30-minute hang with nothing to go on.
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      output += chunk;
+    });
+
+    const exit = await Promise.race([
+      new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
+      new Promise((_, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error(`auto-update child did not exit within 15s. Output so far:\n${output}`)
+            ),
+          15_000
+        );
+        timer.unref();
+      })
+    ]);
+    assert.deepEqual(exit, { code: 75, signal: null });
+
+    const installed = JSON.parse(
+      readFileSync(
+        join(home, '.trevra', 'service', 'node_modules', 'trevra', 'package.json'),
+        'utf8'
+      )
+    );
+    assert.equal(installed.version, targetVersion);
+    const log = readFileSync(join(home, '.trevra', 'logs', 'linkedin-companion.log'), 'utf8');
+    assert.match(
+      log,
+      new RegExp(
+        `update_available from=${currentVersion.replace(/\./g, '\\.')} to=${targetVersion.replace(/\./g, '\\.')}`
+      )
+    );
+    assert.match(
+      log,
+      new RegExp(`update_installed version=${targetVersion.replace(/\./g, '\\.')}`)
+    );
+  } finally {
+    // A child stuck mid-update must not be left running past this test: an
+    // unreaped child with open stdio pipes keeps `node --test`'s own process
+    // alive indefinitely, turning one flaky/failing test into a CI job that
+    // never exits (rather than failing fast within the 15s timeout above).
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(updatePackage, { recursive: true, force: true });
+  }
+});
+
+test('failed update leaves the currently installed companion untouched', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-update-failure-test-'));
+  const brokenPackage = mkdtempSync(join(tmpdir(), 'trevra-broken-package-'));
+  try {
+    const paths = servicePaths(home, 'linux');
+    mkdirSync(join(paths.serviceRoot, 'node_modules', 'trevra', 'bin'), { recursive: true });
+    writeFileSync(paths.cliPath, '#!/usr/bin/env node\nconsole.log("working")\n');
+    writeFileSync(
+      join(brokenPackage, 'package.json'),
+      JSON.stringify({ name: 'trevra', version: '9.9.9' })
+    );
+    assert.throws(
+      () =>
+        installStablePackage({
+          version: '9.9.9',
+          installSpec: brokenPackage,
+          home,
+          platform: 'linux'
+        }),
+      /service executable is missing/
+    );
+    assert.match(readFileSync(paths.cliPath, 'utf8'), /working/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(brokenPackage, { recursive: true, force: true });
+  }
+});
+
+test('installed service exposes a stable user command without depending on npx', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-command-test-'));
+  try {
+    const paths = servicePaths(home, 'linux');
+    mkdirSync(join(paths.serviceRoot, 'node_modules', 'trevra', 'bin'), { recursive: true });
+    writeFileSync(paths.cliPath, '#!/usr/bin/env node\n');
+    const command = installUserCommand({ home, platform: 'linux' });
+    assert.equal(command, join(home, '.local', 'bin', 'trevra'));
+    assert.equal(readlinkSync(command), paths.cliPath);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('systemd service starts the stable CLI, restarts crashes, and contains no credential material', () => {
+  const unit = renderSystemdUnit({
+    nodePath: '/usr/bin/node',
+    cliPath: '/home/alice/.trevra/service/node_modules/trevra/bin/trevra.js'
+  });
+  assert.match(unit, /linkedin run/);
+  assert.match(unit, /Restart=on-failure/);
+  assert.match(unit, /WantedBy=default\.target/);
+  assert.doesNotMatch(unit, /trv_cmp_|--pair|_authToken|password/i);
+});
+
+test('LaunchAgent restarts only unsuccessful exits and runs at login', () => {
+  const plist = renderLaunchAgent({
+    nodePath: '/usr/local/bin/node',
+    cliPath: '/Users/alice/.trevra/service/node_modules/trevra/bin/trevra.js',
+    stdoutPath: '/Users/alice/.trevra/logs/linkedin.log',
+    stderrPath: '/Users/alice/.trevra/logs/linkedin-error.log'
+  });
+  assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
+  assert.match(plist, /<key>SuccessfulExit<\/key><false\/>/);
+  assert.match(plist, /<string>linkedin<\/string>/);
+  assert.match(plist, /<string>run<\/string>/);
+  assert.doesNotMatch(plist, /trv_cmp_|--pair|password/i);
+});
+
+test('logs command is available without pairing and never needs the service manager', () => {
+  const home = mkdtempSync(join(tmpdir(), 'trevra-logs-test-'));
+  try {
+    mkdirSync(join(home, '.trevra'), { recursive: true });
+    const cli = fileURLToPath(new URL('../bin/trevra.js', import.meta.url));
+    const output = execFileSync(process.execPath, [cli, 'linkedin', 'logs', '--lines', '20'], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home }
+    });
+    assert.match(output, /No companion activity has been logged yet/);
+
+    const help = execFileSync(process.execPath, [cli, 'linkedin', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home }
+    });
+    assert.match(help, /linkedin logs \[--follow\]/);
+    assert.match(help, /linkedin reconnect/);
+    assert.match(help, /--seat KEY/);
+    assert.match(help, /--lines N/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Windows task uses interactive logon and restart-on-failure settings', () => {
+  const script = renderWindowsRegistration({
+    nodePath: 'C:\\Program Files\\nodejs\\node.exe',
+    cliPath: 'C:\\Users\\Alice\\.trevra\\service\\node_modules\\trevra\\bin\\trevra.js',
+    username: 'Alice'
+  });
+  assert.match(script, /New-ScheduledTaskTrigger -AtLogOn/);
+  assert.match(script, /-LogonType Interactive/);
+  assert.match(script, /-RestartCount 999/);
+  assert.match(script, /linkedin run/);
+  assert.doesNotMatch(script, /trv_cmp_|--pair|password/i);
+});

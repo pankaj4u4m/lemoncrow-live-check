@@ -1,0 +1,613 @@
+/**
+ * The operator's own LinkedIn sign-in: stored write-only, shown never,
+ * decrypted at the one moment a browser types it.
+ *
+ * WHY THIS EXISTS AT ALL. A headless Chromium can type a password; it cannot
+ * show a human a window, so this is how a container with no display
+ * (docs/linkedin-outreach-plan.md 4.9) -- or any other machine -- signs a seat
+ * in at all. It is the path every competitor already takes -- Dripify takes
+ * the email and password and signs in for you -- with the risk posture
+ * strictly better than theirs, because this signs in from the operator's own
+ * machine and own IP rather than from a datacenter (which is why Dripify
+ * sells dedicated proxies).
+ *
+ * THE RULES, and every one of them is enforced below rather than remembered:
+ *
+ *  1. HOSTED REFUSES ONLY WHAT IT CANNOT SUPERVISE. `TREVRA_DEPLOYMENT_MODE=
+ *     hosted` with a remote browser provider configured stores and reads
+ *     these only for a workspace that has authorised Trevra's own servers to
+ *     act on its account (`hostedExecutionGate`, `linkedin/hosted-execution.ts`)
+ *     -- the same gate, from the same one definition, as the worker itself.
+ *     Hosted with NO remote browser provider is not that case at all: nothing
+ *     here would be acting unsupervised, so it stores and reads exactly as
+ *     local does, for a workspace's own client-side worker
+ *     (`npm run linkedin:worker`) to use. One operator holding their own
+ *     password is a small, informed, self-inflicted risk regardless of
+ *     tenancy; what stays gated is Trevra's OWN SERVERS holding it to act on
+ *     someone else's account from a cloud browser with nobody's machine and
+ *     nobody's IP in the loop -- a different product with a different threat
+ *     model.
+ *  2. THE PASSWORD IS WRITE-ONLY. Nothing here returns it, no route returns it,
+ *     and `describeLinkedInCredentials` -- the only read a route may call --
+ *     cannot: it returns a boolean and the email's masked form and touches no
+ *     decryption at all.
+ *  3. NO PLAINTEXT-DERIVED DISPLAY VALUE IS STORED. `store.ts` writes an empty
+ *     `last4` for both kinds. The masked email lives in `label`, computed once
+ *     on write, so the setup screen never needs a decrypt.
+ *  4. DECRYPT AT THE MOMENT OF USE. `readLinkedInCredentials` is called
+ *     immediately before the browser types it and its result is not stored on
+ *     any object that outlives the call.
+ *  5. ONE SIGN-IN PER SEAT, NOT PER WORKSPACE. Every function here takes a
+ *     `seatKey` that defaults to `owner`, because a workspace automating two
+ *     LinkedIn accounts needs two sign-ins and every seat now signs itself in.
+ *     Where the bytes live depends on the seat and on nothing else -- see
+ *     TWO HOMES, ONE POSTURE below.
+ *
+ * TWO HOMES, ONE POSTURE, AND WHICH IS WHICH IS DECIDED HERE AND ONLY HERE.
+ *
+ *  owner  -> `workspace_secrets`, kinds 'linkedin.email'/'linkedin.password',
+ *            through `secrets/store.ts`, byte for byte as before this file grew
+ *            a seat dimension. NOTHING WAS MIGRATED: every owner-seat
+ *            credential stored before the multi-seat change resolves through
+ *            the same rows and the same code path it always did, which is the
+ *            cheapest possible backward-compatibility story -- there is no
+ *            migration to have gone wrong.
+ *  others -> `linkedin_seat_credentials` (migration 049), which exists because
+ *            `workspace_secrets` is UNIQUE on (workspace_id, kind) by design
+ *            and store.ts upserts on exactly that pair. Migration 049's header
+ *            has the full argument; the short version is that widening the
+ *            BYOK vault's shape for a LinkedIn-only need would change the
+ *            storage contract of every secret in Trevra.
+ *
+ * The custody posture is IDENTICAL across both: the same AES-256-GCM envelope
+ * from `crypto.ts`, the same TREVRA_SECRETS_KEY (and the same
+ * TREVRA_SECRETS_KEY_PREVIOUS rotation window), the same `hostedExecutionGate`
+ * check on both the read and the write path, the same write-only rule, and
+ * the same "no plaintext-derived display value" rule -- `linkedin_seat_credentials`
+ * has no `last4` column at all. Adding a seat dimension does not widen WHERE a
+ * password may live by one inch, and the CHECK on that table (`seat_key <>
+ * 'owner'`) makes the split impossible to get wrong from the database's side.
+ *
+ * ...AND THE SEAT IS PART OF WHAT THE CIPHERTEXT IS BOUND TO. Both homes now
+ * seal against the row's identity (store, workspace, seat, kind) as GCM's
+ * additional authenticated data -- see the AAD section of `crypto.ts`. Because
+ * `seat_key` is one of those four components, a sealed sign-in cannot be moved
+ * between seats any more than it can be moved between tenants: seat B's row
+ * holding seat A's ciphertext fails to open, loudly, instead of signing a
+ * browser in as the wrong person. `seatCredentialContext` below is the one
+ * place this module spells that identity, so the write, the read and
+ * `custody.ts`'s re-seal cannot drift apart about what a row is.
+ */
+import { linkedInWorkerConfig } from '../config.js';
+import { id, type Db } from '../db.js';
+import { hostedExecutionGate, type HostedExecutionVerdict } from '../linkedin/hosted-execution.js';
+import { OWNER_SEAT_KEY } from '../linkedin/seats.js';
+import { openSecret, sealSecret, type SecretContext } from './crypto.js';
+import {
+  deleteWorkspaceSecret,
+  describeWorkspaceSecret,
+  putWorkspaceSecret,
+  readWorkspaceSecretPlaintext
+} from './store.js';
+
+/**
+ * The hosted refusal, verbatim, so the route can recognise its own store's
+ * answer and turn it into a 409 rather than a 500.
+ *
+ * One sentence, and it ends the conversation: there is no switch to go and
+ * find, so naming one would send the operator looking for it.
+ */
+export { HOSTED_EXECUTION_REFUSAL as LINKEDIN_CREDENTIALS_HOSTED_REFUSAL } from '../linkedin/hosted-execution.js';
+
+/** Raised when TREVRA_SECRETS_KEY is absent, which is a deployment fact, not a fault. */
+export const LINKEDIN_CREDENTIALS_UNSEALED_REFUSAL =
+  'This server has no TREVRA_SECRETS_KEY, so it will not store a LinkedIn password in the clear.';
+
+/** Everything a route, a log line or a screen may know about a stored sign-in. */
+export interface LinkedInCredentialSummary {
+  hasCredentials: boolean;
+  /** `p...@domain.com`, or null when nothing is stored. Never the address itself. */
+  maskedEmail: string | null;
+}
+
+/**
+ * `pankaj@example.com` -> `p•••@example.com`.
+ *
+ * The domain survives intact and the local part does not, because the domain is
+ * what an operator needs to recognise which of their accounts this is, and the
+ * local part is the half that is also half of somebody's login. Computed on
+ * write and stored as the secret's `label`, so no read path ever decrypts to
+ * render a settings screen.
+ */
+export function maskEmail(email: string): string {
+  const trimmed = email.trim();
+  const at = trimmed.lastIndexOf('@');
+  if (at <= 0) return '•••';
+  return `${trimmed.slice(0, 1)}•••${trimmed.slice(at)}`;
+}
+
+/**
+ * May this deployment hold THIS WORKSPACE'S LinkedIn password?
+ *
+ * WHAT CHANGED, AND WHY IT IS STILL THE SAME RULE. This used to be
+ * `!hosted`, full stop -- because a hosted Trevra could not do anything with a
+ * password except hold it: no display, no Chromium, no profile directory, so
+ * the queue filled up and nothing ever sent. Holding a password you cannot use
+ * is pure liability, and refusing was right.
+ *
+ * Hosted execution changes the second half of that sentence and nothing about
+ * the first. A hosted deployment with a remote browser CAN act on the account,
+ * and does so only for a workspace whose owner has authorised it in writing.
+ * So the gate moved from "never, on a hosted box" to "only where it has been
+ * asked for, per tenant, in writing" -- which is a narrowing of who may say yes
+ * (the account holder, not the operator) at the same time as it is a widening
+ * of what is possible.
+ *
+ * THE DECISION IS NOT MADE HERE. It is `hostedExecutionGate`'s, which is also
+ * what the runner and the credential route ask, so there is exactly one
+ * definition of "may Trevra act on this account" and this module cannot drift
+ * from the loop that uses what it stores.
+ *
+ * A HOSTED DEPLOYMENT WITH NO PROVIDER GETS THE OLD SENTENCE, VERBATIM.
+ */
+async function custodyGate(
+  db: Db,
+  workspaceId: string,
+  env: NodeJS.ProcessEnv
+): Promise<HostedExecutionVerdict> {
+  if (!linkedInWorkerConfig(env).hosted) return { allowed: true };
+  return hostedExecutionGate(db, workspaceId, env);
+}
+
+/**
+ * A credential update owns both halves and their audit rows as one unit.
+ *
+ * The advisory key exists even for owner credentials before any rows exist;
+ * row locks alone cannot serialize first-time writes, deletion and rotation.
+ * Keeping the lock transaction-scoped prevents leaking a lease across requests.
+ */
+async function mutateCredentialPair<T>(
+  db: Db,
+  workspaceId: string,
+  seatKey: string,
+  work: (tx: Db) => Promise<T>
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx
+      .prepare('SELECT pg_advisory_xact_lock(hashtext(?),hashtext(?))')
+      .get(`trevra:linkedin-credential:${workspaceId}`, seatKey);
+    return work(tx);
+  });
+}
+/** The two halves, named once so no call site spells a kind by hand. */
+type CredentialHalf = 'linkedin.email' | 'linkedin.password';
+
+/**
+ * Reject a seat key before it reaches SQL or a path.
+ *
+ * The same alphabet `seats.ts` `upsertSeat` enforces, repeated rather than
+ * imported-and-shared because this module is a security boundary and a
+ * validation it delegates is a validation somebody can widen from the other
+ * side of the codebase without ever opening this file.
+ */
+function assertSeatKey(seatKey: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(seatKey)) {
+    throw new Error('seat_key must be 1-64 letters, numbers, underscores or dashes.');
+  }
+}
+
+/**
+ * The identity a `linkedin_seat_credentials` row is sealed against.
+ *
+ * Non-owner seats only -- an owner-seat credential lives in
+ * `workspace_secrets` and gets its context from
+ * `store.ts` `workspaceSecretContext`, whose seat component is the literal
+ * 'owner'. The two never collide, which is the same split the table's CHECK
+ * enforces from the database's side.
+ */
+export function seatCredentialContext(
+  workspaceId: string,
+  seatKey: string,
+  kind: CredentialHalf
+): SecretContext {
+  return { store: 'linkedin_seat_credentials', workspaceId, seatKey, kind };
+}
+
+/**
+ * Seal one half into `linkedin_seat_credentials`.
+ *
+ * Non-owner seats only, by the table's own CHECK. The audit row mirrors what
+ * `store.ts` writes for a `workspace_secrets` update, and carries the same
+ * nothing: an event type, the seat, the kind, and -- for the email half only --
+ * the masked form that was already computed for display. No `last4`, because
+ * this table has no such column and a password has no nickname.
+ */
+async function putSeatSecret(
+  db: Db,
+  input: {
+    workspaceId: string;
+    seatKey: string;
+    kind: CredentialHalf;
+    plaintext: string;
+    label: string | null;
+    actorUserId: string | null;
+    env: NodeJS.ProcessEnv;
+  }
+): Promise<void> {
+  // Throws when TREVRA_SECRETS_KEY is absent, which is exactly what the owner
+  // path does through `putWorkspaceSecret`: a server with no key stores
+  // nothing rather than storing a password in the clear.
+  const sealed = sealSecret(
+    input.plaintext,
+    seatCredentialContext(input.workspaceId, input.seatKey, input.kind),
+    input.env
+  );
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `
+    INSERT INTO linkedin_seat_credentials (
+      id, workspace_id, seat_key, kind, ciphertext, iv, auth_tag, key_version, key_id, label, created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT (workspace_id, seat_key, kind) DO UPDATE SET
+      ciphertext=EXCLUDED.ciphertext,
+      iv=EXCLUDED.iv,
+      auth_tag=EXCLUDED.auth_tag,
+      key_version=EXCLUDED.key_version,
+      key_id=EXCLUDED.key_id,
+      label=EXCLUDED.label,
+      updated_at=EXCLUDED.updated_at
+  `
+    )
+    .run(
+      id('lsec'),
+      input.workspaceId,
+      input.seatKey,
+      input.kind,
+      sealed.ciphertext,
+      sealed.iv,
+      sealed.authTag,
+      sealed.keyVersion,
+      sealed.keyId,
+      input.label,
+      now,
+      now
+    );
+  await writeCredentialAudit(db, {
+    workspaceId: input.workspaceId,
+    actorUserId: input.actorUserId,
+    eventType: 'workspace_secret.updated',
+    seatKey: input.seatKey,
+    kind: input.kind,
+    label: input.label,
+    now
+  });
+}
+
+/** The stored label for one half, or null when nothing is stored. */
+async function describeSeatSecret(
+  db: Db,
+  workspaceId: string,
+  seatKey: string,
+  kind: CredentialHalf
+): Promise<{ label: string | null } | null> {
+  const row = await db
+    .prepare(
+      'SELECT label FROM linkedin_seat_credentials WHERE workspace_id=? AND seat_key=? AND kind=?'
+    )
+    .get<{ label: string | null }>(workspaceId, seatKey, kind);
+  return row ? { label: row.label } : null;
+}
+
+/** INTERNAL. Opens one half. Same rules as `readWorkspaceSecretPlaintext`. */
+async function readSeatSecret(
+  db: Db,
+  workspaceId: string,
+  seatKey: string,
+  kind: CredentialHalf,
+  env: NodeJS.ProcessEnv
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      'SELECT ciphertext, iv, auth_tag, key_version, key_id FROM linkedin_seat_credentials WHERE workspace_id=? AND seat_key=? AND kind=?'
+    )
+    .get<{
+      ciphertext: Buffer;
+      iv: Buffer;
+      auth_tag: Buffer;
+      key_version: number;
+      key_id: string | null;
+    }>(workspaceId, seatKey, kind);
+  if (!row) return null;
+  // Context from the arguments the row was FOUND by: a ciphertext moved here
+  // from another workspace or another seat fails to open rather than signing
+  // this seat's browser in as somebody else.
+  return openSecret(
+    {
+      ciphertext: row.ciphertext,
+      iv: row.iv,
+      authTag: row.auth_tag,
+      keyVersion: Number(row.key_version),
+      keyId: row.key_id == null ? null : String(row.key_id)
+    },
+    seatCredentialContext(workspaceId, seatKey, kind),
+    env
+  );
+}
+
+/** Wipe one half. True when there was something to wipe. */
+async function deleteSeatSecret(
+  db: Db,
+  workspaceId: string,
+  seatKey: string,
+  kind: CredentialHalf,
+  actorUserId: string | null
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      'DELETE FROM linkedin_seat_credentials WHERE workspace_id=? AND seat_key=? AND kind=? RETURNING label'
+    )
+    .get<{ label: string | null }>(workspaceId, seatKey, kind);
+  if (!row) return false;
+  await writeCredentialAudit(db, {
+    workspaceId,
+    actorUserId,
+    eventType: 'workspace_secret.deleted',
+    seatKey,
+    kind,
+    label: row.label,
+    now: new Date().toISOString()
+  });
+  return true;
+}
+
+/**
+ * The audit row for a seat credential.
+ *
+ * Written here rather than reached for in `store.ts` because that module's
+ * `writeAudit` is private and stays that way: this is a five-line insert, and
+ * exporting a general audit writer to save it would be a wider change to a
+ * security module than the thing it saves. The METADATA is what matters, and
+ * it is the same nothing store.ts writes for an opaque kind -- the kind, the
+ * seat, and the masked email that was already a display value.
+ */
+async function writeCredentialAudit(
+  db: Db,
+  event: {
+    workspaceId: string;
+    actorUserId: string | null;
+    eventType: string;
+    seatKey: string;
+    kind: CredentialHalf;
+    label: string | null;
+    now: string;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `
+    INSERT INTO audit_events (
+      id,workspace_id,actor_type,actor_id,event_type,entity_type,entity_id,metadata_json,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?)
+  `
+    )
+    .run(
+      id('audit'),
+      event.workspaceId,
+      event.actorUserId ? 'user' : 'system',
+      event.actorUserId,
+      event.eventType,
+      'workspace_secret',
+      `${event.workspaceId}:${event.seatKey}:${event.kind}`,
+      JSON.stringify({ kind: event.kind, seatKey: event.seatKey, label: event.label }),
+      event.now
+    );
+}
+
+/**
+ * Store both halves, sealed, and return only what may be shown.
+ *
+ * Throws rather than returning a failure shape, because every caller is a route
+ * that has to answer with a status code and every refusal here is a deployment
+ * fact the operator can act on. NOTHING IT THROWS CONTAINS EITHER VALUE.
+ */
+export async function putLinkedInCredentials(
+  db: Db,
+  input: {
+    workspaceId: string;
+    email: string;
+    password: string;
+    actorUserId?: string | null;
+    env?: NodeJS.ProcessEnv;
+    /** Which LinkedIn account in this workspace. Absent means the owner seat. */
+    seatKey?: string;
+  }
+): Promise<LinkedInCredentialSummary> {
+  const env = input.env ?? process.env;
+  // THE GATE FIRST, before anything is sealed, written or audited.
+  const custody = await custodyGate(db, input.workspaceId, env);
+  if (!custody.allowed) throw new Error(custody.reason);
+
+  const seatKey = input.seatKey ?? OWNER_SEAT_KEY;
+  assertSeatKey(seatKey);
+
+  const email = typeof input.email === 'string' ? input.email.trim() : '';
+  const password = typeof input.password === 'string' ? input.password : '';
+  // Never quote the offending value back. An error message is the easiest place
+  // in a codebase for a secret to end up in a log.
+  if (!email) throw new Error('A LinkedIn email address is required');
+  if (!password) throw new Error('A LinkedIn password is required');
+
+  const maskedEmail = maskEmail(email);
+
+  return mutateCredentialPair(db, input.workspaceId, seatKey, async (tx) => {
+    if (seatKey === OWNER_SEAT_KEY) {
+      // The owner keeps the legacy workspace_secrets home. Both writes and their
+      // audit events commit or roll back together on the same database handle.
+      await putWorkspaceSecret(tx, {
+        workspaceId: input.workspaceId,
+        kind: 'linkedin.email',
+        plaintext: email,
+        label: maskedEmail,
+        actorUserId: input.actorUserId ?? null
+      });
+      await putWorkspaceSecret(tx, {
+        workspaceId: input.workspaceId,
+        kind: 'linkedin.password',
+        plaintext: password,
+        label: null,
+        actorUserId: input.actorUserId ?? null
+      });
+    } else {
+      await putSeatSecret(tx, {
+        workspaceId: input.workspaceId,
+        seatKey,
+        kind: 'linkedin.email',
+        plaintext: email,
+        label: maskedEmail,
+        actorUserId: input.actorUserId ?? null,
+        env
+      });
+      await putSeatSecret(tx, {
+        workspaceId: input.workspaceId,
+        seatKey,
+        kind: 'linkedin.password',
+        plaintext: password,
+        label: null,
+        actorUserId: input.actorUserId ?? null,
+        env
+      });
+    }
+    return { hasCredentials: true, maskedEmail };
+  });
+}
+
+/**
+ * What is stored, without opening it.
+ *
+ * The only credential read a route may make. Two metadata lookups, no key
+ * material touched, so it answers on a deployment whose TREVRA_SECRETS_KEY is
+ * missing or has been rotated away -- which is what a status screen has to do.
+ */
+export async function describeLinkedInCredentials(
+  db: Db,
+  workspaceId: string,
+  seatKey: string = OWNER_SEAT_KEY
+): Promise<LinkedInCredentialSummary> {
+  assertSeatKey(seatKey);
+  return db.transaction(async (tx) => {
+    // Status must not combine two snapshots from opposite sides of a rotation.
+    // The metadata read still decrypts nothing, even with the consistent view.
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const [email, password] = await Promise.all(
+      seatKey === OWNER_SEAT_KEY
+        ? [
+            describeWorkspaceSecret(tx, workspaceId, 'linkedin.email'),
+            describeWorkspaceSecret(tx, workspaceId, 'linkedin.password')
+          ]
+        : [
+            describeSeatSecret(tx, workspaceId, seatKey, 'linkedin.email'),
+            describeSeatSecret(tx, workspaceId, seatKey, 'linkedin.password')
+          ]
+    );
+    if (!email || !password) return { hasCredentials: false, maskedEmail: email?.label ?? null };
+    return { hasCredentials: true, maskedEmail: email.label };
+  });
+}
+
+/** Wipe both halves. True when anything was there to wipe. */
+export async function deleteLinkedInCredentials(
+  db: Db,
+  workspaceId: string,
+  actorUserId?: string | null,
+  seatKey: string = OWNER_SEAT_KEY
+): Promise<boolean> {
+  assertSeatKey(seatKey);
+  return mutateCredentialPair(db, workspaceId, seatKey, async (tx) => {
+    if (seatKey === OWNER_SEAT_KEY) {
+      const email = await deleteWorkspaceSecret(
+        tx,
+        workspaceId,
+        'linkedin.email',
+        actorUserId ?? null
+      );
+      const password = await deleteWorkspaceSecret(
+        tx,
+        workspaceId,
+        'linkedin.password',
+        actorUserId ?? null
+      );
+      return email || password;
+    }
+    const email = await deleteSeatSecret(
+      tx,
+      workspaceId,
+      seatKey,
+      'linkedin.email',
+      actorUserId ?? null
+    );
+    const password = await deleteSeatSecret(
+      tx,
+      workspaceId,
+      seatKey,
+      'linkedin.password',
+      actorUserId ?? null
+    );
+    return email || password;
+  });
+}
+/**
+ * INTERNAL. The only function that opens a stored LinkedIn sign-in.
+ *
+ * Call it immediately before the browser types it, use the result, and let it
+ * go. Do not log it, do not return it from a route, do not put it on a
+ * long-lived object, and do not add a caller: there is exactly one, in
+ * `linkedin/local-worker.ts`, and it hands both values straight to
+ * `driver.loginWithCredentials`.
+ *
+ * Returns null -- rather than throwing -- for every reason it cannot produce a
+ * pair: hosted, nothing stored, only one half stored. The caller is a worker
+ * loop that must not die for any of them.
+ */
+export async function readLinkedInCredentials(
+  db: Db,
+  workspaceId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  seatKey: string = OWNER_SEAT_KEY
+): Promise<{ email: string; password: string } | null> {
+  // The same gate as the write path, asked the same way. A hosted instance that
+  // somehow inherited rows from a self-hosted dump still does not open them --
+  // for every seat, not just the owner -- unless this workspace has authorised
+  // hosted execution and a remote browser exists to use them in.
+  //
+  // RETURNS NULL RATHER THAN THROWING, unchanged: a caller here is a worker
+  // about to sign a browser in, and "there is no usable credential" is the
+  // answer it already knows how to handle.
+  if (!(await custodyGate(db, workspaceId, env)).allowed) return null;
+
+  // `seatKey` comes last so that every existing 2- and 3-argument call site --
+  // and the tests that pass a hosted `env` as the third argument -- keeps
+  // resolving the owner seat exactly as it did.
+  assertSeatKey(seatKey);
+  // One REPEATABLE READ snapshot for both halves. Separate SELECTs under the
+  // default READ COMMITTED isolation could observe an email before a rotation
+  // and its new password after the rotation commits.
+  return db.transaction(async (tx) => {
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    if (seatKey === OWNER_SEAT_KEY) {
+      const email = await readWorkspaceSecretPlaintext(tx, workspaceId, 'linkedin.email', env);
+      if (!email) return null;
+      const password = await readWorkspaceSecretPlaintext(
+        tx,
+        workspaceId,
+        'linkedin.password',
+        env
+      );
+      return password ? { email, password } : null;
+    }
+    const email = await readSeatSecret(tx, workspaceId, seatKey, 'linkedin.email', env);
+    if (!email) return null;
+    const password = await readSeatSecret(tx, workspaceId, seatKey, 'linkedin.password', env);
+    return password ? { email, password } : null;
+  });
+}

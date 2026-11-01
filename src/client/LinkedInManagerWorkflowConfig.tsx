@@ -1,0 +1,3485 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  ArrowDown,
+  ArrowUp,
+  CircleAlert,
+  Eye,
+  GripVertical,
+  LayoutTemplate,
+  LoaderCircle,
+  MessageSquare,
+  PenLine,
+  Plus,
+  Save,
+  Trash2,
+  UserCheck,
+  UserMinus,
+  UserPlus
+} from 'lucide-react';
+import {
+  createLinkedInManagerWorkflow,
+  deleteLinkedInManagerWorkflow,
+  getLinkedInManagerWorkflows,
+  updateLinkedInManagedCampaignSequence,
+  updateLinkedInManagerWorkflow,
+  validateLinkedInManagerWorkflow
+} from './api';
+import type { ManagedCampaign } from '../server/linkedin/managed-campaigns';
+import type { LinkedInWorkflow, WorkflowDelay, WorkflowStep } from '../server/linkedin/workflows';
+import { errorMessage } from './LinkedInSafety';
+import { useIsWorkspaceOwner } from './auth-client';
+import { Select } from './ui/primitives';
+import { ADDITIONAL_WORKFLOW_STARTERS } from './workflow-starter-recipes';
+/* ---------------------------------------------------------------------------
+ * The reusable workflow builder.
+ *
+ * Every rule enforced here is a rule `workflowStepsSchema` in
+ * src/server/linkedin/workflows.ts already enforces. It is mirrored rather than
+ * imported because that module pulls in zod, node:crypto and the db handle --
+ * none of which belong in the browser bundle. When the schema changes, this
+ * file changes with it: the point of the mirror is that an operator is told
+ * what is wrong ON THE STEP, before a save, instead of reading one 400 that
+ * names an array index.
+ * ------------------------------------------------------------------------ */
+
+type Action = WorkflowStep['action'];
+type MessageStep = Extract<WorkflowStep, { action: 'message' }>;
+type Variant = MessageStep['config']['variants'][number];
+
+/**
+ * The closed set the server accepts -- MANAGER_VARIABLES in workflows.ts.
+ *
+ * EMAIL, PHONE AND COUNTRY ARE HERE BECAUSE THE DATA ALREADY IS: the CSV
+ * importer has always parsed all three onto the contact, and until the server
+ * widened this set not one of them could reach a message. A builder still
+ * mirroring three names would now refuse, on the step card, templates the save
+ * route accepts -- the mirror lying in the operator's favour is no better than
+ * it lying against them.
+ */
+const MANAGER_VARIABLES = [
+  'first_name',
+  'last_name',
+  'company',
+  'email',
+  'phone',
+  'country',
+  'booking_link'
+] as const;
+type ManagerVariable = (typeof MANAGER_VARIABLES)[number];
+
+/**
+ * Mirrors MANAGER_VARIABLE_ALIASES: camelCase spellings that mean the same field.
+ *
+ * The older sequence path documents `{{firstName}}` and `{{lastName}}`, and
+ * authors copy lines between the two screens, so both spellings resolve. They
+ * are ALIASES rather than members: the picker below offers one canonical name
+ * per field, and the alias exists so the other spelling is understood, not so
+ * the set has two entries for one thing.
+ */
+const MANAGER_VARIABLE_ALIASES: Readonly<Record<string, ManagerVariable>> = {
+  firstName: 'first_name',
+  lastName: 'last_name'
+};
+
+/** Mirrors `resolveManagerVariable`: the canonical field, in either spelling, or null. */
+function resolveManagerVariable(name: string): ManagerVariable | null {
+  if ((MANAGER_VARIABLES as readonly string[]).includes(name)) return name as ManagerVariable;
+  return MANAGER_VARIABLE_ALIASES[name] ?? null;
+}
+
+/** LinkedIn refuses a longer invitation note; the schema caps it at the same number. */
+const INVITE_NOTE_MAX = 300;
+/** `body`/`suggestedTemplate` ceiling in the schema. */
+const BODY_MAX = 8000;
+/** `delayBefore.amount` ceiling in the schema: 90 days of hours. */
+const DELAY_MAX = 2160;
+const MAX_STEPS = 50;
+
+/**
+ * Mirrors MESSAGE_VARIANT_MAX in workflows.ts: message versions per A/B step.
+ *
+ * The number is the READ, not the storage. Results hold every arm to 20
+ * messages before naming a leader, so four arms is already 80 sends of one
+ * step before the comparison means anything -- and that is said on the card,
+ * next to the button that adds the fourth, rather than discovered later on a
+ * results panel that keeps answering "not enough data yet".
+ */
+const VARIANT_MAX = 4;
+
+/** The ids the builder mints, in order. One letter each, so a card header stays short. */
+const VARIANT_IDS = ['a', 'b', 'c', 'd'] as const;
+
+/**
+ * Split-bar fills for the ids styles.css does not already colour.
+ *
+ * `a` takes the sheet's default green fill and `b` its blue; the third and
+ * fourth arms exist now and need to be told apart at a glance, so they carry
+ * the two remaining theme colours inline. Keyed by ID rather than by position
+ * on purpose: removing the middle arm must not repaint the survivors.
+ */
+const VARIANT_FILL: Readonly<Record<string, string>> = { c: 'var(--amber)', d: 'var(--muted)' };
+
+/**
+ * Integer weights, summing to exactly 100, keeping the proportions handed in.
+ *
+ * ADDING OR REMOVING AN ARM HAS TO LEAVE A SPLIT THAT STILL READS AS ONE. Two
+ * arms at 50/50 plus a third left the card claiming 50%, 50% and 50% of leads;
+ * the server would have normalised by the true total and sent 33/33/33, so the
+ * builder was describing a split nobody was running. Every arm keeps a floor
+ * of 1 -- the schema's own minimum -- and the remainder is handed out largest
+ * fraction first, which is deterministic and never needs a second pass.
+ */
+export function renormaliseWeights(weights: readonly number[]): number[] {
+  const count = weights.length;
+  if (count === 0) return [];
+  if (count > 100) return weights.map(() => 1);
+  const safe = weights.map((weight) => Math.max(1, Math.trunc(weight) || 1));
+  const total = safe.reduce((sum, weight) => sum + weight, 0);
+  const pool = 100 - count;
+  const exact = safe.map((weight) => (weight / total) * pool);
+  const out = exact.map((share) => 1 + Math.floor(share));
+  let slack = 100 - out.reduce((sum, share) => sum + share, 0);
+  const byRemainder = exact
+    .map((share, index) => ({ index, remainder: share - Math.floor(share) }))
+    .sort((a, b) => b.remainder - a.remainder || a.index - b.index);
+  for (let at = 0; slack > 0; at += 1, slack -= 1) out[byRemainder[at].index] += 1;
+  return out;
+}
+
+/** The next unused letter, or null when the step is already at {@link VARIANT_MAX}. */
+export function nextVariantId(taken: readonly string[]): string | null {
+  const used = new Set(taken.map((variantId) => variantId.trim().toLowerCase()));
+  return VARIANT_IDS.find((candidate) => !used.has(candidate)) ?? null;
+}
+
+/** Who the previews are rendered for, so merge fields read as sentences and not as tokens. */
+const SAMPLE_LEAD: Record<ManagerVariable, string> = {
+  first_name: 'Ada',
+  last_name: 'Lovelace',
+  company: 'Analytical Engines',
+  email: 'ada@analyticalengines.example',
+  phone: '+44 20 7946 0958',
+  country: 'United Kingdom',
+  booking_link: 'https://cal.com/you/intro'
+};
+
+const MERGE_TOKEN = /\{\{\s*([A-Za-z][A-Za-z0-9_.-]*)(?:\|([^{}\r\n]*))?\s*\}\}/g;
+
+interface ActionMeta {
+  label: string;
+  Icon: typeof Eye;
+  /** Reuses the chip colours the rendered sequence already uses for the same idea. */
+  chip: string;
+  /** What the step does, said on the card when it carries no copy to explain itself. */
+  blurb: string;
+}
+
+const ACTION_META: Record<Action, ActionMeta> = {
+  profile_view: {
+    label: 'Profile view',
+    Icon: Eye,
+    chip: 'li-kind-profile_view',
+    blurb: 'Opens the profile and warms the lead.'
+  },
+  connection_request: {
+    label: 'Connection request',
+    Icon: UserPlus,
+    chip: 'li-kind-invite',
+    blurb: 'Sends an invitation, optionally A/B testing the note.'
+  },
+  message: {
+    label: 'Message (A/B)',
+    Icon: MessageSquare,
+    chip: 'li-kind-dm',
+    blurb: 'Sends one deterministic message variant.'
+  },
+  manual_message: {
+    label: 'Manual message checkpoint',
+    Icon: PenLine,
+    chip: 'li-kind-inmail',
+    blurb: 'Pauses for a human-written message.'
+  },
+  follow: {
+    label: 'Follow',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Follows the profile.'
+  },
+  unfollow: {
+    label: 'Unfollow profile',
+    Icon: UserMinus,
+    chip: 'li-kind-profile_view',
+    blurb: 'Low-priority reversible cleanup. Shares the Follow safety bucket.'
+  },
+  disconnect: {
+    label: 'Remove connection',
+    Icon: UserMinus,
+    chip: 'li-kind-inmail',
+    blurb: 'Advanced destructive cleanup; only runs for a verified 1st-degree connection.'
+  },
+  follow_company: {
+    label: 'Follow company',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Follows one configured LinkedIn company page when the control is available.'
+  },
+  like_company_post: {
+    label: 'Like company post',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Likes the latest visible post on one configured company page.'
+  },
+  invite_to_follow_company: {
+    label: 'Invite to follow company',
+    Icon: UserCheck,
+    chip: 'li-kind-invite',
+    blurb: 'Uses the company admin invite surface only when this sender is eligible.'
+  },
+  invite_to_event: {
+    label: 'Invite to event',
+    Icon: UserCheck,
+    chip: 'li-kind-invite',
+    blurb: 'Invites this lead from one configured LinkedIn event surface.'
+  },
+  invite_to_group: {
+    label: 'Invite to group',
+    Icon: UserCheck,
+    chip: 'li-kind-invite',
+    blurb: 'Invites this lead from one configured LinkedIn group surface.'
+  },
+  group_message: {
+    label: 'Group member message',
+    Icon: MessageSquare,
+    chip: 'li-kind-dm',
+    blurb:
+      'Messages only from a legitimate group-member Message surface; never falls back to profile DM.'
+  },
+  event_message: {
+    label: 'Event attendee message',
+    Icon: MessageSquare,
+    chip: 'li-kind-dm',
+    blurb:
+      'Messages only from a legitimate event-attendee Message surface; never falls back to profile DM.'
+  },
+  withdraw_pending: {
+    label: 'Withdraw pending invite',
+    Icon: UserMinus,
+    chip: 'li-kind-profile_view',
+    blurb: 'Withdraws a stale unanswered invitation.'
+  },
+  like_post: {
+    label: 'Like recent post',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Likes one recent post using the engagement driver.'
+  },
+  endorse_skills: {
+    label: 'Endorse skills',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Endorses a small bounded number of visible skills.'
+  },
+  wait: {
+    label: 'Wait',
+    Icon: ArrowDown,
+    chip: 'li-kind-profile_view',
+    blurb: 'Timer only. It checks no condition.'
+  },
+  condition: {
+    label: 'Condition',
+    Icon: LayoutTemplate,
+    chip: 'li-kind-dm',
+    blurb: 'Checks once now and routes Yes or No.'
+  },
+  monitor: {
+    label: 'Monitor',
+    Icon: Eye,
+    chip: 'li-kind-dm',
+    blurb: 'Checks repeatedly until Yes or a configured timeout routes No.'
+  },
+  end: {
+    label: 'End path',
+    Icon: UserMinus,
+    chip: 'li-kind-profile_view',
+    blurb: 'Explicitly terminates this branch.'
+  },
+  inmail: {
+    label: 'InMail',
+    Icon: MessageSquare,
+    chip: 'li-kind-inmail',
+    blurb: 'Sends InMail only when the sender capability and credits are known.'
+  },
+  email: {
+    label: 'Email',
+    Icon: MessageSquare,
+    chip: 'li-kind-dm',
+    blurb: 'Sends through the campaign mailbox channel.'
+  },
+  find_email: {
+    label: 'Find email',
+    Icon: Eye,
+    chip: 'li-kind-profile_view',
+    blurb: 'Runs configured enrichment and stores provenance.'
+  },
+  add_tag: {
+    label: 'Add tag',
+    Icon: UserCheck,
+    chip: 'li-kind-profile_view',
+    blurb: 'Adds a workspace lead tag.'
+  },
+  remove_tag: {
+    label: 'Remove tag',
+    Icon: UserMinus,
+    chip: 'li-kind-profile_view',
+    blurb: 'Removes a workspace lead tag.'
+  },
+  manual_comment: {
+    label: 'Manual comment checkpoint',
+    Icon: PenLine,
+    chip: 'li-kind-inmail',
+    blurb: 'Suggests a comment but requires a human to post it.'
+  }
+};
+
+const ACTION_GROUPS: ReadonlyArray<{ label: string; actions: readonly Action[] }> = [
+  {
+    label: 'Core outreach',
+    actions: ['profile_view', 'connection_request', 'message', 'inmail']
+  },
+  {
+    label: 'Branching & timing',
+    actions: ['wait', 'condition', 'monitor', 'end']
+  },
+  {
+    label: 'Email & lead state',
+    actions: ['find_email', 'email', 'add_tag', 'remove_tag']
+  },
+  {
+    label: 'Engagement',
+    actions: [
+      'follow',
+      'like_post',
+      'endorse_skills',
+      'follow_company',
+      'like_company_post',
+      'invite_to_follow_company',
+      'invite_to_event',
+      'invite_to_group',
+      'group_message',
+      'event_message'
+    ]
+  },
+  {
+    label: 'Cleanup & manual',
+    actions: ['withdraw_pending', 'unfollow', 'disconnect', 'manual_message', 'manual_comment']
+  }
+];
+const ACTION_ORDER: readonly Action[] = ACTION_GROUPS.flatMap((group) => group.actions);
+
+const CONDITION_LABELS = {
+  connected: 'Already connected',
+  accepted: 'Connection request accepted',
+  replied: 'Replied',
+  open_profile: 'Open Profile / free InMail',
+  email_available: 'Email available',
+  email_opened: 'Email opened',
+  email_clicked: 'Email clicked',
+  email_bounced: 'Email bounced',
+  email_replied: 'Email replied',
+  email_found: 'Email found by enrichment',
+  handoff_succeeded: 'External handoff succeeded'
+} as const;
+
+/* ---------------------------------------------------------------------------
+ * Pure helpers.
+ * ------------------------------------------------------------------------ */
+
+function hoursOf(delay: WorkflowDelay): number {
+  return delay.unit === 'days' ? delay.amount * 24 : delay.amount;
+}
+
+/** Cumulative offset from the moment the campaign starts the lead, as an operator reads it. */
+function whenLabel(totalHours: number): string {
+  if (totalHours <= 0) return 'At campaign start';
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  if (hours === 0) return `Day ${days}`;
+  return `Day ${days}, +${hours}h`;
+}
+
+/** The delay on the step itself. Zero is a word, not a number: it reads as a decision. */
+function waitLabel(delay: WorkflowDelay): string {
+  if (delay.amount <= 0) return 'immediately';
+  return `${delay.amount} ${delay.amount === 1 ? delay.unit.replace(/s$/, '') : delay.unit}`;
+}
+
+/** Mirrors `templatesOf` in workflows.ts -- the strings the server scans for variables. */
+function templatesOf(step: WorkflowStep): string[] {
+  if (step.action === 'connection_request')
+    return (
+      step.config.variants?.map((variant) => variant.body) ??
+      (step.config.message ? [step.config.message] : [])
+    );
+  if (step.action === 'message') return step.config.variants.map((variant) => variant.body);
+  if (step.action === 'inmail' || step.action === 'email')
+    return [step.config.subject, ...step.config.variants.map((variant) => variant.body)];
+  if (step.action === 'manual_message' || step.action === 'manual_comment')
+    return step.config.suggestedTemplate ? [step.config.suggestedTemplate] : [];
+  return [];
+}
+
+/**
+ * Mirrors `unsupportedVariables` in workflows.ts, character for character in
+ * the pattern.
+ *
+ * Widening the accepted set does not soften the rule: a name that is neither a
+ * canonical field nor an alias is still reported here, and the save route still
+ * rejects it. The only change is that `{{email}}` and `{{firstName}}` stopped
+ * being in that category.
+ */
+function unsupportedVariables(template: string): string[] {
+  const found = new Set<string>();
+  for (const match of template.matchAll(MERGE_TOKEN)) {
+    if (match[1].startsWith('custom.') && /^[A-Za-z][A-Za-z0-9_.-]*$/.test(match[1].slice(7)))
+      continue;
+    if (resolveManagerVariable(match[1]) === null) found.add(match[1]);
+  }
+  return [...found];
+}
+
+/**
+ * Preview uses sample lead data, including fallback expressions. Real campaign
+ * execution never blanks a required value: the server holds the member until
+ * missing required variables are supplied or a fallback is configured.
+ */
+function renderSample(template: string): string {
+  return template.replace(MERGE_TOKEN, (whole, name: string, fallback: string | undefined) => {
+    if (name.startsWith('custom.')) return `sample ${name.slice(7).replaceAll('_', ' ')}`;
+    const canonical = resolveManagerVariable(name);
+    if (canonical === null) return whole;
+    return SAMPLE_LEAD[canonical]?.trim() || fallback?.trim() || '';
+  });
+}
+
+/**
+ * Everything wrong with one step, in sentences.
+ *
+ * The withdraw rule needs the whole list, not the step, because it is about
+ * ORDER: the server rejects a withdraw that no connection request precedes,
+ * and reordering is the thing that breaks it.
+ */
+function stepProblems(step: WorkflowStep, index: number, steps: readonly WorkflowStep[]): string[] {
+  const problems: string[] = [];
+  const { amount } = step.delayBefore;
+  if (!Number.isInteger(amount) || amount < 0 || amount > DELAY_MAX) {
+    problems.push(`The wait has to be a whole number between 0 and ${DELAY_MAX}.`);
+  }
+  if (
+    step.sla &&
+    (!Number.isInteger(step.sla.amount) || step.sla.amount < 1 || step.sla.amount > DELAY_MAX)
+  ) {
+    problems.push(`The target SLA has to be a whole number between 1 and ${DELAY_MAX}.`);
+  }
+
+  if (step.action === 'withdraw_pending') {
+    const invited = steps
+      .slice(0, index)
+      .some((earlier) => earlier.action === 'connection_request');
+    if (!invited) {
+      problems.push(
+        'There is no connection request above this step, so there is nothing pending to withdraw. Move it below an invite, or add one.'
+      );
+    }
+    if (
+      !Number.isInteger(step.config.afterDays) ||
+      step.config.afterDays < 1 ||
+      step.config.afterDays > 90
+    ) {
+      problems.push('Withdraw after has to be between 1 and 90 days.');
+    }
+  }
+
+  if (step.action === 'connection_request') {
+    const note = step.config.message ?? '';
+    if (note.length > INVITE_NOTE_MAX) {
+      problems.push(
+        `The note is ${note.length} characters. LinkedIn refuses an invitation note over ${INVITE_NOTE_MAX}.`
+      );
+    }
+  }
+
+  if (step.action === 'message') {
+    if (
+      step.config.requiresAcceptedConnection &&
+      !steps.slice(0, index).some((earlier) => earlier.action === 'connection_request')
+    ) {
+      problems.push('This condition needs a connection request above the message.');
+    }
+    if (step.config.variants.every((variant) => variant.body.trim().length === 0)) {
+      problems.push('A message step needs copy in at least one variant.');
+    }
+    if (step.config.variants.length > VARIANT_MAX) {
+      problems.push(`A message step takes at most ${VARIANT_MAX} versions.`);
+    }
+    for (const variant of step.config.variants) {
+      if (variant.body.length > BODY_MAX)
+        problems.push(
+          `Variant ${variant.id.toUpperCase()} is ${variant.body.length} characters. The ceiling is ${BODY_MAX}.`
+        );
+      if (!Number.isInteger(variant.weight) || variant.weight < 1 || variant.weight > 100) {
+        problems.push(`Variant ${variant.id.toUpperCase()} needs a weight between 1 and 100.`);
+      }
+      if (variant.attachmentUrl) {
+        try {
+          const media = new URL(variant.attachmentUrl);
+          if (media.protocol !== 'https:')
+            problems.push(`Variant ${variant.id.toUpperCase()} attachment must use HTTPS.`);
+        } catch {
+          problems.push(`Variant ${variant.id.toUpperCase()} attachment URL is invalid.`);
+        }
+      }
+      if (variant.mediaKind === 'voice')
+        problems.push(
+          'Native LinkedIn voice notes are not available in the verified desktop composer; use a manual checkpoint instead.'
+        );
+    }
+  }
+
+  if (
+    (step.action === 'manual_message' || step.action === 'manual_comment') &&
+    (step.config.suggestedTemplate ?? '').length > BODY_MAX
+  ) {
+    problems.push(`The suggestion is over ${BODY_MAX} characters.`);
+  }
+  if (step.action === 'connection_request' && step.config.variants) {
+    if (step.config.variants.length === 0 || step.config.variants.length > VARIANT_MAX)
+      problems.push(`An invitation test needs 1–${VARIANT_MAX} variants.`);
+    for (const variant of step.config.variants)
+      if (variant.body.length > INVITE_NOTE_MAX)
+        problems.push(
+          `Invite variant ${variant.id.toUpperCase()} is over ${INVITE_NOTE_MAX} characters.`
+        );
+  }
+  if (step.action === 'email' || step.action === 'inmail') {
+    if (!step.config.subject.trim())
+      problems.push(`${step.action === 'email' ? 'Email' : 'InMail'} subject is required.`);
+    if (
+      step.config.variants.length === 0 ||
+      step.config.variants.every((variant) => !variant.body.trim())
+    )
+      problems.push(`${step.action === 'email' ? 'Email' : 'InMail'} needs message copy.`);
+    for (const variant of step.config.variants) {
+      if (variant.attachmentUrl) {
+        try {
+          const media = new URL(variant.attachmentUrl);
+          if (media.protocol !== 'https:')
+            problems.push(`Variant ${variant.id.toUpperCase()} attachment must use HTTPS.`);
+        } catch {
+          problems.push(`Variant ${variant.id.toUpperCase()} attachment URL is invalid.`);
+        }
+      }
+      if (variant.mediaKind === 'voice')
+        problems.push(
+          'Native LinkedIn voice notes are not available in the verified desktop composer; use a manual checkpoint instead.'
+        );
+    }
+  }
+  if (step.action === 'condition' || step.action === 'monitor') {
+    if (!step.config.yesStepId || step.config.yesStepId.startsWith('__'))
+      problems.push('Choose the YES branch target.');
+    if (!step.config.noStepId || step.config.noStepId.startsWith('__'))
+      problems.push('Choose the NO branch target.');
+    if (
+      ['accepted', 'replied'].includes(step.config.condition.kind) &&
+      !step.config.condition.ofStepId
+    )
+      problems.push(
+        `${step.config.condition.kind === 'accepted' ? 'Accepted' : 'Replied'} must reference an earlier result-bearing step.`
+      );
+  }
+  if ((step.action === 'add_tag' || step.action === 'remove_tag') && !step.config.tag.trim())
+    problems.push('Tag cannot be empty.');
+
+  for (const template of templatesOf(step)) {
+    const bad = unsupportedVariables(template);
+    if (bad.length > 0) {
+      problems.push(
+        `${bad.map((name) => `{{${name}}}`).join(', ')} ${bad.length === 1 ? 'is not a variable' : 'are not variables'} the server accepts. It takes ${MANAGER_VARIABLES.map((name) => `{{${name}}}`).join(', ')}.`
+      );
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * What actually gets posted.
+ *
+ * A message variant with no copy is a variant the operator started and left --
+ * `body` is `min(1)` on the server, so it is dropped rather than posted as an
+ * empty string that would come back as a 400. Dropping it is also what the
+ * split on the card already says will happen.
+ */
+function serializeSteps(steps: readonly WorkflowStep[]): WorkflowStep[] {
+  return steps.map((step) =>
+    step.action === 'message'
+      ? {
+          ...step,
+          config: {
+            ...step.config,
+            variants: step.config.variants.filter((variant) => variant.body.trim().length > 0)
+          }
+        }
+      : step
+  );
+}
+
+function blankStep(action: Action, stepId: string, delayBefore: WorkflowDelay): WorkflowStep {
+  const base = { id: stepId, delayBefore };
+  if (action === 'connection_request') return { ...base, action, config: { message: '' } };
+  if (action === 'withdraw_pending') return { ...base, action, config: { afterDays: 14 } };
+  if (
+    action === 'profile_view' ||
+    action === 'follow' ||
+    action === 'unfollow' ||
+    action === 'like_post'
+  )
+    return { ...base, action, config: {} };
+  if (action === 'disconnect') return { ...base, action, config: { acknowledgeDestructive: true } };
+  if (
+    action === 'follow_company' ||
+    action === 'like_company_post' ||
+    action === 'invite_to_follow_company'
+  )
+    return {
+      ...base,
+      action,
+      config: { companyUrl: 'https://www.linkedin.com/company/' }
+    } as WorkflowStep;
+  if (action === 'invite_to_event')
+    return {
+      ...base,
+      action,
+      config: { eventUrl: 'https://www.linkedin.com/events/' }
+    } as WorkflowStep;
+  if (action === 'invite_to_group')
+    return {
+      ...base,
+      action,
+      config: { groupUrl: 'https://www.linkedin.com/groups/' }
+    } as WorkflowStep;
+  if (action === 'group_message')
+    return {
+      ...base,
+      action,
+      config: {
+        groupUrl: 'https://www.linkedin.com/groups/',
+        variants: [{ id: 'a', body: '', weight: 100 }]
+      }
+    };
+  if (action === 'event_message')
+    return {
+      ...base,
+      action,
+      config: {
+        eventUrl: 'https://www.linkedin.com/events/',
+        variants: [{ id: 'a', body: '', weight: 100 }]
+      }
+    };
+  if (action === 'endorse_skills') return { ...base, action, config: { maxSkills: 1 } };
+  if (action === 'message')
+    return {
+      ...base,
+      action,
+      config: {
+        variants: [
+          { id: 'a', body: '', weight: 50 },
+          { id: 'b', body: '', weight: 50 }
+        ],
+        requiresAcceptedConnection: false
+      }
+    };
+  if (action === 'manual_message') return { ...base, action, config: { suggestedTemplate: '' } };
+  if (action === 'manual_comment')
+    return { ...base, action, config: { suggestedTemplate: '', postUrl: null } };
+  if (action === 'wait')
+    return { ...base, action, config: { duration: { amount: 1, unit: 'days' } } };
+  if (action === 'condition')
+    return {
+      ...base,
+      action,
+      config: {
+        condition: { kind: 'email_available' },
+        yesStepId: '__choose_yes__',
+        noStepId: '__choose_no__'
+      }
+    };
+  if (action === 'monitor')
+    return {
+      ...base,
+      action,
+      config: {
+        condition: { kind: 'accepted', ofStepId: null },
+        timeout: { amount: 10, unit: 'days' },
+        pollEveryMinutes: 60,
+        yesStepId: '__choose_yes__',
+        noStepId: '__choose_no__'
+      }
+    };
+  if (action === 'end') return { ...base, action, config: { outcome: 'completed' } };
+  if (action === 'inmail')
+    return {
+      ...base,
+      action,
+      config: { subject: '', variants: [{ id: 'a', body: '', weight: 100 }], allowPaid: false }
+    };
+  if (action === 'email')
+    return {
+      ...base,
+      action,
+      config: {
+        subject: '',
+        variants: [{ id: 'a', body: '', weight: 100 }],
+        threaded: true,
+        tracking: 'off'
+      }
+    };
+  if (action === 'find_email')
+    return { ...base, action, config: { providerId: 'hunter', refresh: false } };
+  if (action === 'add_tag' || action === 'remove_tag')
+    return { ...base, action, config: { tag: 'prospect' } };
+  const exhaustive: never = action;
+  throw new Error(`Unsupported workflow action: ${String(exhaustive)}`);
+}
+
+interface Starter {
+  key: string;
+  label: string;
+  blurb: string;
+  build: (mint: () => string) => WorkflowStep[];
+}
+
+/**
+ * One-click sequences.
+ *
+ * Each is a shape an operator would otherwise assemble by hand. Where a
+ * message needs words, they are written against the three supported
+ * variables so the first save is not blocked on writing three messages.
+ * Where a note would only read as automated -- a cold invite is the worst
+ * place for one -- it is left blank on purpose, same as the product's own
+ * cold-outreach default (see `templates.ts`).
+ */
+const STARTERS: readonly Starter[] = [
+  {
+    key: 'warm-connect-followup',
+    label: 'Warm → Connect → Reply branches',
+    blurb:
+      'View, wait, invite, then split Accepted / Not Accepted and Replied / No Reply into explicit lanes.',
+    build: (mint) => {
+      const view = mint(),
+        warm = mint(),
+        invite = mint(),
+        accepted = mint(),
+        settle = mint();
+      const message1 = mint(),
+        reply = mint(),
+        message2 = mint(),
+        repliedEnd = mint();
+      const withdraw = mint(),
+        completedEnd = mint(),
+        notAcceptedEnd = mint();
+      return [
+        { id: view, delayBefore: { amount: 0, unit: 'hours' }, action: 'profile_view', config: {} },
+        {
+          id: warm,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'wait',
+          config: { duration: { amount: 1, unit: 'days' } }
+        },
+        {
+          id: invite,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'connection_request',
+          config: { message: '' }
+        },
+        {
+          id: accepted,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'accepted', ofStepId: invite },
+            timeout: { amount: 10, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: settle,
+            noStepId: withdraw
+          }
+        },
+        {
+          id: settle,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'wait',
+          config: { duration: { amount: 1, unit: 'days' } }
+        },
+        {
+          id: message1,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'Thanks for connecting, {{first_name}}. What are you focused on at {{company}} right now?',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: reply,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'replied', ofStepId: message1 },
+            timeout: { amount: 3, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: repliedEnd,
+            noStepId: message2
+          }
+        },
+        {
+          id: message2,
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: completedEnd,
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'One last thought, {{first_name}} — happy to share a short example if useful for {{company}}.',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: repliedEnd,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'replied' }
+        },
+        {
+          id: withdraw,
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: notAcceptedEnd,
+          action: 'withdraw_pending',
+          config: { afterDays: 10 }
+        },
+        {
+          id: completedEnd,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'completed' }
+        },
+        {
+          id: notAcceptedEnd,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'not_accepted' }
+        }
+      ];
+    }
+  },
+  {
+    key: 'connect-first',
+    label: 'Connected? → Message or Invite',
+    blurb:
+      'Mixed lists route existing connections straight to a message and new leads through invite acceptance.',
+    build: (mint) => {
+      const connected = mint(),
+        directMessage = mint(),
+        invite = mint(),
+        accepted = mint();
+      const acceptedMessage = mint(),
+        withdraw = mint(),
+        completed = mint(),
+        notAccepted = mint();
+      return [
+        {
+          id: connected,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'condition',
+          config: { condition: { kind: 'connected' }, yesStepId: directMessage, noStepId: invite }
+        },
+        {
+          id: directMessage,
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: completed,
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'Hi {{first_name}} — quick question about {{company}}.',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: invite,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'connection_request',
+          config: { message: '' }
+        },
+        {
+          id: accepted,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'accepted', ofStepId: invite },
+            timeout: { amount: 14, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: acceptedMessage,
+            noStepId: withdraw
+          }
+        },
+        {
+          id: acceptedMessage,
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: completed,
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'Good to connect, {{first_name}}. What is {{company}} focused on this quarter?',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: withdraw,
+          delayBefore: { amount: 0, unit: 'hours' },
+          nextStepId: notAccepted,
+          action: 'withdraw_pending',
+          config: { afterDays: 14 }
+        },
+        {
+          id: completed,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'completed' }
+        },
+        {
+          id: notAccepted,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'not_accepted' }
+        }
+      ];
+    }
+  },
+  {
+    key: 'warm-human',
+    label: 'View → Follow → Like → Human',
+    blurb: 'Three warm touches, then a human checkpoint; no automated cold message.',
+    build: (mint) => {
+      const view = mint(),
+        follow = mint(),
+        like = mint(),
+        human = mint(),
+        end = mint();
+      return [
+        { id: view, delayBefore: { amount: 0, unit: 'hours' }, action: 'profile_view', config: {} },
+        { id: follow, delayBefore: { amount: 1, unit: 'days' }, action: 'follow', config: {} },
+        { id: like, delayBefore: { amount: 1, unit: 'days' }, action: 'like_post', config: {} },
+        {
+          id: human,
+          delayBefore: { amount: 1, unit: 'days' },
+          action: 'manual_message',
+          config: {
+            suggestedTemplate:
+              'Review {{first_name}}’s recent activity and write a personal note about something specific.'
+          }
+        },
+        {
+          id: end,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'manual' }
+        }
+      ];
+    }
+  },
+  {
+    key: 'multichannel-fallback',
+    label: 'LinkedIn → Email fallback',
+    blurb:
+      'Try the right LinkedIn path first; fall back to a known email only after connection/reply timeouts.',
+    build: (mint) => {
+      const connected = mint(),
+        connectedMessage = mint(),
+        connectedReply = mint();
+      const invite = mint(),
+        accepted = mint(),
+        acceptedMessage = mint(),
+        acceptedReply = mint();
+      const emailAvailable = mint(),
+        email = mint(),
+        emailReply = mint(),
+        completed = mint(),
+        replied = mint();
+      return [
+        {
+          id: connected,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'condition',
+          config: {
+            condition: { kind: 'connected' },
+            yesStepId: connectedMessage,
+            noStepId: invite
+          }
+        },
+        {
+          id: connectedMessage,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'Hi {{first_name}} — quick question about {{company}}.',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: connectedReply,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'replied', ofStepId: connectedMessage },
+            timeout: { amount: 3, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: replied,
+            noStepId: emailAvailable
+          }
+        },
+        {
+          id: invite,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'connection_request',
+          config: { message: '' }
+        },
+        {
+          id: accepted,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'accepted', ofStepId: invite },
+            timeout: { amount: 10, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: acceptedMessage,
+            noStepId: emailAvailable
+          }
+        },
+        {
+          id: acceptedMessage,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'message',
+          config: {
+            variants: [
+              {
+                id: 'a',
+                body: 'Thanks for connecting, {{first_name}}. Is this relevant to {{company}}?',
+                weight: 100
+              }
+            ],
+            requiresAcceptedConnection: false
+          }
+        },
+        {
+          id: acceptedReply,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'replied', ofStepId: acceptedMessage },
+            timeout: { amount: 3, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: replied,
+            noStepId: emailAvailable
+          }
+        },
+        {
+          id: emailAvailable,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'condition',
+          config: { condition: { kind: 'email_available' }, yesStepId: email, noStepId: completed }
+        },
+        {
+          id: email,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'email',
+          config: {
+            subject: 'Quick question for {{company}}',
+            variants: [
+              {
+                id: 'a',
+                body: 'Hi {{first_name}}, I also wanted to reach you here. Worth a quick conversation?',
+                weight: 100
+              }
+            ],
+            threaded: true,
+            tracking: 'off'
+          }
+        },
+        {
+          id: emailReply,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'monitor',
+          config: {
+            condition: { kind: 'email_replied' },
+            timeout: { amount: 4, unit: 'days' },
+            pollEveryMinutes: 60,
+            yesStepId: replied,
+            noStepId: completed
+          }
+        },
+        {
+          id: completed,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'completed' }
+        },
+        {
+          id: replied,
+          delayBefore: { amount: 0, unit: 'hours' },
+          action: 'end',
+          config: { outcome: 'replied' }
+        }
+      ];
+    }
+  },
+  ...ADDITIONAL_WORKFLOW_STARTERS
+];
+
+/* ---------------------------------------------------------------------------
+ * The panel.
+ * ------------------------------------------------------------------------ */
+
+export function LinkedInManagerWorkflowConfig({
+  onChanged,
+  setToast,
+  compact = false,
+  onCreated,
+  initialWorkflowId,
+  campaign = null,
+  onCampaignSaved
+}: {
+  onChanged: () => Promise<void>;
+  setToast: (message: string) => void;
+  /**
+   * The inline "new from template" picker used on the campaign screen: pick a
+   * starter, it is created and saved immediately, no name field, no step
+   * editor, no library table. The full builder below is still where a
+   * starter gets customized -- this mode exists for the case where the
+   * starter as written is exactly what's wanted.
+   */
+  compact?: boolean;
+  /** Compact mode only: fires with the workflow a starter click just created. */
+  onCreated?: (workflow: LinkedInWorkflow) => void;
+  /** Full editor only: immediately open this saved workflow for editing. */
+  initialWorkflowId?: string | null;
+  /**
+   * CAMPAIGN MODE: edit the steps of ONE campaign and nothing else.
+   *
+   * A campaign has always carried its own copy of the steps -- it is the copy
+   * the runner actually executes -- but the only editor the screen offered was
+   * this library builder, so adjusting a single campaign meant editing a
+   * template every other campaign draws from, and the edit did not reach the
+   * campaign it was opened from at all. Given a campaign here, the same editor
+   * saves to that campaign's snapshot instead. The library is untouched unless
+   * the operator explicitly asks for a reusable copy, which is what finally
+   * makes a one-off sequence possible without parking a single-use row in the
+   * workflow list every future campaign has to scroll past.
+   */
+  campaign?: ManagedCampaign | null;
+  /** Campaign mode only: fires with the campaign after its steps are saved. */
+  onCampaignSaved?: (campaign: ManagedCampaign) => void;
+}) {
+  const isOwner = useIsWorkspaceOwner();
+  const [library, setLibrary] = useState<LinkedInWorkflow[]>([]);
+  const [starterQuery, setStarterQuery] = useState('');
+  const visibleStarters = STARTERS.filter((starter) =>
+    (starter.label + ' ' + starter.blurb).toLowerCase().includes(starterQuery.trim().toLowerCase())
+  );
+  const [id, setId] = useState<string | null>(null);
+  const [name, setName] = useState('');
+  const [scope, setScope] = useState<'workspace' | 'personal'>(() =>
+    isOwner ? 'workspace' : 'personal'
+  );
+  const [steps, setSteps] = useState<WorkflowStep[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [serverIssues, setServerIssues] = useState<
+    Array<{ path: Array<string | number>; message: string }>
+  >([]);
+  const [serverValidating, setServerValidating] = useState(false);
+  /** The card whose grip is held down. Only that card is draggable, so a caret drag inside a textarea is not a reorder. */
+  const [armedId, setArmedId] = useState<string | null>(null);
+  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [dropAt, setDropAt] = useState<number | null>(null);
+  const openedInitialWorkflowId = useRef<string | null>(null);
+  const openedCampaignId = useRef<string | null>(null);
+  /** Campaign mode: the name field appears only when a reusable copy is being asked for. */
+  const [copying, setCopying] = useState(false);
+
+  /**
+   * Step ids, minted once per edit session and never handed out twice.
+   *
+   * The old builder named a new step after the list length, so deleting step 2
+   * of 3 and adding another minted `step-3` a second time -- a duplicate id,
+   * and `workflowStepsSchema` rejects the whole save for it. The used-set is
+   * never pruned on a removal, so an id retired at 11:00 is not reissued at
+   * 11:01 either.
+   */
+  const counter = useRef(1);
+  const usedIds = useRef(new Set<string>());
+  const mintId = () => {
+    let candidate = `step-${counter.current}`;
+    while (usedIds.current.has(candidate)) {
+      counter.current += 1;
+      candidate = `step-${counter.current}`;
+    }
+    counter.current += 1;
+    usedIds.current.add(candidate);
+    return candidate;
+  };
+  const claimIds = (existing: readonly WorkflowStep[]) =>
+    existing.forEach((step) => usedIds.current.add(step.id));
+
+  const refresh = async () => setLibrary(await getLinkedInManagerWorkflows());
+  useEffect(() => {
+    // Campaign mode edits one snapshot and offers no library table, so it does
+    // not read the library either.
+    if (compact || campaign) return;
+    void refresh().catch(() => undefined);
+  }, [compact, campaign]);
+
+  /** Compact mode's whole job: build a starter's steps, save it under its own label, hand it back. No shared mutable id-minting state needed -- this is one save, not an editing session. */
+  const createFromStarter = async (starter: Starter) => {
+    setBusy(true);
+    setError('');
+    try {
+      let nextId = 1;
+      const mint = () => `step-${nextId++}`;
+      const workflow = await createLinkedInManagerWorkflow({
+        name: starter.label,
+        scope: isOwner ? 'workspace' : 'personal',
+        steps: serializeSteps(starter.build(mint))
+      });
+      setToast(`Workflow “${workflow.name}” saved. This stored configuration and queued nothing.`);
+      onCreated?.(workflow);
+      await onChanged();
+    } catch (err) {
+      setError(errorMessage(err, 'Unable to create that workflow.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const problems = useMemo(
+    () => steps.map((step, index) => stepProblems(step, index, steps)),
+    [steps]
+  );
+  const brokenCount = problems.filter((list) => list.length > 0).length;
+  useEffect(() => {
+    if (compact || steps.length === 0) {
+      setServerIssues([]);
+      setServerValidating(false);
+      return undefined;
+    }
+    // Campaign mode validates against the same server graph rules; a snapshot
+    // the runner cannot walk is no more acceptable than a library row that
+    // cannot be saved.
+    let live = true;
+    setServerValidating(true);
+    const timer = window.setTimeout(() => {
+      void validateLinkedInManagerWorkflow(serializeSteps(steps))
+        .then((result) => {
+          if (!live) return;
+          setServerIssues(result.issues);
+        })
+        .catch((err) => {
+          if (!live) return;
+          setServerIssues([{ path: [], message: errorMessage(err, 'Server validation failed.') }]);
+        })
+        .finally(() => {
+          if (live) setServerValidating(false);
+        });
+    }, 250);
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
+  }, [compact, steps]);
+  const cumulative = useMemo(() => {
+    let total = 0;
+    return steps.map((step) => {
+      total += hoursOf(step.delayBefore);
+      return total;
+    });
+  }, [steps]);
+
+  const replaceStep = (index: number, next: WorkflowStep) =>
+    setSteps((current) => current.map((step, at) => (at === index ? next : step)));
+  const addStep = (action: Action) =>
+    setSteps((current) =>
+      current.length >= MAX_STEPS
+        ? current
+        : [
+            ...current,
+            blankStep(action, mintId(), {
+              amount: current.length === 0 ? 0 : 1,
+              unit: current.length === 0 ? 'hours' : 'days'
+            })
+          ]
+    );
+  const addOutcomeScaffold = (index: number) => {
+    setSteps((current) => {
+      const source = current[index];
+      if (!source || !['connection_request', 'message', 'inmail'].includes(source.action))
+        return current;
+      if (source.action === 'inmail') {
+        const alreadyWrapped = current.some(
+          (candidate) =>
+            candidate.action === 'condition' &&
+            candidate.config.condition.kind === 'open_profile' &&
+            candidate.config.yesStepId === source.id
+        );
+        if (alreadyWrapped) return current;
+        if (current.length + 2 > MAX_STEPS) {
+          setError(
+            `Open Profile eligibility needs 2 more steps, but this workflow is already near the ${MAX_STEPS}-step limit.`
+          );
+          return current;
+        }
+        const inmailId = mintId();
+        const noEndId = mintId();
+        const existingNext =
+          source.nextStepId === undefined ? (current[index + 1]?.id ?? null) : source.nextStepId;
+        const wrappedInmail: WorkflowStep = {
+          ...source,
+          id: inmailId,
+          nextStepId: existingNext
+        };
+        const gate: WorkflowStep = {
+          id: source.id,
+          action: 'condition',
+          delayBefore: source.delayBefore,
+          config: {
+            condition: { kind: 'open_profile' },
+            yesStepId: inmailId,
+            noStepId: noEndId
+          }
+        };
+        const noEnd: WorkflowStep = {
+          id: noEndId,
+          action: 'end',
+          delayBefore: { amount: 0, unit: 'hours' },
+          config: { outcome: 'excluded' }
+        };
+        const next = [...current];
+        next[index] = gate;
+        next.splice(index + 1, 0, wrappedInmail, noEnd);
+        setError('');
+        return next;
+      }
+      const expected = source.action === 'connection_request' ? 'accepted' : 'replied';
+      if (
+        current.some(
+          (step) =>
+            step.action === 'monitor' &&
+            step.config.condition.kind === expected &&
+            step.config.condition.ofStepId === source.id
+        )
+      )
+        return current;
+      const existingNext = current[index + 1]?.id ?? null;
+      const required = existingNext ? 2 : 3;
+      if (current.length + required > MAX_STEPS) {
+        setError(
+          `Outcome paths need ${required} more steps, but this workflow is already near the ${MAX_STEPS}-step limit.`
+        );
+        return current;
+      }
+      const monitorId = mintId();
+      const yesEndId = mintId();
+      const noEndId = existingNext ? null : mintId();
+      const monitor: WorkflowStep =
+        source.action === 'connection_request'
+          ? {
+              id: monitorId,
+              action: 'monitor',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {
+                condition: { kind: 'accepted', ofStepId: source.id },
+                timeout: { amount: 10, unit: 'days' },
+                pollEveryMinutes: 60,
+                yesStepId: existingNext ?? yesEndId,
+                noStepId: noEndId ?? yesEndId
+              }
+            }
+          : {
+              id: monitorId,
+              action: 'monitor',
+              delayBefore: { amount: 0, unit: 'hours' },
+              config: {
+                condition: { kind: 'replied', ofStepId: source.id },
+                timeout: { amount: 7, unit: 'days' },
+                pollEveryMinutes: 60,
+                yesStepId: yesEndId,
+                noStepId: existingNext ?? (noEndId as string)
+              }
+            };
+      const yesEnd: WorkflowStep = {
+        id: yesEndId,
+        action: 'end',
+        delayBefore: { amount: 0, unit: 'hours' },
+        config: { outcome: source.action === 'message' ? 'replied' : 'completed' }
+      };
+      const additions: WorkflowStep[] = [monitor];
+      if (existingNext) {
+        if (source.action === 'connection_request')
+          additions.push({
+            id: yesEndId,
+            action: 'end',
+            delayBefore: { amount: 0, unit: 'hours' },
+            config: { outcome: 'not_accepted' }
+          });
+        else additions.push(yesEnd);
+      } else {
+        additions.push(yesEnd);
+        additions.push({
+          id: noEndId as string,
+          action: 'end',
+          delayBefore: { amount: 0, unit: 'hours' },
+          config: { outcome: source.action === 'connection_request' ? 'not_accepted' : 'completed' }
+        });
+      }
+      const next = [...current];
+      next[index] = { ...source, nextStepId: monitorId } as WorkflowStep;
+      next.splice(index + 1, 0, ...additions);
+      setError('');
+      return next;
+    });
+  };
+
+  const removeStep = (index: number) =>
+    setSteps((current) => current.filter((_, at) => at !== index));
+  const moveStep = (from: number, to: number) =>
+    setSteps((current) => {
+      if (from === to || to < 0 || to >= current.length) return current;
+      const next = [...current];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      const indexById = new Map(next.map((step, index) => [step.id, index]));
+      const invalidReference = next.find((step, index) => {
+        if (step.action !== 'condition' && step.action !== 'monitor') return false;
+        const sourceId = step.config.condition.ofStepId;
+        return sourceId ? (indexById.get(sourceId) ?? Number.POSITIVE_INFINITY) >= index : false;
+      });
+      if (invalidReference) {
+        setError(
+          `That move would put “${invalidReference.id}” before the result-bearing step it reads. Branch references must point backward, so the move was not applied.`
+        );
+        return current;
+      }
+      const invalidWithdraw = next.findIndex(
+        (step, index) =>
+          step.action === 'withdraw_pending' &&
+          !next.slice(0, index).some((earlier) => earlier.action === 'connection_request')
+      );
+      if (invalidWithdraw >= 0) {
+        setError(
+          'That move would put Withdraw before its connection request, so the move was not applied.'
+        );
+        return current;
+      }
+      setError('');
+      return next;
+    });
+
+  const reset = () => {
+    setId(null);
+    setName('');
+    setScope(isOwner ? 'workspace' : 'personal');
+    setSteps([]);
+    setError('');
+  };
+  const edit = (workflow: LinkedInWorkflow) => {
+    claimIds(workflow.steps);
+    setId(workflow.id);
+    setName(workflow.name);
+    setScope(workflow.scope);
+    setSteps(workflow.steps);
+    setError('');
+  };
+
+  useEffect(() => {
+    if (!campaign || openedCampaignId.current === campaign.id) return;
+    openedCampaignId.current = campaign.id;
+    claimIds(campaign.steps);
+    setSteps(campaign.steps);
+    setError('');
+  }, [campaign]);
+
+  useEffect(() => {
+    if (
+      compact ||
+      campaign ||
+      !initialWorkflowId ||
+      openedInitialWorkflowId.current === initialWorkflowId
+    )
+      return;
+    if (library.length === 0) return;
+    const workflow = library.find((candidate) => candidate.id === initialWorkflowId);
+    openedInitialWorkflowId.current = initialWorkflowId;
+    if (!workflow) {
+      setError('That workflow no longer exists.');
+      return;
+    }
+    edit(workflow);
+  }, [compact, initialWorkflowId, library]);
+
+  const applyStarter = (starter: Starter) => {
+    setSteps(starter.build(mintId));
+    setError('');
+    if (!name.trim()) setName(starter.label);
+  };
+
+  const clearDrag = () => {
+    setArmedId(null);
+    setDragFrom(null);
+    setDropAt(null);
+  };
+
+  /**
+   * A GRIP THAT WAS PRESSED AND NOT DRAGGED HAS TO DISARM ITSELF.
+   *
+   * `onMouseDown` on the grip arms the card -- it is what makes `draggable`
+   * true, so that a caret drag inside a textarea is never a reorder -- but the
+   * only things that cleared it were `onDragEnd` and `onDrop`. A grip CLICK
+   * produces neither, so one stray click left that card draggable for the rest
+   * of the session and selecting text in it started a drag instead.
+   *
+   * The listener is on the document rather than on the button because a pointer
+   * does not have to come back up over the element it went down on. A real drag
+   * is unaffected: browsers suppress `mouseup` for the duration of a native drag
+   * and fire `dragend` instead, which `clearDrag` already handles.
+   */
+  useEffect(() => {
+    if (armedId === null) return undefined;
+    const disarm = () => setArmedId(null);
+    document.addEventListener('mouseup', disarm);
+    document.addEventListener('touchend', disarm);
+    document.addEventListener('touchcancel', disarm);
+    return () => {
+      document.removeEventListener('mouseup', disarm);
+      document.removeEventListener('touchend', disarm);
+      document.removeEventListener('touchcancel', disarm);
+    };
+  }, [armedId]);
+
+  /**
+   * THE THREE GUARDS BELOW ARE REACHABLE, AND MAKING THEM SO WAS THE FIX.
+   *
+   * None of them could fire. The save button was disabled on an empty name and
+   * on a broken step, and its footer only rendered once there was at least one
+   * step, so all three strings were dead code -- and a builder holding a
+   * finished sequence with no name faced a dead button with nothing anywhere
+   * saying which field it was waiting on. The button is now disabled only while
+   * a request is in flight, and each refusal says its own reason, which is the
+   * rule the step cards have followed all along.
+   */
+  const save = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError('Give the workflow a name.');
+      return;
+    }
+    if (steps.length === 0) {
+      setError('A workflow needs at least one step.');
+      return;
+    }
+    if (brokenCount > 0) {
+      setError('Some steps still have problems. They are marked below.');
+      return;
+    }
+    if (serverIssues.length > 0) {
+      setError(
+        `Server validation still reports ${serverIssues.length} issue${serverIssues.length === 1 ? '' : 's'}. Fix them before saving.`
+      );
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const payload = { name: trimmed, scope, steps: serializeSteps(steps) };
+      const saved = id
+        ? await updateLinkedInManagerWorkflow(id, payload)
+        : await createLinkedInManagerWorkflow(payload);
+      setToast(`Workflow “${saved.name}” saved. This stored configuration and queued nothing.`);
+      if (id) {
+        claimIds(saved.steps);
+        setId(saved.id);
+        setName(saved.name);
+        setSteps(saved.steps);
+      } else if (campaign) {
+        // A reusable copy was asked for, not a new editing session. The steps on
+        // screen still belong to the campaign, and the campaign is still what
+        // the primary button saves; only the name field is done with.
+        setCopying(false);
+        setName('');
+      } else {
+        reset();
+      }
+      await Promise.all([campaign ? Promise.resolve() : refresh(), onChanged()]);
+    } catch (err) {
+      setError(errorMessage(err, 'Unable to save that workflow.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * CAMPAIGN MODE'S PRIMARY SAVE: this campaign's own steps, nothing else.
+   *
+   * No name, no scope, no library row -- the campaign already has an identity
+   * and a snapshot, and this overwrites that snapshot. The same step validation
+   * the library builder runs still gates it, because a snapshot the runner
+   * cannot walk is exactly as broken as a template that will not save.
+   */
+  const saveCampaignSteps = async () => {
+    if (!campaign) return;
+    if (steps.length === 0) {
+      setError('A campaign needs at least one step.');
+      return;
+    }
+    if (brokenCount > 0) {
+      setError('Some steps still have problems. They are marked below.');
+      return;
+    }
+    if (serverIssues.length > 0) {
+      setError(
+        `Server validation still reports ${serverIssues.length} issue${serverIssues.length === 1 ? '' : 's'}. Fix them before saving.`
+      );
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const result = await updateLinkedInManagedCampaignSequence(
+        campaign.id,
+        serializeSteps(steps)
+      );
+      setToast(
+        `Steps saved for “${result.campaign.name}”. ${result.pendingAffected} ${
+          result.pendingAffected === 1 ? 'person' : 'people'
+        } not yet in a wave will walk them; anyone already in a wave keeps the steps they started on. Nothing was sent.`
+      );
+      onCampaignSaved?.(result.campaign);
+      await onChanged();
+    } catch (err) {
+      setError(errorMessage(err, 'Unable to save these steps for this campaign.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (workflow: LinkedInWorkflow) => {
+    setBusy(true);
+    setError('');
+    try {
+      await deleteLinkedInManagerWorkflow(workflow.id);
+      if (id === workflow.id) reset();
+      setToast(`Workflow “${workflow.name}” deleted.`);
+      await Promise.all([refresh(), onChanged()]);
+    } catch (err) {
+      setError(errorMessage(err, 'Unable to delete that workflow.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (compact) {
+    return (
+      <div className="li-wf-compact li-polished">
+        {error && <div className="error-banner">{error}</div>}
+        <label className="li-wf-starter-filter">
+          Find a workflow template
+          <input
+            type="search"
+            aria-label="Search workflow templates"
+            placeholder={`Search ${STARTERS.length} workflows by objective`}
+            value={starterQuery}
+            onChange={(event) => setStarterQuery(event.target.value)}
+          />
+        </label>
+        <div className="li-wf-starters">
+          {visibleStarters.map((starter) => (
+            <button
+              className="li-wf-starter"
+              type="button"
+              key={starter.key}
+              disabled={busy}
+              onClick={() => void createFromStarter(starter)}
+            >
+              <strong>{starter.label}</strong>
+              <p>{starter.blurb}</p>
+              <span className="li-wf-starter-steps">
+                {starter
+                  .build(() => 'preview')
+                  .map((step, at) => (
+                    <span
+                      className={`li-chip li-kind-chip ${ACTION_META[step.action].chip}`}
+                      key={`${starter.key}-${at}`}
+                    >
+                      {ACTION_META[step.action].label}
+                    </span>
+                  ))}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <section className="page-panel li-polished">
+      <div className="section-heading">
+        <div>
+          <h3 aria-level={2}>
+            {campaign ? `Steps for ${campaign.name}` : 'Reusable workflow builder'}
+          </h3>
+          <p>
+            {campaign
+              ? 'These steps belong to this campaign alone. Saving them changes no workflow in the library and no other campaign. Anyone already in a wave keeps the steps they started on.'
+              : 'A workflow is a ladder of LinkedIn actions, each waiting its own delay. Definitions are versioned and validated. Saving one never creates a LinkedIn action.'}
+          </p>
+        </div>
+        {!campaign && (id || steps.length > 0) && (
+          <button className="ghost-button" type="button" onClick={reset}>
+            New workflow
+          </button>
+        )}
+      </div>
+
+      {error && <div className="error-banner">{error}</div>}
+      {serverIssues.length > 0 && (
+        <div className="li-warn-block">
+          <CircleAlert size={15} />
+          <div>
+            <strong>Server validation</strong>
+            <ul>
+              {serverIssues.map((issue, index) => (
+                <li key={`${issue.path.join('.')}-${index}`}>
+                  {issue.path.length ? `${issue.path.join('.')} — ` : ''}
+                  {issue.message}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/*
+        In campaign mode these two fields describe a LIBRARY ROW, and campaign
+        mode does not write one unless it is asked to. They appear when the
+        operator asks for a reusable copy, and not before -- naming and filing
+        something nobody wanted saved is what filled the workflow list with
+        one-off rows in the first place.
+      */}
+      {(!campaign || copying) && (
+        <label className="li-block-label">
+          {campaign ? 'Name for the reusable copy' : 'Workflow name'}
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Founder connect + follow-up"
+          />
+        </label>
+      )}
+
+      {(!campaign || copying) && (
+        <label className="li-block-label">
+          Template library
+          {isOwner ? (
+            <Select
+              value={scope}
+              disabled={Boolean(id)}
+              onChange={(event) => setScope(event.target.value as 'workspace' | 'personal')}
+            >
+              <option value="workspace">Workspace — visible to everyone</option>
+              <option value="personal">Personal — visible only to me</option>
+            </Select>
+          ) : (
+            <span className="li-hint">Personal — visible only to you</span>
+          )}
+          {id && (
+            <small className="li-hint">
+              Scope is fixed once a workflow exists. A new workflow can be filed in either library.
+            </small>
+          )}
+        </label>
+      )}
+
+      {steps.length === 0 ? (
+        <div className="empty-state li-wf-empty">
+          <LayoutTemplate size={22} />
+          <h4>No steps yet</h4>
+          <p>
+            A workflow is the sequence every lead in a campaign walks: view the profile, ask to
+            connect, follow up, withdraw what nobody answered. Each step waits its own delay before
+            it runs. Start from one of these and edit it, or pick any of the six actions below as
+            the first step.
+          </p>
+          <label className="li-wf-starter-filter">
+            Find a workflow template
+            <input
+              type="search"
+              aria-label="Search workflow templates"
+              placeholder={`Search ${STARTERS.length} workflows by objective`}
+              value={starterQuery}
+              onChange={(event) => setStarterQuery(event.target.value)}
+            />
+          </label>
+          <div className="li-wf-starters">
+            {visibleStarters.map((starter) => (
+              <button
+                className="li-wf-starter"
+                type="button"
+                key={starter.key}
+                onClick={() => applyStarter(starter)}
+              >
+                <strong>{starter.label}</strong>
+                <p>{starter.blurb}</p>
+                <span className="li-wf-starter-steps">
+                  {starter
+                    .build(() => 'preview')
+                    .map((step, at) => (
+                      <span
+                        className={`li-chip li-kind-chip ${ACTION_META[step.action].chip}`}
+                        key={`${starter.key}-${at}`}
+                      >
+                        {ACTION_META[step.action].label}
+                      </span>
+                    ))}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <ol className="li-wf-timeline">
+          {steps.map((step, index) => (
+            <li
+              className={`li-wf-node${dragFrom === index ? ' is-dragging' : ''}${dropAt === index && dragFrom !== null && dragFrom !== index ? ' is-drop-target' : ''}`}
+              key={step.id}
+            >
+              <div className="li-wf-rail" aria-hidden="true">
+                <span className="li-wf-marker">{index + 1}</span>
+                {index < steps.length - 1 && <span className="li-wf-line" />}
+              </div>
+              <WorkflowStepCard
+                step={step}
+                index={index}
+                total={steps.length}
+                steps={steps}
+                when={whenLabel(cumulative[index])}
+                problems={problems[index]}
+                armed={armedId === step.id}
+                onArm={() => setArmedId(step.id)}
+                onChange={(next) => replaceStep(index, next)}
+                onChangeAction={(action) =>
+                  replaceStep(index, blankStep(action, step.id, step.delayBefore))
+                }
+                onAddOutcomeScaffold={() => addOutcomeScaffold(index)}
+                onMove={(direction) => moveStep(index, index + direction)}
+                onRemove={() => removeStep(index)}
+                onDragStart={() => setDragFrom(index)}
+                onDragOver={() => setDropAt(index)}
+                onDrop={() => {
+                  if (dragFrom !== null) moveStep(dragFrom, index);
+                  clearDrag();
+                }}
+                onDragEnd={clearDrag}
+              />
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {/*
+      THIS MENU IS THE ONLY WAY TO ADD A STEP, INCLUDING THE FIRST ONE.
+      The empty state used to offer a single button hardcoded to `profile_view`,
+      and the six-action menu rendered only once a step already existed -- so
+      five of the six actions could not begin a workflow. An operator wanting to
+      open on a connection request had to add a profile view and then change what
+      it was. Rendering it in both states means the first step is chosen exactly
+      the way every later one is.
+    */}
+      <div className="li-add-step">
+        <fieldset className="li-add-step-group">
+          <legend>{steps.length === 0 ? 'Start with a step' : 'Add a step'}</legend>
+          <div className="li-add-step-groups">
+            {ACTION_GROUPS.map((group) => (
+              <div className="li-add-step-section" key={group.label}>
+                <span>{group.label}</span>
+                <div className="li-add-step-buttons">
+                  {group.actions.map((action) => {
+                    const { Icon, label, blurb } = ACTION_META[action];
+                    return (
+                      <button
+                        className="li-add-action"
+                        type="button"
+                        key={action}
+                        disabled={steps.length >= MAX_STEPS}
+                        title={blurb}
+                        onClick={() => addStep(action)}
+                      >
+                        <Icon size={14} />
+                        <span>{label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </fieldset>
+        {steps.length >= MAX_STEPS && (
+          <span className="li-hint">A workflow holds {MAX_STEPS} steps at most.</span>
+        )}
+      </div>
+
+      <div className="panel-footer">
+        <span>
+          {brokenCount > 0
+            ? `${brokenCount} step${brokenCount === 1 ? '' : 's'} still ${brokenCount === 1 ? 'has' : 'have'} something the server would refuse. Each one says what, below.`
+            : serverValidating
+              ? 'Checking this graph against the server validator…'
+              : serverIssues.length > 0
+                ? `${serverIssues.length} server validation issue${serverIssues.length === 1 ? '' : 's'} remain.`
+                : steps.length === 0
+                  ? campaign
+                    ? 'A campaign needs at least one step. Pick the first one above.'
+                    : 'A workflow needs at least one step. Pick the first one above.'
+                  : campaign
+                    ? copying && !name.trim()
+                      ? 'Name the reusable copy and it can be saved.'
+                      : 'Saving changes this campaign only. It queues no LinkedIn action.'
+                    : !name.trim()
+                      ? 'Give the workflow a name and it can be saved.'
+                      : 'Saving stores this definition. It queues no LinkedIn action.'}
+        </span>
+        {campaign ? (
+          <>
+            {/*
+              The opt-in that keeps the library clean. Editing a campaign no
+              longer files anything; a template appears in the workflow list
+              when, and only when, somebody says this sequence is worth reusing.
+            */}
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busy}
+              onClick={() => (copying ? void save() : setCopying(true))}
+            >
+              <Save size={14} /> {copying ? 'Save reusable copy' : 'Save as reusable workflow'}
+            </button>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={busy}
+              onClick={() => void saveCampaignSteps()}
+            >
+              {busy ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />} Save steps
+              for this campaign
+            </button>
+          </>
+        ) : (
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void save()}
+          >
+            {busy ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{' '}
+            {id ? 'Update workflow' : 'Save workflow'}
+          </button>
+        )}
+      </div>
+
+      {library.length > 0 && (
+        <div className="li-table-scroll">
+          <table className="li-table">
+            <thead>
+              <tr>
+                <th>Workflow</th>
+                <th>Library</th>
+                <th>Steps</th>
+                <th>Version</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {library.map((workflow) => (
+                <tr key={workflow.id}>
+                  <td>
+                    <button className="ghost-button" type="button" onClick={() => edit(workflow)}>
+                      {workflow.name}
+                    </button>
+                  </td>
+                  <td>{workflow.scope === 'workspace' ? 'Workspace' : 'Personal'}</td>
+                  <td>{workflow.steps.length}</td>
+                  <td>v{workflow.version}</td>
+                  <td>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label="Delete workflow"
+                      title="Delete workflow"
+                      onClick={() => void remove(workflow)}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------------------------------------------------------------------
+ * One step.
+ * ------------------------------------------------------------------------ */
+
+function WorkflowStepCard({
+  step,
+  index,
+  total,
+  steps,
+  when,
+  problems,
+  armed,
+  onArm,
+  onChange,
+  onChangeAction,
+  onAddOutcomeScaffold,
+  onMove,
+  onRemove,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd
+}: {
+  step: WorkflowStep;
+  index: number;
+  total: number;
+  steps: readonly WorkflowStep[];
+  /** Cumulative offset from campaign start, already worded. */
+  when: string;
+  problems: readonly string[];
+  armed: boolean;
+  onArm: () => void;
+  onChange: (next: WorkflowStep) => void;
+  onChangeAction: (action: Action) => void;
+  onAddOutcomeScaffold: () => void;
+  onMove: (direction: -1 | 1) => void;
+  onRemove: () => void;
+  onDragStart: () => void;
+  onDragOver: () => void;
+  onDrop: () => void;
+  onDragEnd: () => void;
+}) {
+  const meta = ACTION_META[step.action];
+  const { Icon } = meta;
+  /** Every textarea on this card, so a merge field lands at the caret of the one it belongs to. */
+  const fields = useRef<Record<string, HTMLTextAreaElement | null>>({});
+
+  const insert = (key: string, value: string, token: string, commit: (next: string) => void) => {
+    const element = fields.current[key];
+    const start = element?.selectionStart ?? value.length;
+    const end = element?.selectionEnd ?? value.length;
+    commit(`${value.slice(0, start)}${token}${value.slice(end)}`);
+    requestAnimationFrame(() => {
+      if (!element) return;
+      const caret = start + token.length;
+      element.focus();
+      element.setSelectionRange(caret, caret);
+    });
+  };
+
+  const setDelay = (patch: Partial<WorkflowDelay>) =>
+    onChange({ ...step, delayBefore: { ...step.delayBefore, ...patch } } as WorkflowStep);
+  const setSla = (patch: Partial<WorkflowDelay> | null) =>
+    onChange(
+      patch === null
+        ? ({ ...step, sla: undefined } as WorkflowStep)
+        : ({
+            ...step,
+            sla: { ...(step.sla ?? { amount: 24, unit: 'hours' as const }), ...patch }
+          } as WorkflowStep)
+    );
+  const laterTargets = steps.slice(index + 1);
+  const earlierResultTargets = steps
+    .slice(0, index)
+    .filter(
+      (candidate) =>
+        candidate.action === 'connection_request' ||
+        candidate.action === 'message' ||
+        candidate.action === 'inmail' ||
+        candidate.action === 'email'
+    );
+
+  return (
+    <article
+      className="li-step li-step-card li-wf-card"
+      draggable={armed}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', String(index));
+        onDragStart();
+      }}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        onDragOver();
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        onDrop();
+      }}
+      onDragEnd={onDragEnd}
+    >
+      <header>
+        <span className={`li-chip li-kind-chip ${meta.chip}`}>
+          <Icon size={12} /> {meta.label}
+        </span>
+        <span className="li-wf-when">{when}</span>
+        <div className="li-step-tools">
+          <button
+            className="li-mini-button li-wf-grip"
+            type="button"
+            aria-label={`Drag step ${index + 1} to reorder`}
+            title="Drag to reorder"
+            onMouseDown={onArm}
+            onTouchStart={onArm}
+          >
+            <GripVertical size={12} />
+          </button>
+          <button
+            className="li-mini-button"
+            type="button"
+            disabled={index === 0}
+            aria-label={`Move step ${index + 1} earlier`}
+            onClick={() => onMove(-1)}
+          >
+            <ArrowUp size={12} />
+          </button>
+          <button
+            className="li-mini-button"
+            type="button"
+            disabled={index === total - 1}
+            aria-label={`Move step ${index + 1} later`}
+            onClick={() => onMove(1)}
+          >
+            <ArrowDown size={12} />
+          </button>
+          <button
+            className="li-mini-button li-mini-danger"
+            type="button"
+            aria-label={`Delete step ${index + 1}`}
+            onClick={onRemove}
+          >
+            <Trash2 size={12} />
+          </button>
+        </div>
+      </header>
+
+      <div className="li-form-grid li-step-fields">
+        <label>
+          Action
+          <Select
+            value={step.action}
+            aria-label={`Action for step ${index + 1}`}
+            onChange={(event) => onChangeAction(event.target.value as Action)}
+          >
+            {ACTION_GROUPS.map((group) => (
+              <optgroup key={group.label} label={group.label}>
+                {group.actions.map((action) => (
+                  <option key={action} value={action}>
+                    {ACTION_META[action].label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </Select>
+        </label>
+        <div className="li-wf-wait">
+          <label>
+            Wait before this step
+            <input
+              type="number"
+              min={0}
+              max={DELAY_MAX}
+              value={step.delayBefore.amount}
+              onChange={(event) =>
+                setDelay({
+                  amount: Math.min(
+                    DELAY_MAX,
+                    Math.max(0, Math.trunc(Number(event.target.value) || 0))
+                  )
+                })
+              }
+            />
+          </label>
+          <label>
+            Unit
+            <Select
+              value={step.delayBefore.unit}
+              onChange={(event) => setDelay({ unit: event.target.value as 'hours' | 'days' })}
+            >
+              <option value="hours">hours</option>
+              <option value="days">days</option>
+            </Select>
+          </label>
+        </div>
+        <p className="li-hint li-span-2">
+          {index === 0
+            ? `Runs ${waitLabel(step.delayBefore)} after the campaign starts the lead — ${when.toLowerCase()}.`
+            : `Runs ${waitLabel(step.delayBefore)} after step ${index} — ${when.toLowerCase()}.`}
+        </p>
+
+        <div className="li-wf-wait li-span-2">
+          <label>
+            Target SLA after due
+            <input
+              type="number"
+              min={1}
+              max={DELAY_MAX}
+              placeholder="none"
+              value={step.sla?.amount ?? ''}
+              onChange={(event) => {
+                const raw = event.target.value.trim();
+                if (!raw) setSla(null);
+                else
+                  setSla({
+                    amount: Math.min(DELAY_MAX, Math.max(1, Math.trunc(Number(raw) || 1)))
+                  });
+              }}
+            />
+          </label>
+          <label>
+            SLA unit
+            <Select
+              disabled={!step.sla}
+              value={step.sla?.unit ?? 'hours'}
+              onChange={(event) => setSla({ unit: event.target.value as 'hours' | 'days' })}
+            >
+              <option value="hours">hours</option>
+              <option value="days">days</option>
+            </Select>
+          </label>
+        </div>
+        <p className="li-hint li-span-2">
+          {step.sla
+            ? `If this step is still waiting ${step.sla.amount} ${step.sla.unit} after it becomes due, Trevra escalates it ahead of newer continuation work. This never raises LinkedIn limits.`
+            : 'Optional: set a follow-up SLA to escalate this step if it waits too long. It changes priority, not LinkedIn limits.'}
+        </p>
+
+        {(step.action === 'follow_company' ||
+          step.action === 'like_company_post' ||
+          step.action === 'invite_to_follow_company') && (
+          <label className="li-span-2">
+            LinkedIn company URL
+            <input
+              type="url"
+              value={step.config.companyUrl}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, companyUrl: event.target.value }
+                } as WorkflowStep)
+              }
+              placeholder="https://www.linkedin.com/company/acme/"
+            />
+          </label>
+        )}
+        {(step.action === 'invite_to_event' || step.action === 'event_message') && (
+          <label className="li-span-2">
+            LinkedIn event URL
+            <input
+              type="url"
+              value={step.config.eventUrl}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, eventUrl: event.target.value }
+                } as WorkflowStep)
+              }
+              placeholder="https://www.linkedin.com/events/.../"
+            />
+          </label>
+        )}
+        {(step.action === 'invite_to_group' || step.action === 'group_message') && (
+          <label className="li-span-2">
+            LinkedIn group URL
+            <input
+              type="url"
+              value={step.config.groupUrl}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, groupUrl: event.target.value }
+                } as WorkflowStep)
+              }
+              placeholder="https://www.linkedin.com/groups/123/"
+            />
+          </label>
+        )}
+        {(step.action === 'group_message' || step.action === 'event_message') && (
+          <div className="li-span-2">
+            <CompactVariants
+              variants={step.config.variants}
+              bodyMax={8000}
+              bind={(key, element) => {
+                fields.current[key] = element;
+              }}
+              insert={insert}
+              onChange={(variants) =>
+                onChange({ ...step, config: { ...step.config, variants } } as WorkflowStep)
+              }
+            />
+          </div>
+        )}
+
+        {step.action === 'disconnect' && (
+          <div className="li-span-2 mgr-danger-note">
+            <strong>Destructive action.</strong> Trevra verifies the lead is a 1st-degree connection
+            before exposing LinkedIn’s Remove connection control. Unknown relationship state stops
+            the batch; it never guesses.
+          </div>
+        )}
+
+        {(step.action === 'connection_request' ||
+          step.action === 'message' ||
+          step.action === 'inmail') && (
+          <div className="li-span-2 mgr-preview-note">
+            <b>
+              {step.action === 'connection_request'
+                ? 'Simple outcome lanes'
+                : step.action === 'message'
+                  ? 'Reply lanes'
+                  : 'Open Profile eligibility'}
+              .
+            </b>{' '}
+            {step.action === 'inmail'
+              ? 'Wrap this step in If Open Profile → InMail / No → End. Paid credits stay off unless you explicitly enable them.'
+              : 'Add the canonical Monitor + YES/NO paths with one click; you can edit the timeout and destinations afterward.'}
+            <button
+              className="li-mini-button"
+              type="button"
+              onClick={onAddOutcomeScaffold}
+              disabled={
+                step.action === 'inmail'
+                  ? steps.some(
+                      (candidate) =>
+                        candidate.action === 'condition' &&
+                        candidate.config.condition.kind === 'open_profile' &&
+                        candidate.config.yesStepId === step.id
+                    )
+                  : steps.some(
+                      (candidate) =>
+                        candidate.action === 'monitor' &&
+                        candidate.config.condition.ofStepId === step.id &&
+                        candidate.config.condition.kind ===
+                          (step.action === 'connection_request' ? 'accepted' : 'replied')
+                    )
+              }
+            >
+              {step.action === 'connection_request'
+                ? 'Add Accepted / Not Accepted paths'
+                : step.action === 'message'
+                  ? 'Add Replied / No Reply paths'
+                  : 'Wrap with Open Profile check'}
+            </button>
+          </div>
+        )}
+
+        {step.action === 'connection_request' && (
+          <div className="li-span-2">
+            {step.config.variants && step.config.variants.length > 0 ? (
+              <>
+                <CompactVariants
+                  variants={step.config.variants}
+                  bodyMax={INVITE_NOTE_MAX}
+                  emptyLabel="Empty note is valid"
+                  bind={(key, element) => {
+                    fields.current[key] = element;
+                  }}
+                  insert={insert}
+                  onChange={(variants) =>
+                    onChange({ ...step, config: { ...step.config, variants } })
+                  }
+                />
+                <button
+                  className="li-mini-button"
+                  type="button"
+                  onClick={() =>
+                    onChange({
+                      ...step,
+                      config: { message: step.config.variants?.[0]?.body ?? '' }
+                    })
+                  }
+                >
+                  Use one invitation note
+                </button>
+              </>
+            ) : (
+              <>
+                <label>
+                  Invitation note (optional)
+                  <textarea
+                    ref={(element) => {
+                      fields.current.note = element;
+                    }}
+                    rows={3}
+                    value={step.config.message ?? ''}
+                    onChange={(event) =>
+                      onChange({ ...step, config: { message: event.target.value } })
+                    }
+                    placeholder="Hi {{first_name}} — …"
+                  />
+                </label>
+                <MergeRow
+                  onInsert={(variable) =>
+                    insert('note', step.config.message ?? '', `{{${variable}}}`, (next) =>
+                      onChange({ ...step, config: { message: next } })
+                    )
+                  }
+                  trailing={
+                    <CharCount length={(step.config.message ?? '').length} max={INVITE_NOTE_MAX} />
+                  }
+                />
+                <TemplatePreview value={step.config.message ?? ''} />
+                <div className="li-wf-split">
+                  <button
+                    className="li-mini-button"
+                    type="button"
+                    onClick={() =>
+                      onChange({
+                        ...step,
+                        config: {
+                          variants: [
+                            { id: 'a', body: step.config.message ?? '', weight: 50 },
+                            { id: 'b', body: '', weight: 50 }
+                          ]
+                        }
+                      })
+                    }
+                  >
+                    <Plus size={12} /> A/B test invitation note
+                  </button>
+                  <span className="li-hint">An empty note is a valid variant.</span>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {step.action === 'withdraw_pending' && (
+          <label>
+            Withdraw invites older than (days)
+            <input
+              type="number"
+              min={1}
+              max={90}
+              value={step.config.afterDays}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: {
+                    afterDays: Math.min(
+                      90,
+                      Math.max(1, Math.trunc(Number(event.target.value) || 1))
+                    )
+                  }
+                })
+              }
+            />
+          </label>
+        )}
+
+        {step.action === 'message' && (
+          <label className="li-span-2">
+            Condition
+            <Select
+              value={step.config.requiresAcceptedConnection ? 'accepted' : 'always'}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: {
+                    ...step.config,
+                    requiresAcceptedConnection: event.target.value === 'accepted'
+                  }
+                })
+              }
+            >
+              <option value="always">Always send when this step is due</option>
+              <option value="accepted">Only if the connection request was accepted</option>
+            </Select>
+          </label>
+        )}
+
+        {step.action === 'message' && (
+          <MessageVariants
+            step={step}
+            bind={(key, element) => {
+              fields.current[key] = element;
+            }}
+            insert={insert}
+            onChange={onChange}
+          />
+        )}
+
+        {step.action === 'manual_message' && (
+          <div className="li-span-2">
+            <label>
+              Suggested copy for the human (optional)
+              <textarea
+                ref={(element) => {
+                  fields.current.suggested = element;
+                }}
+                rows={3}
+                value={step.config.suggestedTemplate ?? ''}
+                onChange={(event) =>
+                  onChange({ ...step, config: { suggestedTemplate: event.target.value } })
+                }
+                placeholder="Review the thread and write a personal note."
+              />
+            </label>
+            <MergeRow
+              onInsert={(variable) =>
+                insert(
+                  'suggested',
+                  step.config.suggestedTemplate ?? '',
+                  `{{${variable}}}`,
+                  (next) => onChange({ ...step, config: { suggestedTemplate: next } })
+                )
+              }
+              trailing={
+                <CharCount length={(step.config.suggestedTemplate ?? '').length} max={BODY_MAX} />
+              }
+            />
+            <TemplatePreview value={step.config.suggestedTemplate ?? ''} />
+          </div>
+        )}
+
+        {step.action === 'endorse_skills' && (
+          <label>
+            Skills to endorse (1–10 per action)
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={step.config.maxSkills}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: {
+                    maxSkills: Math.max(
+                      1,
+                      Math.min(10, Math.trunc(Number(event.target.value) || 1))
+                    )
+                  }
+                })
+              }
+            />
+          </label>
+        )}
+
+        {step.action === 'wait' && (
+          <div className="li-wf-wait li-span-2">
+            <label>
+              Wait duration
+              <input
+                type="number"
+                min={0}
+                max={DELAY_MAX}
+                value={step.config.duration.amount}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: {
+                      duration: {
+                        ...step.config.duration,
+                        amount: Math.min(
+                          DELAY_MAX,
+                          Math.max(0, Math.trunc(Number(event.target.value) || 0))
+                        )
+                      }
+                    }
+                  })
+                }
+              />
+            </label>
+            <label>
+              Unit
+              <Select
+                value={step.config.duration.unit}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: {
+                      duration: {
+                        ...step.config.duration,
+                        unit: event.target.value as 'hours' | 'days'
+                      }
+                    }
+                  })
+                }
+              >
+                <option value="hours">hours</option>
+                <option value="days">days</option>
+              </Select>
+            </label>
+            <p className="li-hint">
+              Passive timer only. Trevra does not poll any condition during this node.
+            </p>
+          </div>
+        )}
+
+        {(step.action === 'condition' || step.action === 'monitor') && (
+          <div className="li-span-2 li-form-grid">
+            <label>
+              Condition
+              <Select
+                value={step.config.condition.kind}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: {
+                      ...step.config,
+                      condition: {
+                        kind: event.target.value as keyof typeof CONDITION_LABELS,
+                        ofStepId: ['accepted', 'replied'].includes(event.target.value)
+                          ? null
+                          : undefined
+                      }
+                    }
+                  } as WorkflowStep)
+                }
+              >
+                {Object.entries(CONDITION_LABELS).map(([kind, label]) => (
+                  <option key={kind} value={kind}>
+                    {label}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            {['accepted', 'replied'].includes(step.config.condition.kind) && (
+              <label>
+                Result from earlier step
+                <Select
+                  value={step.config.condition.ofStepId ?? ''}
+                  onChange={(event) =>
+                    onChange({
+                      ...step,
+                      config: {
+                        ...step.config,
+                        condition: {
+                          ...step.config.condition,
+                          ofStepId: event.target.value || null
+                        }
+                      }
+                    } as WorkflowStep)
+                  }
+                >
+                  <option value="">Choose step</option>
+                  {earlierResultTargets
+                    .filter((candidate) =>
+                      step.config.condition.kind === 'accepted'
+                        ? candidate.action === 'connection_request'
+                        : ['message', 'inmail', 'email'].includes(candidate.action)
+                    )
+                    .map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidate.id} · {ACTION_META[candidate.action].label}
+                      </option>
+                    ))}
+                </Select>
+              </label>
+            )}
+            {step.action === 'monitor' && (
+              <>
+                <label>
+                  Monitor timeout
+                  <input
+                    type="number"
+                    min={0}
+                    max={DELAY_MAX}
+                    value={step.config.timeout.amount}
+                    onChange={(event) =>
+                      onChange({
+                        ...step,
+                        config: {
+                          ...step.config,
+                          timeout: {
+                            ...step.config.timeout,
+                            amount: Math.min(
+                              DELAY_MAX,
+                              Math.max(0, Math.trunc(Number(event.target.value) || 0))
+                            )
+                          }
+                        }
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Timeout unit
+                  <Select
+                    value={step.config.timeout.unit}
+                    onChange={(event) =>
+                      onChange({
+                        ...step,
+                        config: {
+                          ...step.config,
+                          timeout: {
+                            ...step.config.timeout,
+                            unit: event.target.value as 'hours' | 'days'
+                          }
+                        }
+                      })
+                    }
+                  >
+                    <option value="hours">hours</option>
+                    <option value="days">days</option>
+                  </Select>
+                </label>
+                <label>
+                  Poll every (minutes)
+                  <input
+                    type="number"
+                    min={5}
+                    max={1440}
+                    value={step.config.pollEveryMinutes}
+                    onChange={(event) =>
+                      onChange({
+                        ...step,
+                        config: {
+                          ...step.config,
+                          pollEveryMinutes: Math.min(
+                            1440,
+                            Math.max(5, Math.trunc(Number(event.target.value) || 5))
+                          )
+                        }
+                      })
+                    }
+                  />
+                </label>
+              </>
+            )}
+            <label>
+              YES →
+              <Select
+                value={step.config.yesStepId}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, yesStepId: event.target.value }
+                  } as WorkflowStep)
+                }
+              >
+                <option value="__choose_yes__">Choose target</option>
+                {laterTargets.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.id} · {ACTION_META[candidate.action].label}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            <label>
+              NO / timeout →
+              <Select
+                value={step.config.noStepId}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, noStepId: event.target.value }
+                  } as WorkflowStep)
+                }
+              >
+                <option value="__choose_no__">Choose target</option>
+                {laterTargets.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.id} · {ACTION_META[candidate.action].label}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            <p className="li-hint li-span-2">
+              {step.action === 'monitor'
+                ? 'Monitor routes YES as soon as evidence arrives and NO only at timeout.'
+                : 'Condition evaluates once when the lead reaches this node.'}
+            </p>
+          </div>
+        )}
+
+        {step.action === 'end' && (
+          <label>
+            End outcome
+            <Select
+              value={step.config.outcome}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: { outcome: event.target.value as typeof step.config.outcome }
+                })
+              }
+            >
+              <option value="completed">Completed</option>
+              <option value="replied">Replied / handoff</option>
+              <option value="not_accepted">Not accepted</option>
+              <option value="manual">Manual handoff</option>
+              <option value="excluded">Excluded</option>
+            </Select>
+          </label>
+        )}
+
+        {(step.action === 'email' || step.action === 'inmail') && (
+          <div className="li-span-2">
+            <label>
+              Subject
+              <input
+                value={step.config.subject}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, subject: event.target.value }
+                  } as WorkflowStep)
+                }
+                placeholder={
+                  step.action === 'email' ? 'Quick question for {{company}}' : 'About {{company}}'
+                }
+              />
+            </label>
+            <MergeRow
+              onInsert={(variable) =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, subject: `${step.config.subject}{{${variable}}}` }
+                } as WorkflowStep)
+              }
+              trailing={
+                <CharCount
+                  length={step.config.subject.length}
+                  max={step.action === 'email' ? 998 : 200}
+                />
+              }
+            />
+            <CompactVariants
+              variants={step.config.variants}
+              bodyMax={BODY_MAX}
+              bind={(key, element) => {
+                fields.current[key] = element;
+              }}
+              insert={insert}
+              onChange={(variants) =>
+                onChange({ ...step, config: { ...step.config, variants } } as WorkflowStep)
+              }
+            />
+            {step.action === 'email' ? (
+              <div className="li-form-grid">
+                <label className="li-check-row">
+                  <input
+                    type="checkbox"
+                    checked={step.config.threaded}
+                    onChange={(event) =>
+                      onChange({
+                        ...step,
+                        config: { ...step.config, threaded: event.target.checked }
+                      })
+                    }
+                  />{' '}
+                  Thread follow-ups where the provider supports it
+                </label>
+                <label>
+                  Tracking policy
+                  <Select
+                    value={step.config.tracking}
+                    onChange={(event) =>
+                      onChange({
+                        ...step,
+                        config: {
+                          ...step.config,
+                          tracking: event.target.value as typeof step.config.tracking
+                        }
+                      })
+                    }
+                  >
+                    <option value="off">Off</option>
+                    <option value="opens">Opens</option>
+                    <option value="opens_clicks">Opens + clicks</option>
+                  </Select>
+                  <small className="li-acct-range">
+                    Off adds no tracking. Opens inserts a tracking pixel; Opens + clicks also
+                    rewrites links through Trevra's tracking endpoint. Tracking requires an
+                    appropriate privacy notice and lawful basis; leave Off unless authorized.
+                  </small>
+                </label>
+              </div>
+            ) : (
+              <label className="li-check-row">
+                <input
+                  type="checkbox"
+                  checked={step.config.allowPaid}
+                  onChange={(event) =>
+                    onChange({
+                      ...step,
+                      config: { ...step.config, allowPaid: event.target.checked }
+                    })
+                  }
+                />{' '}
+                Permit paid InMail credits, subject to account + campaign caps
+              </label>
+            )}
+          </div>
+        )}
+
+        {step.action === 'find_email' && (
+          <div className="li-span-2 li-form-grid">
+            <label>
+              Email finder provider
+              <Select
+                value={step.config.providerId ?? 'environment'}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, providerId: event.target.value }
+                  })
+                }
+              >
+                <option value="hunter">Hunter — workspace key, found-only (70%+ confidence)</option>
+                <option value="environment">Legacy server-configured provider</option>
+              </Select>
+            </label>
+            <label className="li-check-row">
+              <input
+                type="checkbox"
+                checked={step.config.refresh}
+                onChange={(event) =>
+                  onChange({ ...step, config: { ...step.config, refresh: event.target.checked } })
+                }
+              />{' '}
+              Refresh even when a prior enrichment result exists
+            </label>
+          </div>
+        )}
+
+        {(step.action === 'add_tag' || step.action === 'remove_tag') && (
+          <label>
+            Tag
+            <input
+              value={step.config.tag}
+              onChange={(event) => onChange({ ...step, config: { tag: event.target.value } })}
+            />
+          </label>
+        )}
+
+        {step.action === 'manual_comment' && (
+          <div className="li-span-2 li-form-grid">
+            <label>
+              Target post URL (optional)
+              <input
+                value={step.config.postUrl ?? ''}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, postUrl: event.target.value || null }
+                  })
+                }
+              />
+            </label>
+            <label className="li-span-2">
+              Suggested comment
+              <textarea
+                ref={(element) => {
+                  fields.current.comment = element;
+                }}
+                rows={3}
+                value={step.config.suggestedTemplate ?? ''}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    config: { ...step.config, suggestedTemplate: event.target.value }
+                  })
+                }
+              />
+            </label>
+            <MergeRow
+              onInsert={(variable) =>
+                insert('comment', step.config.suggestedTemplate ?? '', `{{${variable}}}`, (next) =>
+                  onChange({ ...step, config: { ...step.config, suggestedTemplate: next } })
+                )
+              }
+            />
+          </div>
+        )}
+
+        {(step.action === 'profile_view' ||
+          step.action === 'follow' ||
+          step.action === 'like_post' ||
+          step.action === 'endorse_skills' ||
+          step.action === 'withdraw_pending' ||
+          step.action === 'end') && <p className="li-hint li-span-2">{meta.blurb}</p>}
+      </div>
+
+      {problems.length > 0 && (
+        <div className="li-wf-issues">
+          {problems.map((problem) => (
+            <small className="li-merge-warn" key={problem}>
+              {problem}
+            </small>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+/* ---------------------------------------------------------------------------
+ * A/B variants.
+ * ------------------------------------------------------------------------ */
+
+function VariantMediaFields({
+  variant,
+  onPatch
+}: {
+  variant: Variant;
+  onPatch: (changes: Partial<Variant>) => void;
+}) {
+  const mediaKind = variant.attachmentUrl ? (variant.mediaKind === 'gif' ? 'gif' : 'file') : 'none';
+  return (
+    <div className="li-form-grid li-wf-media-fields">
+      <label>
+        Attachment
+        <Select
+          value={mediaKind}
+          onChange={(event) => {
+            const next = event.target.value as 'none' | 'file' | 'gif';
+            if (next === 'none')
+              onPatch({ attachmentUrl: null, attachmentName: null, mediaKind: null });
+            else onPatch({ mediaKind: next });
+          }}
+        >
+          <option value="none">No attachment</option>
+          <option value="file">File / image</option>
+          <option value="gif">GIF</option>
+        </Select>
+      </label>
+      {mediaKind !== 'none' && (
+        <>
+          <label>
+            HTTPS file URL
+            <input
+              type="url"
+              value={variant.attachmentUrl ?? ''}
+              placeholder="https://…/deck.pdf"
+              onChange={(event) => onPatch({ attachmentUrl: event.target.value, mediaKind })}
+            />
+          </label>
+          <label>
+            File name (optional)
+            <input
+              value={variant.attachmentName ?? ''}
+              placeholder={mediaKind === 'gif' ? 'demo.gif' : 'deck.pdf'}
+              onChange={(event) => onPatch({ attachmentName: event.target.value || null })}
+            />
+          </label>
+          <p className="li-hint li-span-2">
+            Trevra downloads at execution time (HTTPS, max 10 MB), uploads into LinkedIn, and sends
+            only after the composer shows an attachment preview. A failed upload leaves the text
+            unsent.
+          </p>
+          {variant.attachmentUrl && (
+            <p className="li-wf-preview li-span-2">
+              <span className="li-wf-preview-label">Attachment preview</span>
+              <a href={variant.attachmentUrl} target="_blank" rel="noreferrer noopener">
+                {variant.attachmentName || variant.attachmentUrl}
+              </a>
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function CompactVariants({
+  variants,
+  bodyMax,
+  emptyLabel,
+  bind,
+  insert,
+  onChange
+}: {
+  variants: Variant[];
+  bodyMax: number;
+  emptyLabel?: string;
+  bind: (key: string, element: HTMLTextAreaElement | null) => void;
+  insert: (key: string, value: string, token: string, commit: (next: string) => void) => void;
+  onChange: (variants: Variant[]) => void;
+}) {
+  const patch = (at: number, changes: Partial<Variant>) =>
+    onChange(
+      variants.map((variant, index) => (index === at ? { ...variant, ...changes } : variant))
+    );
+  const setRenormalised = (next: Variant[]) => {
+    const weights = renormaliseWeights(next.map((variant) => variant.weight));
+    onChange(next.map((variant, index) => ({ ...variant, weight: weights[index] })));
+  };
+  const minted = nextVariantId(variants.map((variant) => variant.id));
+  const total = variants.reduce((sum, variant) => sum + Math.max(1, variant.weight), 0);
+
+  return (
+    <div className="li-wf-variants">
+      {variants.map((variant, at) => {
+        const key = `compact-variant-${variant.id}`;
+        const pct = total > 0 ? Math.round((Math.max(1, variant.weight) / total) * 100) : 0;
+        return (
+          <div className="li-wf-variant" key={variant.id}>
+            <div className="li-wf-variant-head">
+              <span className="li-chip">Variant {variant.id.toUpperCase()}</span>
+              <label className="li-wf-weight">
+                Weight
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={variant.weight}
+                  aria-label={`Weight for variant ${variant.id.toUpperCase()}`}
+                  onChange={(event) =>
+                    patch(at, {
+                      weight: Math.min(
+                        100,
+                        Math.max(1, Math.trunc(Number(event.target.value) || 1))
+                      )
+                    })
+                  }
+                />
+              </label>
+              <span className="li-wf-share">
+                {variant.body.trim() ? `${pct}% of leads` : (emptyLabel ?? 'Copy required')}
+              </span>
+              {variants.length > 1 && (
+                <button
+                  className="li-mini-button li-mini-danger"
+                  type="button"
+                  onClick={() => setRenormalised(variants.filter((_, index) => index !== at))}
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            <textarea
+              ref={(element) => bind(key, element)}
+              rows={3}
+              value={variant.body}
+              aria-label={`Copy for variant ${variant.id.toUpperCase()}`}
+              onChange={(event) => patch(at, { body: event.target.value })}
+              placeholder="Hi {{first_name}}…"
+            />
+            <MergeRow
+              onInsert={(name) =>
+                insert(key, variant.body, `{{${name}}}`, (next) => patch(at, { body: next }))
+              }
+              trailing={<CharCount length={variant.body.length} max={bodyMax} />}
+            />
+            <TemplatePreview value={variant.body} />
+            <VariantMediaFields variant={variant} onPatch={(changes) => patch(at, changes)} />
+          </div>
+        );
+      })}
+      {minted && (
+        <button
+          className="li-mini-button"
+          type="button"
+          onClick={() => {
+            const mean = Math.max(
+              1,
+              Math.round(
+                variants.reduce((sum, variant) => sum + Math.max(1, variant.weight), 0) /
+                  Math.max(1, variants.length)
+              )
+            );
+            setRenormalised([...variants, { id: minted, body: '', weight: mean }]);
+          }}
+        >
+          <Plus size={12} /> Add variant {minted.toUpperCase()}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function MessageVariants({
+  step,
+  bind,
+  insert,
+  onChange
+}: {
+  step: MessageStep;
+  bind: (key: string, element: HTMLTextAreaElement | null) => void;
+  insert: (key: string, value: string, token: string, commit: (next: string) => void) => void;
+  onChange: (next: WorkflowStep) => void;
+}) {
+  const variants = step.config.variants;
+  const written = variants.filter((variant) => variant.body.trim().length > 0);
+  const total = written.reduce((sum, variant) => sum + Math.max(1, variant.weight), 0);
+
+  // `...step.config` matters: dropping it silently reset `requiresAcceptedConnection`
+  // to false (the option this step doesn't render its own control for the
+  // opposite of) on every keystroke in a variant body, every weight tweak, and
+  // every add/remove -- so choosing "only if accepted" and then editing the
+  // copy quietly threw the condition away.
+  const setVariants = (next: Variant[]) =>
+    onChange({ ...step, config: { ...step.config, variants: next } });
+  const patch = (at: number, changes: Partial<Variant>) =>
+    setVariants(
+      variants.map((variant, index) => (index === at ? { ...variant, ...changes } : variant))
+    );
+  const share = (variant: Variant) => {
+    if (variant.body.trim().length === 0 || total === 0) return null;
+    return Math.round((Math.max(1, variant.weight) / total) * 100);
+  };
+
+  /** Re-spread the weights over whatever arms are left, so the card's split is the one that runs. */
+  const setRenormalised = (next: Variant[]) => {
+    const weights = renormaliseWeights(next.map((variant) => variant.weight));
+    setVariants(next.map((variant, index) => ({ ...variant, weight: weights[index] })));
+  };
+
+  const minted = nextVariantId(variants.map((variant) => variant.id));
+  const addVariant = () => {
+    if (!minted) return;
+    // The new arm starts on the MEAN of the existing ones, so a 70/30 split
+    // stays a 70/30 split with a third arm beside it rather than being flattened
+    // to thirds -- the operator's intent is a ratio, not the two numbers.
+    const mean = Math.max(
+      1,
+      Math.round(
+        variants.reduce((sum, variant) => sum + Math.max(1, variant.weight), 0) /
+          Math.max(1, variants.length)
+      )
+    );
+    setRenormalised([...variants, { id: minted, body: '', weight: mean }]);
+  };
+
+  return (
+    <div className="li-span-2 li-wf-variants">
+      {variants.map((variant, at) => {
+        const key = `variant-${variant.id}`;
+        const pct = share(variant);
+        return (
+          <div className="li-wf-variant" key={variant.id}>
+            <div className="li-wf-variant-head">
+              <span className="li-chip">Variant {variant.id.toUpperCase()}</span>
+              <label className="li-wf-weight">
+                Weight
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={variant.weight}
+                  aria-label={`Weight for variant ${variant.id.toUpperCase()}`}
+                  onChange={(event) =>
+                    patch(at, {
+                      weight: Math.min(
+                        100,
+                        Math.max(1, Math.trunc(Number(event.target.value) || 1))
+                      )
+                    })
+                  }
+                />
+              </label>
+              <span className="li-wf-share">
+                {pct === null ? 'no copy — dropped on save' : `${pct}% of leads`}
+              </span>
+              {variants.length > 1 && (
+                <button
+                  className="li-mini-button li-mini-danger"
+                  type="button"
+                  aria-label={`Remove variant ${variant.id.toUpperCase()}`}
+                  onClick={() => setRenormalised(variants.filter((_, index) => index !== at))}
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            <textarea
+              ref={(element) => bind(key, element)}
+              rows={4}
+              value={variant.body}
+              aria-label={`Copy for variant ${variant.id.toUpperCase()}`}
+              onChange={(event) => patch(at, { body: event.target.value })}
+              placeholder="Hi {{first_name}}, noticed {{company}}…"
+            />
+            <MergeRow
+              onInsert={(name) =>
+                insert(key, variant.body, `{{${name}}}`, (next) => patch(at, { body: next }))
+              }
+              trailing={<CharCount length={variant.body.length} max={BODY_MAX} />}
+            />
+            <TemplatePreview value={variant.body} />
+            <VariantMediaFields variant={variant} onPatch={(changes) => patch(at, changes)} />
+          </div>
+        );
+      })}
+
+      <div className="li-wf-split">
+        <span className="li-wf-split-bar">
+          {written.map((variant) => (
+            <span
+              className={`li-wf-split-fill li-wf-split-${variant.id.toLowerCase()}`}
+              key={variant.id}
+              style={{
+                width: `${Math.round((Math.max(1, variant.weight) / total) * 100)}%`,
+                background: VARIANT_FILL[variant.id.toLowerCase()]
+              }}
+            />
+          ))}
+        </span>
+        <span className="li-hint">
+          {written.length === 0
+            ? 'No version has copy yet.'
+            : written.length === 1
+              ? `Every lead gets variant ${written[0].id.toUpperCase()}.`
+              : written
+                  .map(
+                    (variant) =>
+                      `${variant.id.toUpperCase()} ${Math.round((Math.max(1, variant.weight) / total) * 100)}%`
+                  )
+                  .join(' · ')}
+        </span>
+      </div>
+
+      {minted ? (
+        <div className="li-wf-split">
+          <button className="li-mini-button" type="button" onClick={addVariant}>
+            <Plus size={12} /> Add variant {minted.toUpperCase()}
+          </button>
+          <span className="li-hint">
+            Up to {VARIANT_MAX} versions per step. Each one needs about 20 messages of its own
+            before the results panel will name a winner, so a four-way test takes roughly four times
+            as long to read as a two-way one.
+          </span>
+        </div>
+      ) : (
+        <span className="li-hint">
+          {VARIANT_MAX} versions is the most one step can test. Remove one to try different wording.
+        </span>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------------
+ * Small shared parts.
+ * ------------------------------------------------------------------------ */
+
+/** The three variables the server accepts, as buttons, because they are a closed set. */
+function MergeRow({
+  onInsert,
+  trailing
+}: {
+  onInsert: (variable: string) => void;
+  trailing?: ReactNode;
+}) {
+  const [custom, setCustom] = useState('');
+  const customKey = custom
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, '_')
+    .replace(/^[_\.-]+|[_\.-]+$/g, '');
+  return (
+    <div className="li-merge-row">
+      {MANAGER_VARIABLES.map((variable) => (
+        <button
+          className="li-merge-button"
+          type="button"
+          key={variable}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onInsert(variable)}
+        >{`{{${variable}}}`}</button>
+      ))}
+      <span className="li-merge-custom">
+        <input
+          value={custom}
+          aria-label="Custom CSV field name"
+          placeholder="custom field"
+          onChange={(event) => setCustom(event.target.value)}
+        />
+        <button
+          className="li-merge-button"
+          type="button"
+          disabled={!customKey || !/^[a-z]/.test(customKey)}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            if (!customKey || !/^[a-z]/.test(customKey)) return;
+            onInsert(`custom.${customKey}`);
+            setCustom('');
+          }}
+        >
+          + custom
+        </button>
+      </span>
+      {trailing}
+    </div>
+  );
+}
+
+function CharCount({ length, max }: { length: number; max: number }) {
+  return (
+    <span className={`li-count${length > max ? ' is-over' : ''}`}>
+      {length}/{max}
+    </span>
+  );
+}
+
+/** What one lead would actually read. Silent until something is written. */
+function TemplatePreview({ value }: { value: string }) {
+  if (!value.trim()) return null;
+  return (
+    <div className="li-wf-preview">
+      <span className="li-wf-preview-label">
+        Preview · {SAMPLE_LEAD.first_name} {SAMPLE_LEAD.last_name}, {SAMPLE_LEAD.company}
+      </span>
+      <p className="li-template">{renderSample(value)}</p>
+    </div>
+  );
+}

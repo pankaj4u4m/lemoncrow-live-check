@@ -1,0 +1,27 @@
+project_id    = "your-gcp-project"
+region        = "europe-west6"
+image         = "europe-west6-docker.pkg.dev/your-gcp-project/trevra/trevra:latest"
+app_origin    = "https://app.example.com"
+better_auth_url = "https://app.example.com"
+authward_issuer    = "https://auth.olaryn.com"
+authward_client_id = "trevra-web"
+# Billing stays disabled while billing_client_secret is empty. URL/client/audience
+# defaults already point at the hosted Olaryn Billing contract.
+billing_client_secret = ""
+nango_host             = "https://nango-api.example.com"
+legal_name       = "Trevra"
+support_email    = "support@example.com"
+alert_email      = "founder@example.com"
+security_contact_email = "security@example.com"
+google_site_verification = ""
+bing_site_verification   = ""
+
+# Prefer TF_VAR_* environment variables instead of storing sensitive provider secrets here.
+smtp_server               = "smtp.example.com"
+smtp_port                 = 587
+smtp_username              = "replace-me"
+smtp_password              = "replace-me"
+email_from                 = "alerts@example.com"
+email_from_name            = "Trevra"
+nango_api_key             = "replace-me"}]}
+nango_webhook_signing_key = "replace-me"

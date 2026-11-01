@@ -1,0 +1,349 @@
+import { randomUUID } from 'node:crypto';
+import { COMPANION_RELEASE_VERSION } from './companion-release.js';
+import type { IncomingMessage, Server } from 'node:http';
+import type { Duplex } from 'node:stream';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import type { Db } from '../db.js';
+import {
+  authenticateCompanionToken,
+  companionDeviceIsActive,
+  companionRelaySecretMatches,
+  companionWorkspaceReady,
+  touchCompanionDevice
+} from './companion.js';
+
+interface ControlConnection {
+  ws: WebSocket;
+  deviceId: string;
+  workspaceId: string;
+  label: string;
+  connectionId: string;
+  connectedAt: number;
+  lastDbTouch: number;
+}
+
+interface RelaySession {
+  id: string;
+  workspaceId: string;
+  seatKey: string;
+  browser: WebSocket;
+  control: ControlConnection;
+  ready: boolean;
+  pending: Array<{ data: string; binary: boolean }>;
+  pendingBytes: number;
+}
+
+const MAX_PENDING_BYTES = 2 * 1024 * 1024;
+
+/**
+ * How often every relay socket -- control AND browser -- must put a frame on
+ * the wire.
+ *
+ * WHY BOTH, AND WHY THIS NUMBER. A CDP tunnel is idle for the WHOLE of the
+ * inter-action gap: `local-worker.ts` sleeps `ACTION_GAP_SECONDS.max` (120s)
+ * between actions, and a loaded LinkedIn profile emits no CDP events while it
+ * sits there. Every hop in the path therefore sees a socket carrying zero
+ * bytes for two minutes, and every idle timeout between here and the member's
+ * laptop -- Cloudflare's ~100s origin timeout on the control hop, any NAT or
+ * conntrack entry on the worker hop -- is free to reclaim it. That is exactly
+ * what a five-action batch that only ever completes ONE action looks like from
+ * the outside: action 1 succeeds, the gap starts, the tunnel dies unobserved,
+ * and action 2 fails on a page whose browser is gone.
+ *
+ * 30s is comfortably under every timeout in that list and cheap: a ping frame
+ * is 2 bytes of payload, so four of them per action gap costs nothing next to
+ * one CDP message.
+ */
+const HEARTBEAT_MS = 30_000;
+
+/**
+ * Keep one socket provably alive, and terminate it the moment it is not.
+ *
+ * A PROTOCOL PING, NOT AN APPLICATION MESSAGE, because the peer's WebSocket
+ * library answers it without the peer's application code existing: the worker
+ * side of a browser relay is Playwright's own CDP transport, which has no
+ * Trevra code in it at all and would ignore anything we invented. `ws` replies
+ * to a ping automatically on both ends, so this works against Playwright and
+ * against the companion CLI without either having to opt in.
+ *
+ * ONE MISSED BEAT TERMINATES. A half-open socket -- one whose peer is gone but
+ * whose FIN never arrived -- otherwise stays `OPEN` forever, and a relay that
+ * looks open while nothing is on the other end is worse than a closed one: the
+ * worker keeps issuing CDP commands into it and only finds out at the next
+ * navigation, minutes later, by which time the batch has already been counted.
+ */
+function heartbeat(ws: WebSocket, intervalMs: number): NodeJS.Timeout {
+  let alive = true;
+  ws.on('pong', () => {
+    alive = true;
+  });
+  const timer = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!alive) {
+      ws.terminate();
+      return;
+    }
+    alive = false;
+    try {
+      ws.ping();
+    } catch {
+      ws.terminate();
+    }
+  }, intervalMs);
+  timer.unref();
+  return timer;
+}
+
+function bearer(request: IncomingMessage): string {
+  return (
+    String(request.headers.authorization ?? '')
+      .match(/^Bearer\s+(.+)$/i)?.[1]
+      ?.trim() ?? ''
+  );
+}
+
+function reject(socket: Duplex, status: number, message: string): void {
+  if (socket.destroyed) return;
+  socket.write(
+    `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`
+  );
+  socket.destroy();
+}
+
+function text(data: RawData): string {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
+  return Buffer.from(data).toString('utf8');
+}
+
+function sendJson(ws: WebSocket, value: unknown): void {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value));
+}
+
+/** Reverse-CDP bridge between the hosted worker and one paired member computer. */
+export function installLinkedInCompanionRelay(
+  server: Server,
+  db: Db,
+  /**
+   * The heartbeat period, injected only so a test can assert that a keepalive
+   * is genuinely emitted without sitting through 30 real seconds. Production
+   * never passes it.
+   */
+  options: { heartbeatMs?: number } = {}
+): void {
+  const heartbeatMs = Math.max(1, Math.trunc(options.heartbeatMs ?? HEARTBEAT_MS));
+  const controlServer = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  const browserServer = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
+  const controls = new Map<string, ControlConnection>();
+  const sessions = new Map<string, RelaySession>();
+
+  const forgetSession = (session: RelaySession, notifyControl = true): void => {
+    if (!sessions.delete(session.id)) return;
+    if (notifyControl) sendJson(session.control.ws, { type: 'close', relayId: session.id });
+    if (
+      session.browser.readyState === WebSocket.OPEN ||
+      session.browser.readyState === WebSocket.CONNECTING
+    ) {
+      session.browser.close(1000, 'Companion relay closed');
+    }
+  };
+
+  const setupControl = (
+    ws: WebSocket,
+    identity: { deviceId: string; workspaceId: string; label: string }
+  ): void => {
+    const connection: ControlConnection = {
+      ws,
+      ...identity,
+      connectionId: randomUUID(),
+      connectedAt: Date.now(),
+      lastDbTouch: Date.now()
+    };
+    // Application pings update the DB lease, but are not a transport liveness
+    // check. A protocol ping/pong catches half-open sockets; the ws client
+    // answers these automatically. One missed heartbeat terminates the control.
+    const controlHeartbeat = heartbeat(ws, heartbeatMs);
+
+    // Only one live control connection may own a workspace. A replacement or
+    // restarted companion wins immediately and detaches every browser session
+    // owned by the previous socket before becoming selectable by the worker.
+    const prior = controls.get(identity.workspaceId);
+    if (prior) {
+      for (const session of [...sessions.values()]) {
+        if (session.control === prior) forgetSession(session, false);
+      }
+      if (prior.ws.readyState === WebSocket.OPEN || prior.ws.readyState === WebSocket.CONNECTING) {
+        prior.ws.close(4001, 'Another companion connected');
+      }
+    }
+    controls.set(identity.workspaceId, connection);
+    sendJson(ws, {
+      type: 'hello',
+      workspaceId: identity.workspaceId,
+      deviceId: identity.deviceId,
+      label: identity.label,
+      companionVersion: COMPANION_RELEASE_VERSION
+    });
+
+    ws.on('message', (raw: RawData) => {
+      let message: {
+        type?: string;
+        relayId?: string;
+        data?: string;
+        binary?: boolean;
+        message?: string;
+      };
+      try {
+        message = JSON.parse(text(raw)) as typeof message;
+      } catch {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - connection.lastDbTouch > 30_000) {
+        connection.lastDbTouch = now;
+        void touchCompanionDevice(db, connection.deviceId, new Date(now)).catch(() => undefined);
+      }
+      if (message.type === 'ping') {
+        sendJson(ws, { type: 'pong', at: new Date().toISOString() });
+        return;
+      }
+      if (!message.relayId) return;
+      const session = sessions.get(message.relayId);
+      if (!session || session.control !== connection) return;
+
+      if (message.type === 'ready') {
+        session.ready = true;
+        for (const item of session.pending)
+          sendJson(ws, { type: 'cdp', relayId: session.id, data: item.data, binary: item.binary });
+        session.pending = [];
+        session.pendingBytes = 0;
+        return;
+      }
+      if (message.type === 'cdp' && typeof message.data === 'string') {
+        if (session.browser.readyState !== WebSocket.OPEN) return;
+        if (message.binary) session.browser.send(Buffer.from(message.data, 'base64'));
+        else session.browser.send(message.data);
+        return;
+      }
+      if (message.type === 'error') {
+        if (session.browser.readyState === WebSocket.OPEN)
+          session.browser.close(
+            1011,
+            (message.message ?? 'Companion browser failed').slice(0, 120)
+          );
+        forgetSession(session, false);
+      }
+    });
+
+    ws.on('close', () => {
+      clearInterval(controlHeartbeat);
+      if (controls.get(connection.workspaceId) === connection)
+        controls.delete(connection.workspaceId);
+      for (const session of [...sessions.values()]) {
+        if (session.control === connection) forgetSession(session, false);
+      }
+    });
+  };
+
+  const setupBrowser = (
+    browser: WebSocket,
+    meta: { workspaceId: string; seatKey: string; control: ControlConnection }
+  ): void => {
+    const session: RelaySession = {
+      id: randomUUID(),
+      workspaceId: meta.workspaceId,
+      seatKey: meta.seatKey,
+      browser,
+      control: meta.control,
+      ready: false,
+      pending: [],
+      pendingBytes: 0
+    };
+    sessions.set(session.id, session);
+    // THE HOP THAT HAD NOTHING. The control socket has carried a heartbeat
+    // since it was written; this one -- the CDP tunnel itself, the socket a
+    // whole batch's browser work rides on -- carried no liveness traffic at
+    // all, so it was the one socket in the path that an idle timeout could
+    // reclaim without either end noticing until the next navigation.
+    const browserHeartbeat = heartbeat(browser, heartbeatMs);
+    sendJson(meta.control.ws, {
+      type: 'open',
+      relayId: session.id,
+      workspaceId: meta.workspaceId,
+      seatKey: meta.seatKey
+    });
+
+    browser.on('message', (raw: RawData, binary: boolean) => {
+      const payload = binary ? Buffer.from(raw as Buffer).toString('base64') : text(raw);
+      if (!session.ready) {
+        session.pendingBytes += Buffer.byteLength(payload);
+        if (session.pendingBytes > MAX_PENDING_BYTES) {
+          browser.close(1013, 'Companion browser did not become ready');
+          forgetSession(session);
+          return;
+        }
+        session.pending.push({ data: payload, binary });
+        return;
+      }
+      sendJson(session.control.ws, { type: 'cdp', relayId: session.id, data: payload, binary });
+    });
+    browser.on('close', () => {
+      clearInterval(browserHeartbeat);
+      forgetSession(session);
+    });
+    browser.on('error', () => {
+      clearInterval(browserHeartbeat);
+      forgetSession(session);
+    });
+  };
+
+  server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+    void (async () => {
+      let url: URL;
+      try {
+        url = new URL(request.url ?? '/', 'http://localhost');
+      } catch {
+        return reject(socket, 400, 'Bad Request');
+      }
+
+      if (url.pathname === '/api/linkedin/companion/socket') {
+        // The one call site. `authenticateCompanionToken` marks an
+        // availability-return catch-up on every successful call, unconditionally
+        // -- correct exactly because this handler is the only place it is ever
+        // called from: once per fresh control connection, never on a routine
+        // keepalive (those touch `last_seen_at` directly below, in `setupControl`'s
+        // message handler).
+        const token = bearer(request);
+        const identity = token ? await authenticateCompanionToken(db, token) : null;
+        if (!identity) return reject(socket, 401, 'Unauthorized');
+        controlServer.handleUpgrade(request, socket, head, (ws: WebSocket) =>
+          setupControl(ws, identity)
+        );
+        return;
+      }
+
+      const match = url.pathname.match(/^\/api\/linkedin\/companion\/browser\/([^/]+)\/([^/]+)$/);
+      if (!match) return reject(socket, 404, 'Not Found');
+      const workspaceId = decodeURIComponent(match[1]);
+      const seatKey = decodeURIComponent(match[2]);
+      if (!companionRelaySecretMatches(bearer(request))) return reject(socket, 401, 'Unauthorized');
+      if (!(await companionWorkspaceReady(db, workspaceId)))
+        return reject(socket, 503, 'Companion unavailable');
+
+      const candidate = controls.get(workspaceId);
+      if (
+        !candidate ||
+        candidate.ws.readyState !== WebSocket.OPEN ||
+        !(await companionDeviceIsActive(db, candidate.deviceId))
+      ) {
+        return reject(socket, 503, 'Companion unavailable');
+      }
+
+      browserServer.handleUpgrade(request, socket, head, (ws: WebSocket) =>
+        setupBrowser(ws, { workspaceId, seatKey, control: candidate })
+      );
+    })().catch(() => reject(socket, 500, 'Relay error'));
+  });
+}

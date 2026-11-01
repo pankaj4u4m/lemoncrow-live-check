@@ -1,0 +1,834 @@
+import { z } from 'zod/v3';
+import { zodToJsonSchema } from 'zod-to-json-schema';
+import type { Db } from '../db.js';
+import { OUTREACH_UNSUBSCRIBE_MODES } from '../email/unsubscribe-policy.js';
+import { outreachThreadSchema } from '../outreach/scorer.js';
+import type { PlaybookDefinition } from './types.js';
+
+// GTM-only registry: post-sale revenue/project playbooks and financial action flows are intentionally absent.
+const playbooks = new Map<string, PlaybookDefinition>();
+
+export const auditLedOutreachPlaybook: PlaybookDefinition = {
+  id: 'gtm.audit-led-outreach',
+  version: '1.0.0',
+  name: 'Audit-led outreach',
+  description:
+    'Score a lead, audit its AI visibility, prepare evidence-backed outreach, and stop for founder approval.',
+  inputSchema: z.object({
+    lead: z.object({
+      domain: z.string().min(1),
+      name: z.string().nullish(),
+      contactName: z.string().nullish(),
+      contactEmail: z.string().email(),
+      platform: z.string().nullish(),
+      vertical: z.string().nullish(),
+      catalogSize: z.number().nonnegative().nullish()
+    }),
+    draftConfig: z
+      .object({
+        offer: z.string(),
+        senderName: z.string(),
+        postalAddress: z.string(),
+        voiceSample: z.string().nullish()
+      })
+      .optional()
+  }),
+  steps: [
+    {
+      id: 'score',
+      type: 'skill',
+      skillId: 'gtm.score-lead',
+      input: {
+        lead: {
+          platform: { $ref: '$.input.lead.platform' },
+          vertical: { $ref: '$.input.lead.vertical' },
+          catalogSize: { $ref: '$.input.lead.catalogSize' },
+          contactEmail: { $ref: '$.input.lead.contactEmail' }
+        }
+      }
+    },
+    {
+      id: 'audit',
+      type: 'skill',
+      skillId: 'gtm.visibility-audit',
+      input: { domain: { $ref: '$.input.lead.domain' } },
+      retry: { maxAttempts: 2, delaySeconds: 5 }
+    },
+    {
+      id: 'draft',
+      type: 'skill',
+      skillId: 'gtm.outreach-draft',
+      needs: ['score', 'audit'],
+      input: {
+        lead: {
+          domain: { $ref: '$.input.lead.domain' },
+          name: { $ref: '$.input.lead.name' },
+          contactName: { $ref: '$.input.lead.contactName' },
+          contactEmail: { $ref: '$.input.lead.contactEmail' },
+          topFinding: { $ref: '$.steps.audit.output.topFinding' },
+          findingDetail: { $ref: '$.steps.audit.output.evidence.0.detail' }
+        },
+        config: { $ref: '$.input.draftConfig' }
+      }
+    },
+    {
+      id: 'approve-outreach',
+      type: 'approval',
+      title: 'Approve outreach draft',
+      needs: ['draft'],
+      payload: {
+        recipient: { $ref: '$.steps.draft.output.toEmail' },
+        subject: { $ref: '$.steps.draft.output.subject' },
+        body: { $ref: '$.steps.draft.output.bodyText' },
+        metadata: {
+          leadScore: { $ref: '$.steps.score.output.overall' },
+          auditScore: { $ref: '$.steps.audit.output.score' },
+          evidence: { $ref: '$.steps.audit.output.evidence' },
+          deliveryPurpose: 'outreach'
+        }
+      }
+    },
+    {
+      id: 'send-outreach',
+      type: 'action',
+      actionType: 'email.send',
+      approvalStepId: 'approve-outreach',
+      needs: ['approve-outreach'],
+      payload: { $ref: '$.steps.approve-outreach.input' },
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-outreach.output.approved' },
+    delivery: { $ref: '$.steps.send-outreach.output' },
+    draft: { $ref: '$.steps.draft.output' },
+    score: { $ref: '$.steps.score.output' },
+    audit: { $ref: '$.steps.audit.output' }
+  },
+  source: { type: 'builtin' },
+  // Its send carries outreach approval metadata, and only a prepared run has
+  // been through the outreach plan's footer, DNC and suppression checks.
+  preparedOnly: true
+};
+
+/**
+ * Community outreach, end to end.
+ *
+ * was never flipped, so "nothing posts without a human" was a config value one
+ * edit away from false. Here it is structural: the post is an `action` step
+ * bound to `approve-reply`, and the engine refuses to execute it unless a
+ * completed approval exists whose payload hash equals the hash of the exact
+ * payload about to be sent.
+ *
+ * The playbook handles ONE thread per run -- the top-ranked one. The engine's
+ * steps are a linear DAG with no fan-out, and one approval per reply is the
+ * correct granularity anyway: a founder approves a specific comment on a
+ * specific thread, not a batch.
+ *
+ * `guard` runs BEFORE `draft` so a blocked thread never spends a drafting
+ * cycle, and its verdict is carried into the approval payload -- the founder
+ * sees the daily-cap, cooldown, and account-standing findings next to the copy
+ * they are being asked to approve.
+ *
+ * A run that discovers NOTHING fails at `guard` with a `thread: Required`
+ * validation error, because `$.steps.score.output.repliable.0.thread` resolves to
+ * nothing and the engine's steps are an unconditional DAG. That is a failed
+ * run rather than a silent success, which is the safer of the two available
+ * answers; giving it a nicer one means a conditional step type, which is a
+ * change to the engine and not to this port.
+ */
+export const communityOutreachPlaybook: PlaybookDefinition = {
+  id: 'gtm.community-outreach',
+  version: '1.0.0',
+  name: 'Community outreach reply',
+  description:
+    'Find the best community thread discussing coding-agent cost, gate it against posting limits, draft a reply, and stop for founder approval before posting.',
+  inputSchema: z.object({
+    platforms: z.array(z.string().min(1)).max(20).optional(),
+    queries: z.array(z.string().min(1)).max(50).optional(),
+    limitPerPlatform: z.number().int().positive().max(100).default(25),
+    minScore: z.number().min(0).max(10).default(5),
+    product: z.object({
+      name: z.string().min(1).max(80),
+      url: z.string().url(),
+      summary: z.string().min(1).max(300),
+      mechanism: z.string().min(1).max(300),
+      claims: z
+        .array(z.object({ label: z.string().min(1).max(80), value: z.string().min(1).max(80) }))
+        .max(8)
+        .default([])
+    }),
+    /** Overrides OUTREACH_ACCOUNT_PROFILES_JSON for this run. */
+    account: z.object({ accountAgeDays: z.number().min(0), karma: z.number().min(0) }).nullish()
+  }),
+  steps: [
+    {
+      id: 'scout',
+      type: 'skill',
+      skillId: 'gtm.scout-threads',
+      input: {
+        platforms: { $ref: '$.input.platforms' },
+        queries: { $ref: '$.input.queries' },
+        limitPerPlatform: { $ref: '$.input.limitPerPlatform' }
+      },
+      retry: { maxAttempts: 2, delaySeconds: 15 }
+    },
+    {
+      id: 'score',
+      type: 'skill',
+      skillId: 'gtm.score-threads',
+      needs: ['scout'],
+      input: {
+        threads: { $ref: '$.steps.scout.output.threads' },
+        minScore: { $ref: '$.input.minScore' }
+      }
+    },
+    {
+      id: 'guard',
+      type: 'skill',
+      skillId: 'gtm.outreach-guard',
+      needs: ['score'],
+      input: {
+        thread: { $ref: '$.steps.score.output.repliable.0.thread' },
+        account: { $ref: '$.input.account' },
+        // The stop signal. Without it the verdict is advisory and a blocked
+        // thread still reaches a founder for approval.
+        requireAllowed: true
+      }
+    },
+    {
+      id: 'draft',
+      type: 'skill',
+      skillId: 'gtm.draft-reply',
+      needs: ['score', 'guard'],
+      input: {
+        thread: { $ref: '$.steps.score.output.repliable.0.thread' },
+        product: { $ref: '$.input.product' },
+        angle: { $ref: '$.steps.score.output.repliable.0.angle' }
+      }
+    },
+    {
+      id: 'approve-reply',
+      type: 'approval',
+      title: 'Approve community reply',
+      needs: ['draft', 'guard'],
+      payload: {
+        platform: { $ref: '$.steps.score.output.repliable.0.thread.platform' },
+        threadExternalId: { $ref: '$.steps.score.output.repliable.0.thread.externalId' },
+        threadUrl: { $ref: '$.steps.score.output.repliable.0.thread.url' },
+        community: { $ref: '$.steps.score.output.repliable.0.thread.community' },
+        body: { $ref: '$.steps.draft.output.body' },
+        metadata: {
+          threadTitle: { $ref: '$.steps.score.output.repliable.0.thread.title' },
+          // Carried so the CRM write-back can try to match the thread's author
+          // to a known contact. Part of the approved payload, so what gets
+          // attributed is visible to whoever approves it.
+          threadAuthor: { $ref: '$.steps.score.output.repliable.0.thread.author' },
+          relevanceScore: { $ref: '$.steps.score.output.repliable.0.score' },
+          angle: { $ref: '$.steps.draft.output.angle' },
+          safetyAllowed: { $ref: '$.steps.guard.output.allowed' },
+          safetyReason: { $ref: '$.steps.guard.output.reason' },
+          safetyChecks: { $ref: '$.steps.guard.output.checks' },
+          critiquePassed: { $ref: '$.steps.draft.output.critique.passed' },
+          critiqueFindings: { $ref: '$.steps.draft.output.critique.findings' },
+          automationMode: { $ref: '$.steps.draft.output.automationMode' },
+          submitUrl: { $ref: '$.steps.draft.output.submitUrl' }
+        }
+      }
+    },
+    {
+      id: 'post-reply',
+      type: 'action',
+      actionType: 'community.reply',
+      approvalStepId: 'approve-reply',
+      needs: ['approve-reply'],
+      payload: { $ref: '$.steps.approve-reply.input' },
+      retry: { maxAttempts: 3, delaySeconds: 30 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-reply.output.approved' },
+    delivery: { $ref: '$.steps.post-reply.output' },
+    draft: { $ref: '$.steps.draft.output' },
+    safety: { $ref: '$.steps.guard.output' },
+    thread: { $ref: '$.steps.score.output.repliable.0.thread' }
+  },
+  source: { type: 'builtin' }
+};
+
+/**
+ * One thread, chosen by a human, drafted for approval.
+ *
+ * The community playbook scouts and then drafts against `repliable.0` -- the
+ * best thread in a fresh batch, which is the right answer for a scheduled run
+ * and the wrong one for a founder who just picked a row in /research. Same
+ * gate, same approval payload, no scout and no score: the thread arrives whole
+ * from the caller, and its relevance was already computed on the read path.
+ */
+export const threadReplyPlaybook: PlaybookDefinition = {
+  id: 'gtm.thread-reply',
+  version: '1.0.0',
+  name: 'Reply to one discovered thread',
+  description:
+    'Gate one chosen community thread against posting limits, draft a reply to it, and stop for founder approval before posting.',
+  inputSchema: z.object({
+    thread: outreachThreadSchema,
+    angle: z
+      .enum(['technical_deepdive', 'cost_comparison', 'alternative_suggestion', 'minimal_mention'])
+      .optional(),
+    relevanceScore: z.number().min(0).max(10).optional(),
+    product: z.object({
+      name: z.string().min(1).max(80),
+      url: z.string().url(),
+      summary: z.string().min(1).max(300),
+      mechanism: z.string().min(1).max(300),
+      claims: z
+        .array(z.object({ label: z.string().min(1).max(80), value: z.string().min(1).max(80) }))
+        .max(8)
+        .default([])
+    }),
+    account: z.object({ accountAgeDays: z.number().min(0), karma: z.number().min(0) }).nullish()
+  }),
+  steps: [
+    {
+      id: 'guard',
+      type: 'skill',
+      skillId: 'gtm.outreach-guard',
+      input: {
+        thread: { $ref: '$.input.thread' },
+        account: { $ref: '$.input.account' },
+        // The stop signal. Without it the verdict is advisory and a blocked
+        // thread still reaches a founder for approval.
+        requireAllowed: true
+      }
+    },
+    {
+      id: 'draft',
+      type: 'skill',
+      skillId: 'gtm.draft-reply',
+      needs: ['guard'],
+      input: {
+        thread: { $ref: '$.input.thread' },
+        product: { $ref: '$.input.product' },
+        angle: { $ref: '$.input.angle' }
+      }
+    },
+    {
+      id: 'approve-reply',
+      type: 'approval',
+      title: 'Approve community reply',
+      needs: ['draft', 'guard'],
+      payload: {
+        platform: { $ref: '$.input.thread.platform' },
+        threadExternalId: { $ref: '$.input.thread.externalId' },
+        threadUrl: { $ref: '$.input.thread.url' },
+        community: { $ref: '$.input.thread.community' },
+        body: { $ref: '$.steps.draft.output.body' },
+        metadata: {
+          threadTitle: { $ref: '$.input.thread.title' },
+          // Carried so the CRM write-back can try to match the thread's author
+          // to a known contact. Part of the approved payload, so what gets
+          // attributed is visible to whoever approves it.
+          threadAuthor: { $ref: '$.input.thread.author' },
+          relevanceScore: { $ref: '$.input.relevanceScore' },
+          angle: { $ref: '$.steps.draft.output.angle' },
+          safetyAllowed: { $ref: '$.steps.guard.output.allowed' },
+          safetyReason: { $ref: '$.steps.guard.output.reason' },
+          safetyChecks: { $ref: '$.steps.guard.output.checks' },
+          critiquePassed: { $ref: '$.steps.draft.output.critique.passed' },
+          critiqueFindings: { $ref: '$.steps.draft.output.critique.findings' },
+          automationMode: { $ref: '$.steps.draft.output.automationMode' },
+          submitUrl: { $ref: '$.steps.draft.output.submitUrl' }
+        }
+      }
+    },
+    {
+      id: 'post-reply',
+      type: 'action',
+      actionType: 'community.reply',
+      approvalStepId: 'approve-reply',
+      needs: ['approve-reply'],
+      payload: { $ref: '$.steps.approve-reply.input' },
+      retry: { maxAttempts: 3, delaySeconds: 30 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-reply.output.approved' },
+    delivery: { $ref: '$.steps.post-reply.output' },
+    draft: { $ref: '$.steps.draft.output' },
+    safety: { $ref: '$.steps.guard.output' },
+    thread: { $ref: '$.input.thread' }
+  },
+  source: { type: 'builtin' }
+};
+
+export const qualifiedDemandEmailPlaybook: PlaybookDefinition = {
+  id: 'gtm.qualified-demand-email',
+  version: '1.0.0',
+  name: 'Qualified demand email',
+  description:
+    'Prepare one evidence-backed email for a qualified Person × Account recommendation and require approval of the exact bytes before provider execution.',
+  inputSchema: z
+    .object({
+      recommendationId: z.string().trim().min(1).max(160),
+      conversationId: z.string().trim().min(1).max(160),
+      personId: z.string().trim().min(1).max(160),
+      accountId: z.string().trim().min(1).max(160),
+      recipient: z.string().email(),
+      subject: z.string().trim().min(1).max(200),
+      body: z.string().trim().min(1).max(20_000),
+      evidence: z
+        .array(
+          z.object({
+            sourceType: z.string().min(1).max(120),
+            sourceId: z.string().min(1).max(200),
+            label: z.string().min(1).max(200),
+            excerpt: z.string().min(1).max(1200),
+            externalUrl: z.string().url().nullable().optional(),
+            observedAt: z.string().datetime().nullable().optional()
+          })
+        )
+        .max(12)
+    })
+    .strict(),
+  steps: [
+    {
+      id: 'approve-outreach',
+      type: 'approval',
+      title: 'Approve qualified demand outreach',
+      payload: {
+        recipient: { $ref: '$.input.recipient' },
+        subject: { $ref: '$.input.subject' },
+        body: { $ref: '$.input.body' },
+        metadata: {
+          conversationId: { $ref: '$.input.conversationId' },
+          personId: { $ref: '$.input.personId' },
+          accountId: { $ref: '$.input.accountId' },
+          recommendationId: { $ref: '$.input.recommendationId' },
+          evidence: { $ref: '$.input.evidence' },
+          deliveryPurpose: 'outreach',
+          deliverySourceType: 'qualified_demand',
+          deliverySourceId: { $ref: '$.input.recommendationId' },
+          conversationSourceType: 'qualified_demand_outreach',
+          conversationSourceId: { $ref: '$.input.recommendationId' },
+          intent: 'qualified-demand-email'
+        }
+      }
+    },
+    {
+      id: 'send-outreach',
+      type: 'action',
+      actionType: 'email.send',
+      approvalStepId: 'approve-outreach',
+      needs: ['approve-outreach'],
+      payload: { $ref: '$.steps.approve-outreach.input' },
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-outreach.output.approved' },
+    delivery: { $ref: '$.steps.send-outreach.output' },
+    recommendationId: { $ref: '$.input.recommendationId' }
+  },
+  source: { type: 'builtin' }
+};
+
+export const conversationEmailReplyPlaybook: PlaybookDefinition = {
+  id: 'gtm.conversation-email-reply',
+  version: '1.0.0',
+  name: 'Reply by email',
+  description:
+    'Prepare one email reply in a shared GTM conversation and require founder approval of the exact bytes before provider execution.',
+  inputSchema: z
+    .object({
+      idempotencyKey: z.string().trim().min(8).max(200),
+      conversationId: z.string().trim().min(1).max(160),
+      personId: z.string().trim().min(1).max(160),
+      recipient: z.string().email(),
+      subject: z.string().trim().min(1).max(200),
+      body: z.string().trim().min(1).max(20_000),
+      threadExternalRef: z.string().trim().min(1).max(1000),
+      threadIdempotencyKey: z.string().trim().max(500).nullable().optional(),
+      recommendationId: z.string().trim().max(160).nullable().optional(),
+      accountId: z.string().trim().max(160).nullable().optional()
+    })
+    .strict(),
+  steps: [
+    {
+      id: 'approve-reply',
+      type: 'approval',
+      title: 'Approve email reply',
+      payload: {
+        recipient: { $ref: '$.input.recipient' },
+        subject: { $ref: '$.input.subject' },
+        body: { $ref: '$.input.body' },
+        metadata: {
+          threaded: true,
+          threadExternalRef: { $ref: '$.input.threadExternalRef' },
+          threadIdempotencyKey: { $ref: '$.input.threadIdempotencyKey' },
+          conversationId: { $ref: '$.input.conversationId' },
+          personId: { $ref: '$.input.personId' },
+          deliveryPurpose: 'reply',
+          deliverySourceType: 'conversation_reply',
+          deliverySourceId: { $ref: '$.input.idempotencyKey' },
+          recommendationId: { $ref: '$.input.recommendationId' },
+          accountId: { $ref: '$.input.accountId' },
+          conversationSourceType: 'conversation_reply',
+          conversationSourceId: { $ref: '$.input.idempotencyKey' },
+          intent: 'conversation-email-reply'
+        }
+      }
+    },
+    {
+      id: 'send-reply',
+      type: 'action',
+      actionType: 'email.send',
+      approvalStepId: 'approve-reply',
+      needs: ['approve-reply'],
+      payload: { $ref: '$.steps.approve-reply.input' },
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-reply.output.approved' },
+    delivery: { $ref: '$.steps.send-reply.output' }
+  },
+  source: { type: 'builtin' }
+};
+
+export const emailOutreachPlaybook: PlaybookDefinition = {
+  id: 'gtm.email-outreach',
+  version: '1.0.0',
+  name: 'Outreach email',
+  description:
+    'Prepare one first-touch outreach email to a known Person from the approved mailbox, with RFC 8058 one-click unsubscribe, and require approval of the exact bytes before provider execution.',
+  inputSchema: z
+    .object({
+      idempotencyKey: z.string().trim().min(8).max(200),
+      conversationId: z.string().trim().min(1).max(160),
+      personId: z.string().trim().min(1).max(160),
+      contactId: z.string().trim().min(1).max(160),
+      leadListId: z.string().trim().min(1).max(160),
+      connectionId: z.string().trim().min(1).max(160),
+      senderAddress: z.string().email(),
+      recipient: z.string().email(),
+      subject: z.string().trim().min(1).max(200),
+      body: z.string().trim().min(1).max(20_000)
+    })
+    .strict(),
+  steps: [
+    {
+      id: 'approve-outreach',
+      type: 'approval',
+      title: 'Approve outreach email',
+      payload: {
+        recipient: { $ref: '$.input.recipient' },
+        subject: { $ref: '$.input.subject' },
+        body: { $ref: '$.input.body' },
+        metadata: {
+          conversationId: { $ref: '$.input.conversationId' },
+          personId: { $ref: '$.input.personId' },
+          contactId: { $ref: '$.input.contactId' },
+          leadListId: { $ref: '$.input.leadListId' },
+          connectionId: { $ref: '$.input.connectionId' },
+          senderAddress: { $ref: '$.input.senderAddress' },
+          requireListUnsubscribe: true,
+          deliveryPurpose: 'outreach',
+          deliverySourceType: 'email_outreach',
+          deliverySourceId: { $ref: '$.input.idempotencyKey' },
+          conversationSourceType: 'email_outreach',
+          conversationSourceId: { $ref: '$.input.idempotencyKey' },
+          intent: 'email-outreach'
+        }
+      }
+    },
+    {
+      id: 'send-outreach',
+      type: 'action',
+      actionType: 'email.send',
+      approvalStepId: 'approve-outreach',
+      needs: ['approve-outreach'],
+      payload: { $ref: '$.steps.approve-outreach.input' },
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-outreach.output.approved' },
+    delivery: { $ref: '$.steps.send-outreach.output' },
+    personId: { $ref: '$.input.personId' }
+  },
+  source: { type: 'builtin' },
+  preparedOnly: true
+};
+
+/**
+ * 1.1.0 puts how the email carries its opt-out inside the hashed approval
+ * payload (src/server/email/unsubscribe-policy.ts): one-click List-Unsubscribe
+ * headers (Gmail, Microsoft 365) or the reply-to-unsubscribe footer (Zoho
+ * Mail). 1.0.0 stays registered so runs prepared before it resume and send
+ * exactly as approved; runs, indexes and unsubscribe lookups key on playbook_key.
+ */
+export const emailOutreachPlaybookV1_1: PlaybookDefinition = {
+  id: 'gtm.email-outreach',
+  version: '1.1.0',
+  name: 'Outreach email',
+  description:
+    'Prepare one first-touch outreach email to a known Person from the approved mailbox, with one-click unsubscribe (Gmail, Microsoft 365) or a reply-to-unsubscribe footer (Zoho Mail), and require approval of the exact bytes before provider execution.',
+  inputSchema: z
+    .object({
+      idempotencyKey: z.string().trim().min(8).max(200),
+      conversationId: z.string().trim().min(1).max(160),
+      personId: z.string().trim().min(1).max(160),
+      contactId: z.string().trim().min(1).max(160),
+      leadListId: z.string().trim().min(1).max(160),
+      connectionId: z.string().trim().min(1).max(160),
+      senderAddress: z.string().email(),
+      recipient: z.string().email(),
+      subject: z.string().trim().min(1).max(200),
+      body: z.string().trim().min(1).max(20_000),
+      unsubscribeMode: z.enum(OUTREACH_UNSUBSCRIBE_MODES),
+      requireListUnsubscribe: z.boolean()
+    })
+    .strict()
+    .superRefine((input, ctx) => {
+      if (input.requireListUnsubscribe !== (input.unsubscribeMode === 'list_unsubscribe_headers')) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['requireListUnsubscribe'],
+          message:
+            'requireListUnsubscribe must be true exactly when unsubscribeMode is list_unsubscribe_headers.'
+        });
+      }
+    }),
+  steps: [
+    {
+      id: 'approve-outreach',
+      type: 'approval',
+      title: 'Approve outreach email',
+      payload: {
+        recipient: { $ref: '$.input.recipient' },
+        subject: { $ref: '$.input.subject' },
+        body: { $ref: '$.input.body' },
+        metadata: {
+          conversationId: { $ref: '$.input.conversationId' },
+          personId: { $ref: '$.input.personId' },
+          contactId: { $ref: '$.input.contactId' },
+          leadListId: { $ref: '$.input.leadListId' },
+          connectionId: { $ref: '$.input.connectionId' },
+          senderAddress: { $ref: '$.input.senderAddress' },
+          requireListUnsubscribe: { $ref: '$.input.requireListUnsubscribe' },
+          unsubscribeMode: { $ref: '$.input.unsubscribeMode' },
+          deliveryPurpose: 'outreach',
+          deliverySourceType: 'email_outreach',
+          deliverySourceId: { $ref: '$.input.idempotencyKey' },
+          conversationSourceType: 'email_outreach',
+          conversationSourceId: { $ref: '$.input.idempotencyKey' },
+          intent: 'email-outreach'
+        }
+      }
+    },
+    {
+      id: 'send-outreach',
+      type: 'action',
+      actionType: 'email.send',
+      approvalStepId: 'approve-outreach',
+      needs: ['approve-outreach'],
+      payload: { $ref: '$.steps.approve-outreach.input' },
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-outreach.output.approved' },
+    delivery: { $ref: '$.steps.send-outreach.output' },
+    personId: { $ref: '$.input.personId' }
+  },
+  source: { type: 'builtin' },
+  preparedOnly: true
+};
+
+export const bufferDraftPlaybook: PlaybookDefinition = {
+  id: 'gtm.buffer-draft',
+  version: '1.0.0',
+  name: 'Create Buffer draft',
+  description:
+    'Create one unscheduled Buffer draft after the founder approves the exact target channel and text.',
+  inputSchema: z
+    .object({
+      sourcePostId: z.string().trim().min(1).max(200),
+      contentAssetId: z.string().trim().max(200).nullable().optional(),
+      channelId: z.string().trim().min(1).max(300),
+      channelName: z.string().trim().min(1).max(300),
+      text: z.string().trim().min(1).max(20_000)
+    })
+    .strict(),
+  steps: [
+    {
+      id: 'approve-buffer-draft',
+      type: 'approval',
+      title: 'Create draft in Buffer',
+      payload: {
+        channelId: { $ref: '$.input.channelId' },
+        text: { $ref: '$.input.text' },
+        metadata: {
+          sourcePostId: { $ref: '$.input.sourcePostId' },
+          contentAssetId: { $ref: '$.input.contentAssetId' },
+          channelName: { $ref: '$.input.channelName' },
+          mode: 'draft_only'
+        }
+      }
+    },
+    {
+      id: 'create-buffer-draft',
+      type: 'action',
+      actionType: 'buffer.create-draft',
+      approvalStepId: 'approve-buffer-draft',
+      needs: ['approve-buffer-draft'],
+      payload: { $ref: '$.steps.approve-buffer-draft.input' },
+      // No automatic retry: a timeout after Buffer accepted a mutation has an
+      // ambiguous outcome, and the Buffer ledger forces a human reconciliation.
+      retry: { maxAttempts: 1, delaySeconds: 0 }
+    }
+  ],
+  output: {
+    approved: { $ref: '$.steps.approve-buffer-draft.output.approved' },
+    delivery: { $ref: '$.steps.create-buffer-draft.output' },
+    sourcePostId: { $ref: '$.input.sourcePostId' }
+  },
+  source: { type: 'builtin' }
+};
+
+registerPlaybook(auditLedOutreachPlaybook);
+registerPlaybook(communityOutreachPlaybook);
+registerPlaybook(threadReplyPlaybook);
+registerPlaybook(qualifiedDemandEmailPlaybook);
+registerPlaybook(conversationEmailReplyPlaybook);
+registerPlaybook(emailOutreachPlaybook);
+registerPlaybook(emailOutreachPlaybookV1_1);
+registerPlaybook(bufferDraftPlaybook);
+
+export function registerPlaybook(playbook: PlaybookDefinition): PlaybookDefinition {
+  validatePlaybook(playbook);
+  const key = registryKey(playbook.id, playbook.version);
+  const existing = playbooks.get(key);
+  if (existing) return existing;
+  playbooks.set(key, playbook);
+  return playbook;
+}
+
+export function getPlaybook(id: string, version?: string): PlaybookDefinition | undefined {
+  if (version) return playbooks.get(registryKey(id, version));
+  return listPlaybooks()
+    .filter((playbook) => playbook.id === id)
+    .sort((a, b) => b.version.localeCompare(a.version))[0];
+}
+
+export function listPlaybooks(): PlaybookDefinition[] {
+  return [...playbooks.values()].sort(
+    (a, b) => a.id.localeCompare(b.id) || b.version.localeCompare(a.version)
+  );
+}
+
+export async function seedPlaybooks(db: Db, now: Date = new Date()): Promise<void> {
+  const timestamp = now.toISOString();
+  for (const playbook of listPlaybooks()) {
+    const source = playbook.source ?? { type: 'builtin' as const };
+    await db
+      .prepare(
+        `
+      INSERT INTO playbooks (
+        playbook_key,version,name,description,input_schema_json,definition_json,
+        source_type,source_ref,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT (playbook_key,version) DO UPDATE SET
+        name=excluded.name,description=excluded.description,input_schema_json=excluded.input_schema_json,
+        definition_json=excluded.definition_json,source_type=excluded.source_type,
+        source_ref=excluded.source_ref,updated_at=excluded.updated_at
+    `
+      )
+      .run(
+        playbook.id,
+        playbook.version,
+        playbook.name,
+        playbook.description,
+        JSON.stringify(
+          zodToJsonSchema(playbook.inputSchema, { target: 'jsonSchema7', $refStrategy: 'none' })
+        ),
+        JSON.stringify(publicDefinition(playbook)),
+        source.type,
+        source.ref ?? null,
+        timestamp,
+        timestamp
+      );
+  }
+}
+
+export async function listWorkspacePlaybooks(db: Db, workspaceId: string) {
+  const rows = await db
+    .prepare(
+      `
+    SELECT p.playbook_key,p.version,p.name,p.description,p.input_schema_json,p.definition_json,
+      p.source_type,p.source_ref,p.enabled AS registry_enabled,
+      COALESCE(wp.enabled,TRUE) AS workspace_enabled,wp.pinned_version,wp.config_json
+    FROM playbooks p
+    LEFT JOIN workspace_playbooks wp ON wp.workspace_id=? AND wp.playbook_key=p.playbook_key
+    ORDER BY p.playbook_key,p.version DESC
+  `
+    )
+    .all<Record<string, unknown>>(workspaceId);
+  return rows.map((row) => ({
+    id: String(row.playbook_key),
+    version: String(row.version),
+    name: String(row.name),
+    description: String(row.description),
+    enabled: Boolean(row.registry_enabled) && Boolean(row.workspace_enabled),
+    pinnedVersion: row.pinned_version ? String(row.pinned_version) : null,
+    inputSchema: parseObject(row.input_schema_json),
+    definition: parseObject(row.definition_json),
+    source: { type: String(row.source_type), ref: row.source_ref ? String(row.source_ref) : null },
+    config: parseObject(row.config_json)
+  }));
+}
+
+function publicDefinition(playbook: PlaybookDefinition): Record<string, unknown> {
+  return {
+    id: playbook.id,
+    version: playbook.version,
+    steps: playbook.steps,
+    output: playbook.output ?? null
+  };
+}
+
+function validatePlaybook(playbook: PlaybookDefinition): void {
+  if (!playbook.id || !playbook.version || !playbook.name)
+    throw new Error('Playbook id, version, and name are required');
+  const ids = new Set<string>();
+  for (const step of playbook.steps) {
+    if (ids.has(step.id)) throw new Error(`Duplicate playbook step: ${step.id}`);
+    if (step.type === 'action' && !/^[a-z][a-z0-9_.-]{2,119}$/.test(step.actionType)) {
+      throw new Error(`Invalid playbook action type: ${step.actionType}`);
+    }
+    for (const dependency of step.needs ?? []) {
+      if (!ids.has(dependency))
+        throw new Error(`Playbook step ${step.id} depends on unknown or later step ${dependency}`);
+    }
+    ids.add(step.id);
+  }
+}
+
+function registryKey(id: string, version: string): string {
+  return `${id}@${version}`;
+}
+
+function parseObject(value: unknown): Record<string, unknown> {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value))
+    return value as Record<string, unknown>;
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}

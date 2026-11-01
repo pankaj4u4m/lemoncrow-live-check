@@ -1,0 +1,403 @@
+# Trevra
+
+Trevra is a ledger and control plane for agent-operated go-to-market. Founders and agents use it to find and qualify accounts/people, capture inbound demand, operate outreach, manage conversations and opportunity state, and run evidence-backed GTM playbooks. Trevra records what happened and executes consequential GTM actions only through explicit policy and approval boundaries.
+
+No open-source license has been published for this repository. Do not assume that source availability grants reuse, redistribution, or deployment rights; licensing must be approved separately.
+
+Trevra is deliberately **not** a project-management, contract, accounting, invoicing, payment, generic backend, generic event-bus, or arbitrary webhook automation product.
+
+## Public launch and discoverability
+
+Trevra includes crawlable launch copy, canonical and social metadata, JSON-LD, a sitemap, robots directives, Web App Manifest, `llms.txt`, `llms-full.txt`, public `agents.md`, `humans.txt`, RFC 9116 `security.txt`, IndexNow support, and privacy-preserving first-party traction measurement. Configuration and launch verification are documented in [`docs/discoverability.md`](docs/discoverability.md).
+
+## Storage guarantee
+
+Trevra is **PostgreSQL-only**. There is no SQLite dependency, fallback, database file, or embedded development database.
+
+- Application data and Better Auth use PostgreSQL.
+- Every multi-step write uses a real PostgreSQL transaction.
+- Consequential action preparation/execution uses row locks and idempotency boundaries.
+- Schema migrations use a PostgreSQL advisory lock, so multiple instances cannot race migrations.
+- Tests run against real PostgreSQL.
+
+## What is implemented
+
+### GTM operating system
+
+- target-account import, sourcing, enrichment, scoring and evidence;
+- LinkedIn accounts, lead lists, reusable workflows, managed campaigns and inbox handling;
+- Gmail and Microsoft 365 GTM message sync/delivery through Nango-managed connections;
+- public-community research and governed reply workflows;
+- CRM reads plus bounded `crm.log-activity` write-back;
+- minimal opportunity state and evidence-backed stale-proposal follow-up;
+- durable playbooks, agent/skill run ledgers, exact-payload approvals and workspace policies;
+- workspace-scoped audit/export/erasure controls.
+
+### Integration boundary
+
+Providers either **observe GTM state** or **execute a named GTM action**. The current prepared execution registry is deliberately closed to `email.send`, `community.reply`, `crm.log-activity`, and `buffer.create-draft`.
+
+There is no customer Stripe payment webhook, accounting-provider execution, generic `/api/events` ingestion endpoint, generic remote-action adapter, or arbitrary webhook step in campaign workflows. Website lead capture is designed as a GTM-specific source contract, not as general application telemetry. See [`docs/integration-contracts.md`](docs/integration-contracts.md).
+
+Trevra does not rebuild OAuth, refresh-token rotation, provider credential storage, integration retries, or rate-limit handling when a provider/Nango SDK already owns that plumbing.
+
+## Durable playbooks and hosted module registry
+
+Trevra includes durable orchestration, exact-payload approvals, append-only control-plane events, and GTM playbooks. External-write skills cannot execute through the generic skill runner; named GTM action adapters own consequential execution.
+
+The hosted module registry supports signed digest-pinned releases, SBOMs, workspace installation, isolated execution, and privacy-safe popularity counters. A module still cannot bypass the GTM product boundary or the external-write approval boundary.
+
+Architecture and operations are documented in:
+
+- [`docs/control-plane-architecture.md`](docs/control-plane-architecture.md)
+- [`docs/module-registry.md`](docs/module-registry.md)
+- [`docs/sandbox-execution.md`](docs/sandbox-execution.md)
+- [`docs/temporal-orchestration.md`](docs/temporal-orchestration.md)
+
+## Operate from Claude Code or Codex
+
+Trevra ships a restricted agent API, a local stdio MCP server, and a hosted Streamable HTTP MCP endpoint. Agent tokens can inspect GTM skills/playbooks, run enabled skills, start durable playbooks, and inspect run/event ledgers. They cannot approve or execute consequential actions.
+
+Create a scoped token in **Setup → Agent access**, then connect a local MCP bridge:
+
+```bash
+claude mcp add trevra --scope user \
+  --env TREVRA_API_URL=http://localhost:43887 \
+  --env TREVRA_AGENT_TOKEN=<agent-token> \
+  -- npm --prefix /absolute/path/to/trevra run mcp
+```
+
+Or connect Codex directly to the hosted product runtime:
+
+```bash
+export TREVRA_AGENT_TOKEN=<agent-token>
+codex mcp add trevra \
+  --url https://app.example.com/api/agent/mcp \
+  --bearer-token-env-var TREVRA_AGENT_TOKEN
+```
+
+Complete setup, CLI commands, API routes, scopes, and operating boundaries are documented in [`docs/agent-operation.md`](docs/agent-operation.md).
+
+## Hosted LinkedIn from your own computer
+
+Hosted Trevra can run LinkedIn through a Chrome profile on the workspace member's own computer instead of a datacenter browser. Dev/self-host setup can preinstall the per-user Companion package and OS service definition before pairing. Pair once from **Outreach → LinkedIn accounts** with the generated version-pinned command; when that exact version is already installed, the command only pairs and starts it instead of reinstalling the package. The service starts at login and restarts after crashes, so no terminal needs to stay open.
+
+```bash
+trevra linkedin status
+trevra linkedin logs
+trevra linkedin logs --follow
+trevra linkedin start
+trevra linkedin stop
+trevra linkedin restart
+trevra linkedin uninstall
+```
+
+LinkedIn traffic uses that computer's normal network/IP, the persistent browser profile and cookies stay on that computer, and hosted Trevra does not need the LinkedIn password for this path. Exactly one active companion computer is allowed per workspace; pairing a replacement revokes the previous device. A signed-in Trevra tab must still remain open when work should run; if the laptop companion or website disappears, due work stays queued. `linkedin logs` shows the local lifecycle/browser/relay activity log without tokens, cookies, passwords or message contents. Returning runs one normal bounded sitting rather than replaying missed timer ticks. See [`docs/linkedin-companion.md`](docs/linkedin-companion.md).
+
+## Fastest local start
+
+Requirements:
+
+- Docker with Compose v2
+- at least 6 GB of free Docker memory for the complete Trevra + Nango stack
+
+Run the one-time development setup. It creates `.env.dev` when needed, generates the local Trevra/Companion signing key and Nango encryption key, and installs/registers the per-user Companion service once. Pairing still happens later from **Outreach → LinkedIn accounts**; setup never invents or bypasses a pairing code.
+
+```bash
+npm run dev:setup
+```
+
+Current defaults include Trevra `43173`/`43887`, Trevra/Nango PostgreSQL `45432`/`45433`, Redis `46379`, and Nango `43003`/`43009`.
+
+Start Trevra, PostgreSQL, Redis, and self-hosted Nango:
+
+```bash
+docker compose --env-file .env.dev -f compose.dev.yml up --build
+```
+
+Open:
+
+- Trevra: `http://localhost:43173` (`/` is the landing page; app paths open the work console)
+- Trevra API: `http://localhost:43887`
+- Nango API/dashboard: `http://localhost:43003`
+- Nango Connect UI: `http://localhost:43009`
+- Trevra PostgreSQL: `localhost:45432`
+- Nango PostgreSQL: `localhost:45433`
+
+### Local sign-in
+
+Local development Trevra signs users in directly with its built-in Better Auth email/password flow. No Authward service, Authward database, Mailpit instance, or external identity credentials are required. Self-hosted production uses the same boundary, subject to separately approved deployment rights.
+
+Managed hosted Trevra is different by design: `TREVRA_DEPLOYMENT_MODE=hosted` disables Trevra password auth and requires Authward as the upstream identity authority. Social providers and passwordless login are configured on Authward, not in Trevra. Gmail and Calendar delegated permissions remain separate Nango connections.
+
+The Trevra frontend and API hot-reload through the bind-mounted source tree.
+
+After Nango starts, configure its provider integrations and copy the Nango environment secret key and webhook signing key into `.env.dev` as `NANGO_API_KEY` and `NANGO_WEBHOOK_SIGNING_KEY`. Restart only Trevra afterward:
+
+```bash
+docker compose --env-file .env.dev -f compose.dev.yml up -d --force-recreate trevra
+```
+
+Until those Nango keys are configured, the core Trevra demo, account/research workflows, recommendations, and local GTM surfaces still work; live OAuth connections do not.
+
+Stop the stack without deleting data:
+
+```bash
+docker compose --env-file .env.dev -f compose.dev.yml down
+```
+
+Delete all local development data explicitly:
+
+```bash
+docker compose --env-file .env.dev -f compose.dev.yml down -v
+```
+
+## Run the app directly against PostgreSQL
+
+Start only PostgreSQL:
+
+```bash
+docker compose --env-file .env.dev -f compose.dev.yml up -d postgres
+```
+
+Then:
+
+```bash
+cp .env.example .env
+npm run dev:setup
+npm run dev
+```
+
+`dev:setup` also fills the Companion relay/signing settings in an existing `.env` for this direct-process path. Normal `npm run dev` remains non-mutating and never reinstalls an OS service.
+
+Open `http://localhost:43173`.
+
+## Tests and build
+
+The test runner launches a real PostgreSQL 17 Testcontainer. Docker must be running.
+
+```bash
+npm run check
+```
+
+### Single-operator production
+
+For one operator on one machine, deploy the hardened production build on loopback with:
+
+```bash
+npm run selfhost:deploy
+```
+
+This creates a gitignored `0600` secret file, installs/registers the host Companion once, creates a dedicated PostgreSQL volume, runs migrations once, and starts separate API and worker containers on `http://localhost:43900` by default. Pairing is still explicit from Outreach; PostgreSQL is not published to the host. Create a custom-format backup with `npm run selfhost:backup`.
+
+See [`docs/self-hosted-production.md`](docs/self-hosted-production.md) before exposing the service beyond the local machine; remote access requires HTTPS and secure cookies.
+
+Individual commands:
+Individual commands:
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```
+
+## Production on Google Cloud
+
+The supported production path is:
+
+```text
+Browser
+   ↓
+Cloud Run: Trevra
+   ↓ Unix socket through Cloud SQL integration
+Cloud SQL for PostgreSQL: regional HA + backups + PITR
+
+Trevra Cloud Run
+   ↓ HTTPS
+Self-hosted Nango service
+   ↓
+Separate Nango PostgreSQL and Redis
+```
+
+Terraform under [`infra/gcp/terraform`](infra/gcp/terraform) provisions:
+
+- Artifact Registry;
+- a dedicated Cloud Run service account;
+- Cloud Run with startup and liveness probes;
+- Cloud SQL PostgreSQL 16 with regional high availability;
+- SSD autoscaling, automated backups, 14 retained backups, and seven days of point-in-time recovery logs;
+- Secret Manager values for the PostgreSQL URL, Better Auth session secret, Nango, internal ingestion, and Authward client credentials;
+- hosted Authward identity is always injected; shared Billing endpoints are injected into web and worker revisions only when the Billing machine credential is configured;
+- Cloud SQL Client and Secret Manager least-privilege access;
+- migration-safe multi-instance startup.
+
+### 1. Bootstrap remote Terraform state
+
+```bash
+export GCP_PROJECT_ID=your-project
+export GCP_REGION=europe-west6
+export TF_STATE_BUCKET=your-globally-unique-trevra-tfstate
+
+./infra/gcp/bootstrap.sh
+```
+
+### 2. Deploy Trevra
+
+Use a production HTTPS domain for the app and a separately deployed HTTPS Nango endpoint:
+
+```bash
+export GCP_PROJECT_ID=your-project
+export GCP_REGION=europe-west6
+export TF_STATE_BUCKET=your-globally-unique-trevra-tfstate
+export APP_ORIGIN=https://app.example.com
+export BETTER_AUTH_URL=https://app.example.com
+export AUTHWARD_ISSUER=https://auth.olaryn.com
+export AUTHWARD_CLIENT_ID=trevra-web
+export AUTHWARD_CLIENT_SECRET='the Authward trevra-web server-web client secret'
+# Configure Google/GitHub/Microsoft/Apple and passwordless login on Authward itself.
+# Optional until Billing/OpenMeter production is enabled:
+# export BILLING_BASE_URL=https://billing.olaryn.com
+# export BILLING_CLIENT_ID=trevra-billing
+# export BILLING_CLIENT_SECRET='the Authward trevra-billing client secret'
+# export BILLING_AUDIENCE=https://billing.olaryn.com
+export NANGO_HOST=https://nango-api.example.com
+export NANGO_API_KEY='...'
+export NANGO_WEBHOOK_SIGNING_KEY='...'
+
+./infra/gcp/deploy.sh
+```
+
+The script enables required APIs, prepares Artifact Registry, builds the image with Cloud Build, and applies Terraform.
+
+Cloud Run Compose is also represented in [`compose.gcp.yml`](compose.gcp.yml) for inspection or preview deployment, but [`infra/gcp/terraform`](infra/gcp/terraform) is the production source of truth.
+
+### Production self-hosted Nango
+
+[`compose.nango.production.yml`](compose.nango.production.yml) runs Nango with a Cloud SQL Auth Proxy and an external Redis endpoint. It is intended for a hardened GCE VM or equivalent long-running container host—not inside the Trevra Cloud Run service.
+
+```bash
+cp .env.nango.production.example .env.nango.production
+chmod 600 .env.nango.production
+docker compose --env-file .env.nango.production -f compose.nango.production.yml up -d
+```
+
+Place a TLS reverse proxy or HTTPS load balancer in front of ports 3003 and 3009. Keep the Nango encryption key permanently backed up: changing it after credentials have been encrypted can make those credentials unreadable.
+
+See [`docs/deployment.md`](docs/deployment.md) for DNS, secrets, scaling, backup, restore, and Nango details.
+
+## Database operations
+
+Migrations run automatically at startup from `migrations/`. Trevra and Better Auth migrations are serialized with PostgreSQL advisory locks.
+
+Reset only the seeded demo workspace:
+
+```bash
+npm run db:reset
+```
+
+Production data is never deleted by this command.
+
+Recommended production controls:
+
+- Cloud SQL deletion protection;
+- regional high availability;
+- point-in-time recovery;
+- automated backups plus periodic on-demand backups;
+- scheduled logical exports to a separate project or bucket;
+- quarterly restore drills into an isolated Cloud SQL instance;
+- alerting on storage, connections, replication, backup failures, and database availability.
+
+## Primary API surface
+
+### Authentication
+
+- Better Auth endpoints under `/api/auth/*`
+- `GET /api/auth/session`
+- development-only `POST /api/auth/demo`
+
+### Work
+
+- `GET /api/dashboard`
+- `GET /api/recommendations`
+- `POST /api/recommendations/:id/prepare`
+- `POST /api/recommendations/:id/snooze`
+- `POST /api/recommendations/:id/dismiss`
+- `POST /api/actions/:id/approve`
+- `POST /api/actions/:id/execute`
+
+### Connections and GTM ingestion
+
+- `GET /api/integrations`
+- `POST /api/integrations/connect-session`
+- `POST /api/integrations/:id/sync`
+- `DELETE /api/integrations/:id`
+- `GET /api/capture-sources`
+- `POST /api/capture-sources`
+- `POST /api/intake/v1/submissions`
+- `GET /api/inbound/people`
+- `GET /api/inbound/submissions`
+- `POST /api/accounts/import`
+- `POST /api/accounts/source`
+- `GET /api/opportunities`
+- `POST /api/opportunities`
+- `GET /api/conversations`
+- `GET /api/deliveries`
+- `POST /api/webhooks/nango`
+
+### Automation
+
+- `GET /api/automation/rules`
+- `PUT /api/automation/rules/:type`
+- `POST /api/automation/run`
+
+## Safety rules
+
+- Scope changes can never be auto-executed.
+- Approval hashes cover visible text and structured GTM payloads.
+- Execution is blocked if an approved payload changes.
+- Production refuses simulated delivery.
+- Scheduled work executes only after the approved time.
+- External writes receive deterministic idempotency keys.
+- Provider events are signature-verified and deduplicated.
+- Every material state transition is audited.
+
+## Before accepting paying customers
+
+The code and deployment foundations are implemented. The operator still must complete:
+
+- provider OAuth applications, scopes, reviews, and callback domains;
+- Nango production integration functions and provider test connections;
+- privacy policy, terms, DPA, subprocessor list, and deletion process;
+- custom domains and DNS;
+- alerts, incident response, backup validation, and restore drills;
+- security review and cross-tenant adversarial testing.
+
+## Durable GTM control plane
+
+Trevra includes a versioned playbook engine above the individual skill runner. Playbook runs persist their step state, attempts, evidence, policy decisions, approval payload hashes, retries, and outcomes in PostgreSQL. An append-only domain event stream records the same run across process restarts and worker resumptions.
+
+The first built-in playbook is `gtm.audit-led-outreach`:
+
+```text
+score lead -> audit domain -> prepare outreach -> founder approval -> email execution
+```
+
+The **Work** view starts playbooks, displays step progress, and handles exact-payload approval or rejection. **Autopilot** includes a workspace policy editor and scoped Claude Code/Codex tokens.
+
+Architecture and migration details are in [`docs/control-plane-architecture.md`](docs/control-plane-architecture.md).
+
+### Playbook API
+
+```text
+GET    /api/playbooks
+POST   /api/playbooks/:id/runs
+GET    /api/playbook-runs
+GET    /api/playbook-runs/:id
+POST   /api/playbook-runs/:id/steps/:stepId/decision
+GET    /api/control-plane/events
+GET    /api/policies
+POST   /api/policies
+DELETE /api/policies/:id
+```
+
+Agent equivalents live under `/api/agent` and deliberately omit approval and execution.
