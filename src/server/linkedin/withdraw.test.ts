@@ -1,0 +1,2067 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { openDatabase, type Db } from '../db.js';
+import {
+  acceptanceRate,
+  countActionsInWindow,
+  hasTarget,
+  recordAction,
+  type SeatRef
+} from './actions.js';
+import {
+  ingestOutcome,
+  linkedinAnalytics,
+  recordDetectedAcceptance,
+  writeActionStatus
+} from './action-ledger.js';
+import type {
+  LinkedInDegreeDriver,
+  LinkedInDegreeRead,
+  LinkedInDriverResult,
+  LinkedInPage
+} from './driver.js';
+import type {
+  LinkedInListPage,
+  LinkedInWithdrawDriver,
+  PendingInviteList,
+  RecentConnectionList
+} from './driver-withdraw.js';
+import type { LinkedInSafetyVerdict } from './guard.js';
+import { LINKEDIN_LIMITS } from './limits.js';
+import { OWNER_SEAT_KEY, getSeat, upsertSeat } from './seats.js';
+import {
+  approveWithdrawal,
+  listPendingWithdrawalReviews,
+  reviewWithdrawal
+} from './withdrawal-policy.js';
+import {
+  DEFAULT_STALE_AFTER_DAYS,
+  WITHDRAWN_STATUS,
+  claimNextWithdrawal,
+  detectAcceptedInvites,
+  selectAcceptanceCandidates,
+  syncAcceptedConnections,
+  countPendingInvites,
+  enqueueWithdrawals,
+  evaluateWithdrawalSafety,
+  executeWithdrawal,
+  markActionWithdrawn,
+  releaseWithdrawalClaim,
+  runWithdrawalBatch,
+  selectWithdrawalCandidates,
+  sweepStaleInvites,
+  syncPendingInvites,
+  targetMatchKeys,
+  withdrawalCeilingFor,
+  withdrawalsInWindow,
+  type ClaimedWithdrawal,
+  type WithdrawalVerdict
+} from './withdraw.js';
+
+/**
+ * THE DRIVER IS ALWAYS FAKE HERE. THE DATABASE IS ALWAYS REAL.
+ *
+ * No browser is launched and no LinkedIn request is made by this file, ever --
+ * a suite that touched a real account would withdraw real invites, and that
+ * cannot be undone. But the database is a real Postgres, because everything
+ * interesting in `withdraw.ts` IS a SQL predicate: which row the age sweep
+ * picks, which one the claim hands out, what the partial unique index refuses,
+ * and -- the load-bearing one -- what the three predicates in `actions.ts`
+ * make of the eighth status once a row carries it.
+ */
+
+let db: Db;
+
+/** Tuesday 09:00 UTC: a business day, inside business hours, not a weekend. */
+const NOW = new Date('2026-08-04T09:00:00.000Z');
+const WORKSPACE_ID = 'ws_linkedin_withdraw_test';
+const SEAT: SeatRef = { workspaceId: WORKSPACE_ID, seatKey: OWNER_SEAT_KEY };
+
+beforeEach(async () => {
+  db = await openDatabase({ connectionString: process.env.TEST_DATABASE_URL, seedDemo: false });
+  await db
+    .prepare(
+      'INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING'
+    )
+    .run(WORKSPACE_ID, 'LinkedIn Withdraw Test', NOW.toISOString());
+  await db.prepare('DELETE FROM linkedin_withdrawals WHERE workspace_id=?').run(WORKSPACE_ID);
+  await db.prepare('DELETE FROM linkedin_actions WHERE workspace_id=?').run(WORKSPACE_ID);
+  await db.prepare('DELETE FROM linkedin_seats WHERE workspace_id=?').run(WORKSPACE_ID);
+  await db.prepare('DELETE FROM workspace_policies WHERE workspace_id=?').run(WORKSPACE_ID);
+  await db
+    .prepare(
+      `INSERT INTO workspace_policies(
+      id,workspace_id,name,priority,action_pattern,effect,conditions_json,enabled,created_at,updated_at)
+     VALUES ('pol_withdraw_fixture',?,'Fixture withdraw allow',100,
+       'action:linkedin.withdraw','allow','{}'::jsonb,TRUE,?::timestamptz,?::timestamptz)`
+    )
+    .run(WORKSPACE_ID, NOW.toISOString(), NOW.toISOString());
+});
+
+afterEach(async () => {
+  await db?.close();
+});
+
+/** A steady seat, activated long enough ago to be past the warm-up ramp. */
+function steadySeat() {
+  return upsertSeat(
+    db,
+    WORKSPACE_ID,
+    { label: 'Test seat', timezone: 'UTC' },
+    new Date('2026-01-01T09:00:00.000Z')
+  );
+}
+
+/** An invite sent `daysAgo`, in the ledger, awaiting an answer. */
+async function pendingInvite(
+  handle: string,
+  daysAgo: number,
+  status: 'sent' | 'exported' = 'sent'
+): Promise<string> {
+  const at = new Date(NOW.getTime() - daysAgo * 86_400_000);
+  const { id } = await recordAction(
+    db,
+    {
+      workspaceId: WORKSPACE_ID,
+      kind: 'invite',
+      targetRef: `https://www.linkedin.com/in/${handle}/`,
+      status,
+      source: 'export'
+    },
+    at
+  );
+  return id;
+}
+
+async function statusOf(actionId: string): Promise<string | undefined> {
+  const row = await db
+    .prepare('SELECT status FROM linkedin_actions WHERE id=?')
+    .get<{ status: string }>(actionId);
+  return row?.status;
+}
+
+async function withdrawalRow(withdrawalId: string) {
+  return db
+    .prepare('SELECT status, claimed_at, failure_kind, detail FROM linkedin_withdrawals WHERE id=?')
+    .get<{
+      status: string;
+      claimed_at: string | null;
+      failure_kind: string | null;
+      detail: string | null;
+    }>(withdrawalId);
+}
+
+const okResult: LinkedInDriverResult = {
+  ok: true,
+  externalRef: 'https://www.linkedin.com/in/x/',
+  failureKind: null
+};
+
+/** Records what the caller asked the driver to do, and answers however the test says. */
+function fakeDriver(
+  answer: (target: string, index: number) => LinkedInDriverResult = () => okResult
+) {
+  const targets: string[] = [];
+  const driver: LinkedInWithdrawDriver = {
+    listPendingInvites: async () => ({ ok: true, invites: [], truncated: false, degraded: [] }),
+    withdrawInvite: async (_page, target) => {
+      targets.push(target);
+      return answer(target, targets.length - 1);
+    }
+  };
+  return { driver, targets };
+}
+
+const page = {} as LinkedInListPage;
+
+function list(invites: PendingInviteList['invites'], truncated = false): PendingInviteList {
+  return { ok: true, invites, truncated, degraded: [] };
+}
+
+function allowed(): WithdrawalVerdict {
+  return {
+    allowed: true,
+    reason: null,
+    gate: {
+      allowed: true,
+      reason: null,
+      checks: [],
+      automationMode: 'prepare-only',
+      automationReason: 'LinkedIn forbids unattended automation of its site.'
+    },
+    usedToday: 0,
+    dailyCeiling: 18
+  };
+}
+
+function refused(reason: string): WithdrawalVerdict {
+  return {
+    ...allowed(),
+    allowed: false,
+    reason,
+    gate: { ...allowed().gate, allowed: false, reason }
+  };
+}
+
+describe('targetMatchKeys', () => {
+  it('covers every shape an opaque target_ref is stored in', () => {
+    const keys = targetMatchKeys('https://www.linkedin.com/in/maya/');
+    expect(keys).toContain('https://www.linkedin.com/in/maya/');
+    expect(keys).toContain('https://linkedin.com/in/maya');
+    expect(keys).toContain('in/maya');
+    expect(keys).toContain('maya');
+    expect(keys.every((key) => key === key.toLowerCase())).toBe(true);
+  });
+
+  it('matches nothing rather than everything for a non-profile', () => {
+    expect(targetMatchKeys('https://evil.example/steal')).toEqual([]);
+    expect(targetMatchKeys('')).toEqual([]);
+  });
+});
+
+describe('syncPendingInvites', () => {
+  it('stamps evidence on the matching ledger rows and never changes a status', async () => {
+    const actionId = await pendingInvite('maya', 30);
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([
+        {
+          profileUrl: 'https://www.linkedin.com/in/maya/',
+          name: 'Maya',
+          sentAt: '2026-07-01T09:00:00.000Z'
+        }
+      ]),
+      NOW
+    );
+
+    expect(result).toMatchObject({ listed: 1, matched: 1, unmatched: 0 });
+    expect(await statusOf(actionId)).toBe('sent');
+    const row = await db
+      .prepare('SELECT pending_seen_at, pending_since FROM linkedin_actions WHERE id=?')
+      .get<{ pending_seen_at: string; pending_since: string }>(actionId);
+    expect(row?.pending_seen_at).toBeTruthy();
+    expect(new Date(row!.pending_since).toISOString()).toBe('2026-07-01T09:00:00.000Z');
+  });
+
+  it('matches a bare-handle target_ref against a canonical URL from the list', async () => {
+    await recordAction(
+      db,
+      {
+        workspaceId: WORKSPACE_ID,
+        kind: 'invite',
+        targetRef: 'in/Maya',
+        status: 'sent',
+        source: 'manual'
+      },
+      new Date(NOW.getTime() - 86_400_000)
+    );
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ profileUrl: 'https://www.linkedin.com/in/maya/', name: null, sentAt: null }]),
+      NOW
+    );
+    expect(result.matched).toBe(1);
+  });
+
+  it('never walks pending_since forward on a re-sync', async () => {
+    // LinkedIn's label is relative and coarse ("3w"), so overwriting would make
+    // a three-week-old invite look permanently three weeks old and it would
+    // never age into a candidate.
+    const actionId = await pendingInvite('maya', 30);
+    const invite = {
+      profileUrl: 'https://www.linkedin.com/in/maya/',
+      name: null,
+      sentAt: '2026-07-01T09:00:00.000Z'
+    };
+    await syncPendingInvites(db, SEAT, list([invite]), NOW);
+    await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ ...invite, sentAt: '2026-08-01T09:00:00.000Z' }]),
+      NOW
+    );
+
+    const row = await db
+      .prepare('SELECT pending_since FROM linkedin_actions WHERE id=?')
+      .get<{ pending_since: string }>(actionId);
+    expect(new Date(row!.pending_since).toISOString()).toBe('2026-07-01T09:00:00.000Z');
+  });
+
+  it('reports an invite the operator sent by hand instead of inventing a ledger row', async () => {
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ profileUrl: 'https://www.linkedin.com/in/stranger/', name: null, sentAt: null }]),
+      NOW
+    );
+    expect(result).toMatchObject({ matched: 0, unmatched: 1 });
+    const total = await db
+      .prepare('SELECT COUNT(*)::int AS total FROM linkedin_actions WHERE workspace_id=?')
+      .get<{ total: number }>(WORKSPACE_ID);
+    expect(total?.total).toBe(0);
+  });
+
+  it('counts a disappearance without guessing what it was', async () => {
+    // Accepted, declined, expired and withdrawn are indistinguishable from a
+    // list, and the acceptance-rate throttle reads exactly those statuses.
+    const actionId = await pendingInvite('maya', 30);
+    await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ profileUrl: 'https://www.linkedin.com/in/maya/', name: null, sentAt: null }]),
+      NOW
+    );
+
+    const later = new Date(NOW.getTime() + 86_400_000);
+    const result = await syncPendingInvites(db, SEAT, list([]), later);
+
+    expect(result.disappeared).toBe(1);
+    expect(await statusOf(actionId)).toBe('sent');
+  });
+
+  it('does not count a row nobody ever saw on the list as a disappearance', async () => {
+    await pendingInvite('maya', 30);
+    expect((await syncPendingInvites(db, SEAT, list([]), NOW)).disappeared).toBe(0);
+  });
+
+  it("passes the driver's truncation through", async () => {
+    expect((await syncPendingInvites(db, SEAT, list([], true), NOW)).truncated).toBe(true);
+  });
+});
+
+describe('countPendingInvites', () => {
+  it('counts outstanding invites with no window at all', async () => {
+    await pendingInvite('old', 300);
+    await pendingInvite('recent', 1);
+    await pendingInvite('exported-too', 40, 'exported');
+    const decided = await pendingInvite('accepted', 40);
+    await db.prepare("UPDATE linkedin_actions SET status='accepted' WHERE id=?").run(decided);
+
+    expect(await countPendingInvites(db, SEAT)).toBe(3);
+  });
+});
+
+describe('selectWithdrawalCandidates', () => {
+  it('picks only invites older than the threshold, oldest first', async () => {
+    const oldest = await pendingInvite('oldest', 60);
+    const stale = await pendingInvite('stale', 30);
+    await pendingInvite('fresh', 5);
+
+    const candidates = await selectWithdrawalCandidates(db, SEAT, NOW);
+    expect(candidates.map((candidate) => candidate.actionId)).toEqual([oldest, stale]);
+    expect(candidates[0].pendingDays).toBe(60);
+  });
+
+  it('defaults to 21 days and honours an override', async () => {
+    await pendingInvite('day22', DEFAULT_STALE_AFTER_DAYS + 1);
+    await pendingInvite('day10', 10);
+
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW)).toHaveLength(1);
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW, { olderThanDays: 5 })).toHaveLength(2);
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW, { olderThanDays: 90 })).toHaveLength(0);
+  });
+
+  it("measures age by LinkedIn's clock when it has one", async () => {
+    // The ledger says we recorded it yesterday; LinkedIn says the recipient got
+    // it two months ago. The recipient's experience is what "stale" means.
+    const actionId = await pendingInvite('imported', 1);
+    await db
+      .prepare('UPDATE linkedin_actions SET pending_since=?::timestamptz WHERE id=?')
+      .run(new Date(NOW.getTime() - 60 * 86_400_000).toISOString(), actionId);
+
+    const candidates = await selectWithdrawalCandidates(db, SEAT, NOW);
+    expect(candidates.map((candidate) => candidate.actionId)).toEqual([actionId]);
+  });
+
+  it('ignores invites that are no longer awaiting an answer', async () => {
+    for (const status of ['accepted', 'replied', 'declined', 'skipped', WITHDRAWN_STATUS]) {
+      const actionId = await pendingInvite(`x-${status}`, 40);
+      await db.prepare('UPDATE linkedin_actions SET status=? WHERE id=?').run(status, actionId);
+    }
+    await db
+      .prepare(
+        "UPDATE linkedin_actions SET status='planned', recorded_at=NULL WHERE target_ref LIKE '%planned%'"
+      )
+      .run();
+
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW)).toEqual([]);
+  });
+
+  it('ignores a kind that is not an invite', async () => {
+    await recordAction(
+      db,
+      {
+        workspaceId: WORKSPACE_ID,
+        kind: 'dm',
+        targetRef: 'https://www.linkedin.com/in/dm/',
+        status: 'sent',
+        source: 'export'
+      },
+      new Date(NOW.getTime() - 40 * 86_400_000)
+    );
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW)).toEqual([]);
+  });
+
+  it('does not re-propose an invite that already has a live withdrawal', async () => {
+    await pendingInvite('maya', 40);
+    const first = await selectWithdrawalCandidates(db, SEAT, NOW);
+    await enqueueWithdrawals(db, SEAT, first, NOW);
+
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW)).toEqual([]);
+  });
+
+  it('re-proposes one whose withdrawal definitely failed', async () => {
+    await pendingInvite('maya', 40);
+    const { ids } = await enqueueWithdrawals(
+      db,
+      SEAT,
+      await selectWithdrawalCandidates(db, SEAT, NOW),
+      NOW
+    );
+    await db.prepare("UPDATE linkedin_withdrawals SET status='failed' WHERE id=?").run(ids[0]);
+
+    expect(await selectWithdrawalCandidates(db, SEAT, NOW)).toHaveLength(1);
+  });
+});
+
+describe('enqueueWithdrawals', () => {
+  it('queues one row per invite and reports a re-run as duplicates', async () => {
+    await pendingInvite('a', 40);
+    await pendingInvite('b', 40);
+    const candidates = await selectWithdrawalCandidates(db, SEAT, NOW);
+
+    const first = await enqueueWithdrawals(db, SEAT, candidates, NOW);
+    expect(first).toMatchObject({ queued: 2, duplicates: 0 });
+
+    // The database is what enforces this, not the sweep remembering.
+    const second = await enqueueWithdrawals(db, SEAT, candidates, NOW);
+    expect(second).toMatchObject({ queued: 0, duplicates: 2 });
+
+    const total = await db
+      .prepare('SELECT COUNT(*)::int AS total FROM linkedin_withdrawals WHERE workspace_id=?')
+      .get<{ total: number }>(WORKSPACE_ID);
+    expect(total?.total).toBe(2);
+  });
+
+  it('freezes the age at enqueue time', async () => {
+    await pendingInvite('maya', 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const row = await db
+      .prepare('SELECT pending_days FROM linkedin_withdrawals WHERE workspace_id=? LIMIT 1')
+      .get<{ pending_days: number }>(WORKSPACE_ID);
+    expect(row?.pending_days).toBe(40);
+  });
+});
+
+describe('sweepStaleInvites', () => {
+  it('finds and queues in one call, and touches no browser', async () => {
+    await pendingInvite('a', 40);
+    await pendingInvite('b', 2);
+
+    const result = await sweepStaleInvites(db, SEAT, NOW);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.queued).toBe(1);
+    expect(await statusOf(result.candidates[0].actionId)).toBe('sent');
+  });
+});
+
+describe('claimNextWithdrawal', () => {
+  it('hands out the oldest queued row and marks it claimed', async () => {
+    await pendingInvite('older', 60);
+    await pendingInvite('newer', 30);
+    await sweepStaleInvites(db, SEAT, NOW);
+
+    const first = await claimNextWithdrawal(db, SEAT, 'lbatch_1', NOW);
+    expect(first?.targetRef).toBe('https://www.linkedin.com/in/older/');
+    expect((await withdrawalRow(first!.id))?.claimed_at).toBeTruthy();
+
+    const second = await claimNextWithdrawal(db, SEAT, 'lbatch_1', NOW);
+    expect(second?.targetRef).toBe('https://www.linkedin.com/in/newer/');
+    expect(await claimNextWithdrawal(db, SEAT, 'lbatch_1', NOW)).toBeNull();
+  });
+
+  it('never hands out a row that is already claimed', async () => {
+    await pendingInvite('maya', 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    await claimNextWithdrawal(db, SEAT, 'lbatch_1', NOW);
+
+    expect(await claimNextWithdrawal(db, SEAT, 'lbatch_2', NOW)).toBeNull();
+  });
+});
+
+describe('markActionWithdrawn, and what the eighth status means to everything else', () => {
+  it('marks the invite and refuses to overwrite one that moved on', async () => {
+    const actionId = await pendingInvite('maya', 40);
+    expect(await markActionWithdrawn(db, SEAT, actionId)).toBe(true);
+    expect(await statusOf(actionId)).toBe(WITHDRAWN_STATUS);
+
+    // Idempotent, and non-destructive: a second call finds nothing to change.
+    expect(await markActionWithdrawn(db, SEAT, actionId)).toBe(false);
+
+    const accepted = await pendingInvite('sam', 40);
+    await db.prepare("UPDATE linkedin_actions SET status='accepted' WHERE id=?").run(accepted);
+    expect(await markActionWithdrawn(db, SEAT, accepted)).toBe(false);
+    expect(await statusOf(accepted)).toBe('accepted');
+  });
+
+  it('STILL consumes the rolling window -- withdrawing does not un-send', async () => {
+    const actionId = await pendingInvite('maya', 1);
+    expect(await countActionsInWindow(db, SEAT, 'invite', 24 * 7, NOW)).toBe(1);
+
+    await markActionWithdrawn(db, SEAT, actionId);
+    expect(await countActionsInWindow(db, SEAT, 'invite', 24 * 7, NOW)).toBe(1);
+  });
+
+  it('is NOT counted as a refusal by the acceptance rate', async () => {
+    // Reusing 'declined' would drive the rate toward zero and trip the very
+    // throttle this feature exists to clear. Nobody refused; nobody answered.
+    const withdrawn = await pendingInvite('ignored', 1);
+    const accepted = await pendingInvite('keen', 1);
+    await db.prepare("UPDATE linkedin_actions SET status='accepted' WHERE id=?").run(accepted);
+    await markActionWithdrawn(db, SEAT, withdrawn);
+
+    const rate = await acceptanceRate(db, SEAT, 7, NOW);
+    expect(rate).toMatchObject({ decided: 1, accepted: 1, rate: 1 });
+  });
+
+  it('keeps its claim on the target, so no campaign re-invites them', async () => {
+    const actionId = await pendingInvite('maya', 40);
+    await markActionWithdrawn(db, SEAT, actionId);
+
+    expect(await hasTarget(db, SEAT, 'invite', 'https://www.linkedin.com/in/maya/')).toBe(true);
+  });
+
+  it('takes the invite out of the pending count, which is the whole point', async () => {
+    const actionId = await pendingInvite('maya', 40);
+    expect(await countPendingInvites(db, SEAT)).toBe(1);
+    await markActionWithdrawn(db, SEAT, actionId);
+    expect(await countPendingInvites(db, SEAT)).toBe(0);
+  });
+});
+
+describe('evaluateWithdrawalSafety', () => {
+  it("derives the daily ceiling from the seat's own invite band", () => {
+    expect(withdrawalCeilingFor('steady')).toBe(LINKEDIN_LIMITS.invite.steady.perDay);
+    expect(withdrawalCeilingFor('warmup')).toBe(LINKEDIN_LIMITS.invite.warmup.perDay);
+    expect(withdrawalCeilingFor('cooldown')).toBe(LINKEDIN_LIMITS.invite.warmup.perDay);
+    expect(withdrawalCeilingFor(null)).toBe(LINKEDIN_LIMITS.invite.warmup.perDay);
+  });
+
+  it('allows a withdrawal on a healthy seat', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SEAT,
+      { actionId, targetRef: 'https://www.linkedin.com/in/maya/' },
+      NOW
+    );
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.gate.allowed).toBe(true);
+  });
+
+  it('does not fail duplicate-target on the very invite it is withdrawing', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SEAT,
+      { actionId, targetRef: 'https://www.linkedin.com/in/maya/' },
+      NOW
+    );
+    expect(verdict.gate.checks.find((entry) => entry.check === 'duplicate-target')?.passed).toBe(
+      true
+    );
+  });
+
+  it('refuses when the seat is paused, and says which check said so', async () => {
+    await steadySeat();
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'paused' }, NOW);
+    const actionId = await pendingInvite('maya', 40);
+
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SEAT,
+      { actionId, targetRef: 'https://www.linkedin.com/in/maya/' },
+      NOW
+    );
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toContain('seat-paused');
+  });
+
+  it('refuses outside business hours, because a withdrawal is still activity', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const midnight = new Date('2026-08-04T02:00:00.000Z');
+
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SEAT,
+      { actionId, targetRef: 'https://www.linkedin.com/in/maya/' },
+      midnight
+    );
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toContain('business-hours');
+  });
+
+  it('refuses once the withdrawal ceiling is used up, which the gate cannot see', async () => {
+    // A withdrawal is not logged as an invite, so `rolling-24h` never counts
+    // it: four hundred of them would each pass the gate individually while
+    // collectively being the surge. This second number is what stops that.
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const ceiling = LINKEDIN_LIMITS.invite.steady.perDay;
+    for (let index = 0; index < ceiling; index += 1) {
+      await db
+        .prepare(
+          `INSERT INTO linkedin_withdrawals (id, workspace_id, seat_key, action_id, target_ref, status, finished_at)
+           VALUES (?,?,?,?,?, 'withdrawn', ?)`
+        )
+        .run(
+          `lwd_seed_${index}`,
+          WORKSPACE_ID,
+          OWNER_SEAT_KEY,
+          `seed_${index}`,
+          `seed-${index}`,
+          NOW.toISOString()
+        );
+    }
+
+    expect(await withdrawalsInWindow(db, SEAT, 24, NOW)).toBe(ceiling);
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SEAT,
+      { actionId, targetRef: 'https://www.linkedin.com/in/maya/' },
+      NOW
+    );
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toContain('withdrawal-daily-ceiling');
+    expect(verdict.gate.allowed).toBe(true);
+  });
+});
+
+describe('executeWithdrawal', () => {
+  async function claimOne(): Promise<ClaimedWithdrawal> {
+    await sweepStaleInvites(db, SEAT, NOW);
+    const claimed = await claimNextWithdrawal(db, SEAT, 'lbatch_1', NOW);
+    if (!claimed) throw new Error('nothing was queued');
+    return claimed;
+  }
+
+  it('holds unapproved withdrawals, releases the claim, and clicks only after exact approval', async () => {
+    await steadySeat();
+    await pendingInvite('owner-review', 40);
+    await db.prepare('DELETE FROM workspace_policies WHERE workspace_id=?').run(WORKSPACE_ID);
+    const claimed = await claimOne();
+    const review = (await reviewWithdrawal(db, WORKSPACE_ID, claimed.id))!;
+    expect(review.policy.effect).toBe('require_approval');
+    expect(
+      (await listPendingWithdrawalReviews(db, WORKSPACE_ID)).map((row) => row.withdrawalId)
+    ).toContain(claimed.id);
+    const { driver, targets } = fakeDriver();
+    const blocked = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+    expect(blocked).toMatchObject({
+      status: 'queued',
+      blocked: true,
+      withdrawn: false,
+      halt: false
+    });
+    expect(targets).toEqual([]);
+    const claim = await db
+      .prepare('SELECT claimed_at FROM linkedin_withdrawals WHERE id=?')
+      .get<{ claimed_at: string | null }>(claimed.id);
+    expect(claim?.claimed_at).toBeNull();
+    await expect(
+      approveWithdrawal(db, WORKSPACE_ID, claimed.id, '0'.repeat(64), 'owner', NOW)
+    ).rejects.toThrow('changed');
+    await approveWithdrawal(db, WORKSPACE_ID, claimed.id, review.contentHash, 'owner', NOW);
+    const again = await claimNextWithdrawal(db, SEAT, 'lbatch_2', NOW);
+    expect(again?.id).toBe(claimed.id);
+    const sent = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      again!,
+      NOW
+    );
+    expect(sent.withdrawn).toBe(true);
+    expect(targets).toEqual([claimed.targetRef]);
+    const events = await db
+      .prepare(
+        'SELECT decision FROM linkedin_withdrawal_policy_events WHERE workspace_id=? AND withdrawal_id=?'
+      )
+      .all<{ decision: string }>(WORKSPACE_ID, claimed.id);
+    expect(events.map((row) => row.decision).sort()).toEqual(
+      ['held', 'approved', 'allowed'].sort()
+    );
+  });
+
+  it('revoking workspace permission blocks an already-approved withdrawal', async () => {
+    await steadySeat();
+    await pendingInvite('revoked', 40);
+    const claimed = await claimOne();
+    await releaseWithdrawalClaim(db, claimed.id, WORKSPACE_ID);
+    await db.prepare('DELETE FROM workspace_policies WHERE workspace_id=?').run(WORKSPACE_ID);
+    const review = (await reviewWithdrawal(db, WORKSPACE_ID, claimed.id))!;
+    await approveWithdrawal(db, WORKSPACE_ID, claimed.id, review.contentHash, 'owner', NOW);
+    await db
+      .prepare(
+        `INSERT INTO workspace_policies(
+       id,workspace_id,name,priority,action_pattern,effect,conditions_json,enabled,created_at,updated_at)
+       VALUES ('pol_withdraw_deny',?,'Deny withdrawals',100,'action:linkedin.withdraw',
+         'deny','{}'::jsonb,TRUE,?::timestamptz,?::timestamptz)`
+      )
+      .run(WORKSPACE_ID, NOW.toISOString(), NOW.toISOString());
+    const again = await claimNextWithdrawal(db, SEAT, 'lbatch_2', NOW);
+    const { driver, targets } = fakeDriver();
+    const result = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      again!,
+      NOW
+    );
+    expect(result).toMatchObject({ status: 'queued', blocked: true, withdrawn: false });
+    expect(targets).toEqual([]);
+    expect(await reviewWithdrawal(db, 'another_workspace', claimed.id)).toBeNull();
+    await expect(
+      approveWithdrawal(db, 'another_workspace', claimed.id, review.contentHash, 'other', NOW)
+    ).rejects.toThrow('no longer awaiting');
+  });
+
+  it('shows pending reviews past 200 earlier stale queue entries', async () => {
+    await steadySeat();
+    await pendingInvite('after-200', 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    await db
+      .prepare(
+        `INSERT INTO linkedin_withdrawals(
+        id,workspace_id,seat_key,action_id,target_ref,status,pending_days,queued_at)
+       SELECT 'lwd_stale_paging_'||i,?, 'owner','missing_action_'||i,
+          'missing_target_'||i,'queued',40,?::timestamptz + interval '1 minute'
+       FROM generate_series(1,205) AS i`
+      )
+      .run(WORKSPACE_ID, NOW.toISOString());
+    await db.prepare('DELETE FROM workspace_policies WHERE workspace_id=?').run(WORKSPACE_ID);
+    const reviews = await listPendingWithdrawalReviews(db, WORKSPACE_ID);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.targetRef).toBe('https://www.linkedin.com/in/after-200/');
+  });
+
+  it('withdraws, marks the ledger, and settles the queue row', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver, targets } = fakeDriver();
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'withdrawn', withdrawn: true, halt: false });
+    expect(targets).toEqual(['https://www.linkedin.com/in/maya/']);
+    expect(await statusOf(actionId)).toBe(WITHDRAWN_STATUS);
+    expect((await withdrawalRow(claimed.id))?.status).toBe('withdrawn');
+  });
+
+  it('NEVER TOUCHES AN INVITE THE LEDGER SAYS WAS ACCEPTED', async () => {
+    // Rule 3, first layer. The queue row was written before the acceptance was
+    // known, and a stale queue must not produce a destructive action.
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    await db.prepare("UPDATE linkedin_actions SET status='accepted' WHERE id=?").run(actionId);
+    const { driver, targets } = fakeDriver();
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome.status).toBe('stale');
+    expect(targets).toEqual([]);
+    expect(await statusOf(actionId)).toBe('accepted');
+  });
+
+  it('treats "no longer on the live list" as stale and leaves the ledger alone', async () => {
+    // Rule 3, second layer: the driver looked, the entry was gone, and
+    // accepted / declined / expired are indistinguishable from there.
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'already_connected',
+      detail: 'no entry'
+    }));
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'stale', halt: false, withdrawn: false });
+    expect(await statusOf(actionId)).toBe('sent');
+    expect((await withdrawalRow(claimed.id))?.status).toBe('stale');
+  });
+
+  it('runs the gate before the driver, and clicks nothing when it refuses', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver, targets } = fakeDriver();
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => refused('seat-paused: Seat is paused.') },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'queued', blocked: true, halt: false });
+    expect(targets).toEqual([]);
+    expect(await statusOf(actionId)).toBe('sent');
+    // Released, so a later pass can pick it up once the seat is resumed.
+    const row = await withdrawalRow(claimed.id);
+    expect(row?.status).toBe('queued');
+    expect(row?.claimed_at).toBeNull();
+  });
+
+  it('treats a gate that could not be evaluated as a refusal, not a pass', async () => {
+    await steadySeat();
+    await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver, targets } = fakeDriver();
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      {
+        driver,
+        page,
+        evaluate: async () => {
+          throw new Error('database went away');
+        }
+      },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ blocked: true, halt: true });
+    expect(targets).toEqual([]);
+  });
+
+  it('releases and halts on a limit wall, and asks for cooldown', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'limit_wall',
+      detail: 'a wall'
+    }));
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'failed', halt: true, cooldown: true });
+    expect(await statusOf(actionId)).toBe('sent');
+    expect((await withdrawalRow(claimed.id))?.claimed_at).toBeNull();
+  });
+
+  it('halts on selector drift without touching the ledger', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'selector_drift',
+      detail: 'no button'
+    }));
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'failed', halt: true, cooldown: false });
+    expect(await statusOf(actionId)).toBe('sent');
+  });
+
+  it('HOLDS its claim on an unknown outcome rather than deciding either way', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('maya', 40);
+    const claimed = await claimOne();
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'unknown',
+      detail: 'dialog still open'
+    }));
+
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed,
+      NOW
+    );
+
+    expect(outcome).toMatchObject({ status: 'held', halt: true });
+    expect(await statusOf(actionId)).toBe('sent');
+    const row = await withdrawalRow(claimed.id);
+    expect(row?.status).toBe('held');
+    // The claim is the hold: nothing hands this row out again.
+    expect(row?.claimed_at).toBeTruthy();
+    expect(await claimNextWithdrawal(db, SEAT, 'lbatch_2', NOW)).toBeNull();
+  });
+});
+
+describe('runWithdrawalBatch', () => {
+  function batchDeps(overrides: Record<string, unknown> = {}) {
+    const slept: number[] = [];
+    const { driver, targets } = fakeDriver();
+    return {
+      slept,
+      targets,
+      deps: {
+        driver,
+        page,
+        batchId: 'lbatch_fixed',
+        evaluate: async () => allowed(),
+        now: () => NOW,
+        sleep: async (ms: number) => {
+          slept.push(ms);
+        },
+        ...overrides
+      }
+    };
+  }
+
+  it('does not reclaim a held withdrawal and still executes the approved next withdrawal', async () => {
+    await steadySeat();
+    await db.prepare('DELETE FROM workspace_policies WHERE workspace_id=?').run(WORKSPACE_ID);
+    await pendingInvite('first-hold', 40);
+    await pendingInvite('second-approved', 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const pending = await listPendingWithdrawalReviews(db, WORKSPACE_ID);
+    const approved = pending.find((row) => row.targetRef.includes('second-approved'))!;
+    await approveWithdrawal(
+      db,
+      WORKSPACE_ID,
+      approved.withdrawalId,
+      approved.contentHash,
+      'owner',
+      NOW
+    );
+    const { deps, targets } = batchDeps();
+    const result = await runWithdrawalBatch(db, SEAT, deps);
+    expect(result).toMatchObject({ withdrawn: 1, blocked: 1, halted: false });
+    expect(targets).toEqual(['https://www.linkedin.com/in/second-approved/']);
+    const stillQueued = await listPendingWithdrawalReviews(db, WORKSPACE_ID);
+    expect(stillQueued.map((row) => row.targetRef)).toContain(
+      'https://www.linkedin.com/in/first-hold/'
+    );
+  });
+
+  it('PACES THE QUEUE -- a gap between every withdrawal but the first', async () => {
+    // Withdrawal actions use the same queue rhythm as other LinkedIn writes.
+    // The gap is the whole reason this loop exists.
+    await steadySeat();
+    for (const handle of ['a', 'b', 'c']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const { deps, slept, targets } = batchDeps();
+
+    const result = await runWithdrawalBatch(db, SEAT, deps);
+
+    expect(result.withdrawn).toBe(3);
+    expect(targets).toHaveLength(3);
+    expect(slept).toHaveLength(2);
+    for (const ms of slept) {
+      expect(ms).toBeGreaterThanOrEqual(120_000);
+      expect(ms).toBeLessThanOrEqual(180_000);
+    }
+  });
+
+  it('draws the same gaps for the same batch and rows on any machine', async () => {
+    // The seed is (batch id, withdrawal row id), exactly as the invite worker
+    // seeds on (batch id, action id). Replaying the same pass over the same
+    // rows must produce the same rhythm -- which is what makes the pacing
+    // assertable rather than merely hoped for.
+    await steadySeat();
+    for (const handle of ['a', 'b']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const first = batchDeps();
+    await runWithdrawalBatch(db, SEAT, first.deps);
+
+    await db
+      .prepare(
+        "UPDATE linkedin_withdrawals SET status='queued', claimed_at=NULL, finished_at=NULL WHERE workspace_id=?"
+      )
+      .run(WORKSPACE_ID);
+    await db
+      .prepare("UPDATE linkedin_actions SET status='sent' WHERE workspace_id=?")
+      .run(WORKSPACE_ID);
+    const second = batchDeps();
+    await runWithdrawalBatch(db, SEAT, second.deps);
+
+    expect(first.slept).toHaveLength(1);
+    expect(first.slept).toEqual(second.slept);
+  });
+
+  it('honours its own bound on one pass', async () => {
+    await steadySeat();
+    for (const handle of ['a', 'b', 'c', 'd']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const { deps, targets } = batchDeps({ maxActions: 2 });
+
+    expect((await runWithdrawalBatch(db, SEAT, deps)).withdrawn).toBe(2);
+    expect(targets).toHaveLength(2);
+  });
+
+  it('refuses to open on a paused seat, and on a cooling one', async () => {
+    await steadySeat();
+    await pendingInvite('maya', 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'paused' }, NOW);
+    const paused = batchDeps();
+    expect(await runWithdrawalBatch(db, SEAT, paused.deps)).toMatchObject({
+      halted: true,
+      withdrawn: 0
+    });
+    expect(paused.targets).toEqual([]);
+
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'cooldown' }, NOW);
+    const cooling = batchDeps();
+    const result = await runWithdrawalBatch(db, SEAT, cooling.deps);
+    expect(result.halted).toBe(true);
+    expect(result.haltReason).toContain('cooldown');
+    expect(cooling.targets).toEqual([]);
+  });
+
+  it('refuses when no seat is configured at all', async () => {
+    const { deps } = batchDeps();
+    expect(await runWithdrawalBatch(db, SEAT, deps)).toMatchObject({
+      halted: true,
+      haltReason: expect.stringContaining('No LinkedIn seat')
+    });
+  });
+
+  it('stops between actions when a stop is requested', async () => {
+    await steadySeat();
+    for (const handle of ['a', 'b']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const { deps, targets } = batchDeps({ stopRequested: async () => true });
+
+    const result = await runWithdrawalBatch(db, SEAT, deps);
+    expect(result).toMatchObject({ halted: true, withdrawn: 0 });
+    expect(targets).toEqual([]);
+  });
+
+  it('puts the seat into cooldown when LinkedIn says stop, and ends the pass', async () => {
+    await steadySeat();
+    for (const handle of ['a', 'b']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'limit_wall',
+      detail: 'a wall'
+    }));
+    const { deps } = batchDeps({ driver });
+
+    const result = await runWithdrawalBatch(db, SEAT, deps);
+
+    expect(result).toMatchObject({ halted: true, failed: 1, withdrawn: 0 });
+    expect((await getSeat(db, WORKSPACE_ID))?.posture).toBe('cooldown');
+  });
+
+  it('keeps going past a stale row -- nothing was clicked, nothing is wrong', async () => {
+    await steadySeat();
+    for (const handle of ['a', 'b']) await pendingInvite(handle, 40);
+    await sweepStaleInvites(db, SEAT, NOW);
+    const { driver } = fakeDriver((_target, index) =>
+      index === 0 ? { ok: false, failureKind: 'already_connected', detail: 'gone' } : okResult
+    );
+    const { deps } = batchDeps({ driver });
+
+    expect(await runWithdrawalBatch(db, SEAT, deps)).toMatchObject({
+      stale: 1,
+      withdrawn: 1,
+      halted: false
+    });
+  });
+
+  it('does nothing at all when the queue is empty', async () => {
+    await steadySeat();
+    const { deps, targets } = batchDeps();
+    expect(await runWithdrawalBatch(db, SEAT, deps)).toMatchObject({ withdrawn: 0, halted: false });
+    expect(targets).toEqual([]);
+  });
+});
+
+/**
+ * EVERY POSTURE READ AND EVERY COOLDOWN WRITE IS PER SEAT.
+ *
+ * `getSeatPosture` and `upsertSeat` both default their last argument to the
+ * OWNER seat, and this module omitted it in four places. A workspace with one
+ * account never noticed; a workspace with two got the two worst possible
+ * behaviours at once -- a paused or cooling secondary that kept withdrawing on
+ * the owner's say-so, and a limit wall on the secondary that put the OWNER into
+ * cooldown, stopping the account that was behaving and leaving the restricted
+ * one running.
+ */
+describe('a withdrawal pass is bound to its own account', () => {
+  const SALES: SeatRef = { workspaceId: WORKSPACE_ID, seatKey: 'sales' };
+
+  function batchDeps(overrides: Record<string, unknown> = {}) {
+    const { driver, targets } = fakeDriver();
+    return {
+      targets,
+      deps: {
+        driver,
+        page,
+        batchId: 'lbatch_seat',
+        evaluate: async () => allowed(),
+        now: () => NOW,
+        sleep: async () => {},
+        ...overrides
+      }
+    };
+  }
+
+  async function salesInvite(handle: string, daysAgo: number): Promise<string> {
+    const at = new Date(NOW.getTime() - daysAgo * 86_400_000);
+    const { id } = await recordAction(
+      db,
+      {
+        workspaceId: WORKSPACE_ID,
+        seatKey: 'sales',
+        kind: 'invite',
+        targetRef: `https://www.linkedin.com/in/${handle}/`,
+        status: 'sent',
+        source: 'export'
+      },
+      at
+    );
+    return id;
+  }
+
+  beforeEach(async () => {
+    await steadySeat();
+    await upsertSeat(
+      db,
+      WORKSPACE_ID,
+      { label: 'Sales seat', timezone: 'UTC' },
+      new Date('2026-01-01T09:00:00.000Z'),
+      'sales'
+    );
+  });
+
+  it('STOPS A PAUSED SECONDARY even while the owner seat is perfectly healthy', async () => {
+    await salesInvite('lead', 40);
+    await sweepStaleInvites(db, SALES, NOW);
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'paused' }, NOW, 'sales');
+
+    const { deps, targets } = batchDeps();
+    const result = await runWithdrawalBatch(db, SALES, deps);
+
+    expect(result).toMatchObject({ halted: true, withdrawn: 0 });
+    expect(result.haltReason).toContain('paused');
+    expect(targets).toEqual([]);
+  });
+
+  it('is not stopped by the OWNER seat being paused', async () => {
+    await salesInvite('lead', 40);
+    await sweepStaleInvites(db, SALES, NOW);
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'paused' }, NOW);
+
+    // A restriction on one LinkedIn account says nothing about another, which
+    // is the entire reason an operator runs more than one.
+    const { deps, targets } = batchDeps();
+    expect(await runWithdrawalBatch(db, SALES, deps)).toMatchObject({
+      halted: false,
+      withdrawn: 1
+    });
+    expect(targets).toHaveLength(1);
+  });
+
+  it('COOLS THE SEAT THAT HIT THE WALL, and leaves the owner alone', async () => {
+    await salesInvite('lead', 40);
+    await sweepStaleInvites(db, SALES, NOW);
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'limit_wall',
+      detail: 'a wall'
+    }));
+
+    const result = await runWithdrawalBatch(db, SALES, batchDeps({ driver }).deps);
+
+    expect(result).toMatchObject({ halted: true, failed: 1, withdrawn: 0 });
+    expect((await getSeat(db, WORKSPACE_ID, 'sales'))?.posture).toBe('cooldown');
+    expect((await getSeat(db, WORKSPACE_ID))?.posture).not.toBe('cooldown');
+  });
+
+  it("reads its own posture for the withdrawal ceiling, not the owner's", async () => {
+    const actionId = await salesInvite('lead', 40);
+    // The owner is in cooldown; the sales seat is steady. The ceiling this
+    // verdict reports must be the sales seat's.
+    await upsertSeat(db, WORKSPACE_ID, { posture: 'cooldown' }, NOW);
+
+    const verdict = await evaluateWithdrawalSafety(
+      db,
+      SALES,
+      { actionId, targetRef: 'https://www.linkedin.com/in/lead/' },
+      NOW
+    );
+    expect(verdict.dailyCeiling).toBe(withdrawalCeilingFor('steady'));
+  });
+});
+
+/**
+ * THE BATCHED SYNC AND THE BATCHED ENQUEUE, ASSERTED AGAINST THE LOOPS THEY
+ * REPLACED.
+ *
+ * `syncPendingInvites` ran one UPDATE per listed invite -- up to 500 per seat
+ * per sync -- and `enqueueWithdrawals` ran one INSERT per candidate. Both are
+ * now single statements. These pin the counting rules, because a count is
+ * exactly what a set-based rewrite is most likely to change: the old loop
+ * counted PER LIST ENTRY (`updated.changes > 0`), and a naive
+ * `UPDATE ... FROM unnest` would count per ROW instead.
+ */
+describe('the batched pending-invite sync', () => {
+  it('counts one match per list entry when two entries name the same person', async () => {
+    // LinkedIn occasionally lists a profile twice. The loop matched on both
+    // entries -- the second UPDATE hit the same row and still reported a
+    // change -- and the batched form has to agree, which is why the match set
+    // is computed per ENTRY and the rows are updated once each.
+    const actionId = await pendingInvite('maya', 30);
+    const entry = {
+      profileUrl: 'https://www.linkedin.com/in/maya/',
+      name: null,
+      sentAt: '2026-07-01T09:00:00.000Z'
+    };
+    const result = await syncPendingInvites(db, SEAT, list([entry, entry]), NOW);
+
+    expect(result).toMatchObject({ listed: 2, matched: 2, unmatched: 0 });
+    const row = await db
+      .prepare('SELECT pending_since FROM linkedin_actions WHERE id=?')
+      .get<{ pending_since: string }>(actionId);
+    expect(new Date(row!.pending_since).toISOString()).toBe('2026-07-01T09:00:00.000Z');
+  });
+
+  it("takes the earliest entry's sentAt when two entries reach the same row", async () => {
+    // The loop's COALESCE meant the FIRST entry set `pending_since` and every
+    // later one was a no-op. DISTINCT ON ... ORDER BY entry reproduces that.
+    const actionId = await pendingInvite('maya', 30);
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([
+        {
+          profileUrl: 'https://www.linkedin.com/in/maya/',
+          name: null,
+          sentAt: '2026-07-01T09:00:00.000Z'
+        },
+        {
+          profileUrl: 'https://www.linkedin.com/in/maya',
+          name: null,
+          sentAt: '2026-07-20T09:00:00.000Z'
+        }
+      ]),
+      NOW
+    );
+    expect(result.matched).toBe(2);
+    const row = await db
+      .prepare('SELECT pending_since FROM linkedin_actions WHERE id=?')
+      .get<{ pending_since: string }>(actionId);
+    expect(new Date(row!.pending_since).toISOString()).toBe('2026-07-01T09:00:00.000Z');
+  });
+
+  it('separates matched from unmatched across a mixed page, and stamps every match', async () => {
+    const maya = await pendingInvite('maya', 30);
+    const jonas = await pendingInvite('jonas', 25);
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([
+        { profileUrl: 'https://www.linkedin.com/in/maya/', name: null, sentAt: null },
+        { profileUrl: 'https://www.linkedin.com/in/stranger/', name: null, sentAt: null },
+        { profileUrl: 'https://www.linkedin.com/in/jonas/', name: null, sentAt: null },
+        // Not a LinkedIn profile at all: `targetMatchKeys` returns nothing, so
+        // it can match nothing and is unmatched before any SQL runs.
+        { profileUrl: 'https://evil.example/steal', name: null, sentAt: null }
+      ]),
+      NOW
+    );
+
+    expect(result).toMatchObject({ listed: 4, matched: 2, unmatched: 2 });
+    const stamped = await db
+      .prepare(
+        'SELECT id FROM linkedin_actions WHERE workspace_id=? AND pending_seen_at IS NOT NULL ORDER BY id'
+      )
+      .all<{ id: string }>(WORKSPACE_ID);
+    expect(stamped.map((row) => row.id).sort()).toEqual([maya, jonas].sort());
+  });
+
+  it('still reports a disappearance only for rows it did not see THIS sync', async () => {
+    // The `disappeared` count reads `pending_seen_at < now`, so folding it into
+    // the same statement as the UPDATE would make it see the pre-update
+    // snapshot and report every invite LinkedIn had just shown us as gone.
+    const seen = await pendingInvite('maya', 30);
+    const unseen = await pendingInvite('jonas', 30);
+    await syncPendingInvites(
+      db,
+      SEAT,
+      list([
+        { profileUrl: 'https://www.linkedin.com/in/maya/', name: null, sentAt: null },
+        { profileUrl: 'https://www.linkedin.com/in/jonas/', name: null, sentAt: null }
+      ]),
+      NOW
+    );
+
+    const later = new Date(NOW.getTime() + 86_400_000);
+    const result = await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ profileUrl: 'https://www.linkedin.com/in/maya/', name: null, sentAt: null }]),
+      later
+    );
+    expect(result).toMatchObject({ matched: 1, disappeared: 1 });
+    expect(await statusOf(seen)).toBe('sent');
+    expect(await statusOf(unseen)).toBe('sent');
+  });
+
+  it('touches nothing and reports nothing for an empty list', async () => {
+    await pendingInvite('maya', 30);
+    const result = await syncPendingInvites(db, SEAT, list([]), NOW);
+    expect(result).toMatchObject({ listed: 0, matched: 0, unmatched: 0, disappeared: 0 });
+  });
+});
+
+describe('the batched withdrawal enqueue', () => {
+  it('queues every candidate in one statement and reports the ids in candidate order', async () => {
+    const ids = [
+      await pendingInvite('one', 30),
+      await pendingInvite('two', 30),
+      await pendingInvite('three', 30)
+    ];
+    const candidates = await selectWithdrawalCandidates(db, SEAT, NOW);
+    expect(candidates).toHaveLength(3);
+
+    const result = await enqueueWithdrawals(db, SEAT, candidates, NOW);
+    expect(result).toMatchObject({ queued: 3, duplicates: 0 });
+    expect(result.ids).toHaveLength(3);
+
+    const rows = await db
+      .prepare('SELECT action_id FROM linkedin_withdrawals WHERE workspace_id=? ORDER BY action_id')
+      .all<{ action_id: string }>(WORKSPACE_ID);
+    expect(rows.map((row) => row.action_id).sort()).toEqual([...ids].sort());
+  });
+
+  it('reports a re-run as duplicates rather than throwing, exactly as the loop did', async () => {
+    await pendingInvite('one', 30);
+    await pendingInvite('two', 30);
+    const candidates = await selectWithdrawalCandidates(db, SEAT, NOW);
+
+    expect(await enqueueWithdrawals(db, SEAT, candidates, NOW)).toMatchObject({
+      queued: 2,
+      duplicates: 0
+    });
+    // The partial unique index does the enforcing; a losing insert is a no-op.
+    expect(await enqueueWithdrawals(db, SEAT, candidates, NOW)).toMatchObject({
+      queued: 0,
+      duplicates: 2
+    });
+  });
+
+  it('handles one invite named twice inside a SINGLE batch', async () => {
+    // ON CONFLICT DO NOTHING tolerates an intra-statement collision where a DO
+    // UPDATE would raise; this is the case a multi-row insert introduces and
+    // the loop could not have.
+    await pendingInvite('one', 30);
+    const [candidate] = await selectWithdrawalCandidates(db, SEAT, NOW);
+    const result = await enqueueWithdrawals(db, SEAT, [candidate, candidate], NOW);
+    expect(result).toMatchObject({ queued: 1, duplicates: 1 });
+  });
+
+  it('is a no-op for an empty candidate list', async () => {
+    expect(await enqueueWithdrawals(db, SEAT, [], NOW)).toEqual({
+      queued: 0,
+      duplicates: 0,
+      ids: []
+    });
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Acceptance detection
+ *
+ * THE DISAMBIGUATION IS THE WHOLE SUBJECT. An invite that leaves LinkedIn's
+ * pending list was accepted, declined, expired or withdrawn, and the list says
+ * which of the four exactly never. Every test below is about the product
+ * telling those apart on EVIDENCE -- a connection degree read off the target's
+ * own profile -- and about it saying "unknown" whenever the evidence did not
+ * arrive, rather than guessing in the one place a guess changes what the pacing
+ * engine does next.
+ * ------------------------------------------------------------------------ */
+
+/** A profile the degree driver will answer for, keyed by target. */
+function fakeDegreeDriver(answers: Record<string, LinkedInDegreeRead | LinkedInDriverResult>) {
+  const opened: string[] = [];
+  const driver: LinkedInDegreeDriver = {
+    readProfileDegree: async (_page, target) => {
+      opened.push(target);
+      return (
+        answers[target] ?? {
+          ok: true as const,
+          profileUrl: target,
+          degree: null,
+          pending: false,
+          degraded: ['no answer was configured for this target']
+        }
+      );
+    }
+  };
+  return { driver, opened };
+}
+
+function degree(target: string, value: 1 | 2 | 3 | null, pending = false): LinkedInDegreeRead {
+  return { ok: true, profileUrl: target, degree: value, pending, degraded: [] };
+}
+
+const url = (handle: string) => `https://www.linkedin.com/in/${handle}/`;
+
+/**
+ * Put an invite in the exact state the detector cares about: seen on the
+ * pending list, then absent from a LATER complete sync.
+ */
+async function vanishedInvite(handle: string, daysAgo = 30): Promise<string> {
+  const actionId = await pendingInvite(handle, daysAgo);
+  // Seen pending five days ago...
+  await syncPendingInvites(
+    db,
+    SEAT,
+    list([{ profileUrl: url(handle), name: null, sentAt: null }]),
+    new Date(NOW.getTime() - 5 * 86_400_000)
+  );
+  // ...and gone from today's complete read.
+  await syncPendingInvites(db, SEAT, list([]), NOW);
+  return actionId;
+}
+
+function allowedGate(): LinkedInSafetyVerdict {
+  return {
+    allowed: true,
+    reason: null,
+    checks: [],
+    automationMode: 'prepare-only',
+    automationReason: 'LinkedIn forbids unattended automation of its site.'
+  };
+}
+
+const detectorPage = {} as LinkedInPage;
+
+function connectionList(handles: string[], truncated = false): RecentConnectionList {
+  return {
+    ok: true,
+    connections: handles.map((handle) => ({ profileUrl: url(handle), name: handle })),
+    truncated,
+    degraded: []
+  };
+}
+
+describe('acceptance read off the connections list', () => {
+  beforeEach(async () => {
+    await steadySeat();
+  });
+
+  it('accepts the invites the connections list proves, and spends no profile view doing it', async () => {
+    const acceptedId = await pendingInvite('said-yes', 3);
+    const waitingId = await pendingInvite('still-thinking', 3);
+
+    const result = await syncAcceptedConnections(
+      db,
+      SEAT,
+      // A stranger this seat connected with outside Trevra is on the page too,
+      // and must not invent a ledger row.
+      connectionList(['said-yes', 'someone-we-never-invited']),
+      NOW
+    );
+
+    expect(result).toMatchObject({ listed: 2, matched: 1, accepted: 1, unchanged: 0 });
+    expect(await statusOf(acceptedId)).toBe('accepted');
+    // ABSENCE PROVES NOTHING. This list is the recent prefix of a network, so an
+    // invite that is not on it is still awaiting an answer, never declined.
+    expect(await statusOf(waitingId)).toBe('sent');
+
+    const row = await db
+      .prepare(
+        'SELECT accepted_source, recorded_at, acceptance_checked_at FROM linkedin_actions WHERE id=?'
+      )
+      .get<{
+        accepted_source: string;
+        recorded_at: string;
+        acceptance_checked_at: string | null;
+      }>(acceptedId);
+    expect(row?.accepted_source).toBe('detected');
+    // The invite keeps the day it was SENT, so it is not re-charged to today's
+    // rolling budgets -- the same rule `recordDetectedAcceptance` states.
+    expect(new Date(row!.recorded_at).getTime()).toBe(NOW.getTime() - 3 * 86_400_000);
+    // No profile was opened, so no view was spent and none is claimed.
+    expect(row?.acceptance_checked_at).toBeNull();
+  });
+
+  it('matches a ledger target however it was spelled', async () => {
+    const bare = await recordAction(
+      db,
+      {
+        workspaceId: WORKSPACE_ID,
+        kind: 'invite',
+        // What a CSV or a human actually supplies. Trevra never resolves it.
+        targetRef: 'in/typed-by-hand',
+        status: 'sent',
+        source: 'export'
+      },
+      NOW
+    );
+
+    const result = await syncAcceptedConnections(db, SEAT, connectionList(['typed-by-hand']), NOW);
+
+    expect(result).toMatchObject({ matched: 1, accepted: 1 });
+    expect(await statusOf(bare.id)).toBe('accepted');
+  });
+
+  it('never walks a decided invite backwards and never outranks a human', async () => {
+    const repliedId = await pendingInvite('already-replied', 10);
+    await ingestOutcome(
+      db,
+      { workspaceId: WORKSPACE_ID, actionId: repliedId, outcome: 'replied' },
+      NOW
+    );
+    const humanId = await pendingInvite('human-ruled', 10);
+    await ingestOutcome(
+      db,
+      { workspaceId: WORKSPACE_ID, actionId: humanId, outcome: 'accepted' },
+      NOW
+    );
+
+    const result = await syncAcceptedConnections(
+      db,
+      SEAT,
+      connectionList(['already-replied', 'human-ruled']),
+      new Date(NOW.getTime() + 3_600_000)
+    );
+
+    // Neither row is even a candidate: one has moved on, the other carries a
+    // person's mark. The pass reports two names and no writes.
+    expect(result).toMatchObject({ listed: 2, matched: 0, accepted: 0, unchanged: 0 });
+    expect(await statusOf(repliedId)).toBe('replied');
+    const row = await db
+      .prepare('SELECT accepted_source FROM linkedin_actions WHERE id=?')
+      .get<{ accepted_source: string }>(humanId);
+    expect(row?.accepted_source).toBe('human');
+  });
+
+  it('is bound to one account: another seat’s invite is not this seat’s acceptance', async () => {
+    const otherSeat = await recordAction(
+      db,
+      {
+        workspaceId: WORKSPACE_ID,
+        seatKey: 'second-account',
+        kind: 'invite',
+        targetRef: url('their-invite'),
+        status: 'sent',
+        source: 'export'
+      },
+      NOW
+    );
+
+    const result = await syncAcceptedConnections(db, SEAT, connectionList(['their-invite']), NOW);
+
+    expect(result).toMatchObject({ listed: 1, matched: 0, accepted: 0 });
+    expect(await statusOf(otherSeat.id)).toBe('sent');
+  });
+
+  it('carries the truncation through, because a prefix is not the whole network', async () => {
+    const result = await syncAcceptedConnections(db, SEAT, connectionList(['a-name'], true), NOW);
+    expect(result.truncated).toBe(true);
+  });
+});
+
+describe('acceptance detection', () => {
+  beforeEach(async () => {
+    await steadySeat();
+  });
+
+  it('calls a 1st-degree profile accepted and leaves a 2nd-degree one unknown', async () => {
+    const acceptedId = await vanishedInvite('accepted-one');
+    const declinedId = await vanishedInvite('declined-one');
+    const { driver, opened } = fakeDegreeDriver({
+      [url('accepted-one')]: degree(url('accepted-one'), 1),
+      // Declined, expired or withdrawn by hand -- LinkedIn will not say which,
+      // and 2nd degree is compatible with all three.
+      [url('declined-one')]: degree(url('declined-one'), 2)
+    });
+
+    const result = await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    expect(opened).toHaveLength(2);
+    expect(result).toMatchObject({
+      checked: 2,
+      accepted: 1,
+      unknown: 1,
+      stillPending: 0,
+      blocked: 0,
+      halted: false
+    });
+    expect(await statusOf(acceptedId)).toBe('accepted');
+    // THE UNKNOWN CASE. Not 'declined', not 'withdrawn', not accepted: the
+    // status it already had, because nobody found out.
+    expect(await statusOf(declinedId)).toBe('sent');
+  });
+
+  it('treats an unreadable badge as unknown rather than as a non-acceptance', async () => {
+    const actionId = await vanishedInvite('mystery');
+    const { driver } = fakeDegreeDriver({
+      // A localised or redesigned badge: the read succeeded, the parse did not.
+      [url('mystery')]: {
+        ok: true,
+        profileUrl: url('mystery'),
+        degree: null,
+        pending: false,
+        degraded: ['badge read "1er"']
+      }
+    });
+
+    const result = await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    expect(result).toMatchObject({ checked: 1, accepted: 0, unknown: 1 });
+    expect(await statusOf(actionId)).toBe('sent');
+    const row = await db
+      .prepare('SELECT accepted_source, acceptance_checked_at FROM linkedin_actions WHERE id=?')
+      .get<{ accepted_source: string | null; acceptance_checked_at: string | null }>(actionId);
+    expect(row?.accepted_source).toBeNull();
+    // The page view was spent, so it is recorded and the invite is not re-read
+    // on every tick from now until the heat death of the campaign.
+    expect(row?.acceptance_checked_at).toBeTruthy();
+  });
+
+  it('re-files a still-pending invite as pending instead of deciding it', async () => {
+    const actionId = await vanishedInvite('slow-poke');
+    const { driver } = fakeDegreeDriver({ [url('slow-poke')]: degree(url('slow-poke'), 2, true) });
+
+    const result = await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    expect(result).toMatchObject({ checked: 1, stillPending: 1, accepted: 0, unknown: 0 });
+    expect(await statusOf(actionId)).toBe('sent');
+    // The list read was stale, not the invite decided, so the evidence is
+    // refreshed and the staleness clock starts again from today.
+    const row = await db
+      .prepare('SELECT pending_seen_at FROM linkedin_actions WHERE id=?')
+      .get<{ pending_seen_at: string }>(actionId);
+    expect(new Date(row!.pending_seen_at).getTime()).toBe(NOW.getTime());
+  });
+
+  it('records the provenance of a detection, and a human mark outranks it', async () => {
+    const actionId = await vanishedInvite('provenance');
+    const { driver } = fakeDegreeDriver({ [url('provenance')]: degree(url('provenance'), 1) });
+    await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    let row = await db
+      .prepare('SELECT status, accepted_source, accepted_at FROM linkedin_actions WHERE id=?')
+      .get<{ status: string; accepted_source: string; accepted_at: string }>(actionId);
+    expect(row).toMatchObject({ status: 'accepted', accepted_source: 'detected' });
+    const detectedAt = new Date(row!.accepted_at).toISOString();
+
+    // A person then confirms it by hand through the one sanctioned route.
+    await ingestOutcome(
+      db,
+      { workspaceId: WORKSPACE_ID, actionId, outcome: 'accepted' },
+      new Date(NOW.getTime() + 3_600_000)
+    );
+    row = await db
+      .prepare('SELECT status, accepted_source, accepted_at FROM linkedin_actions WHERE id=?')
+      .get<{ status: string; accepted_source: string; accepted_at: string }>(actionId);
+    // The SOURCE becomes the human's; the DATE stays at the earliest evidence,
+    // which is when the acceptance was actually established rather than when
+    // somebody got round to clicking.
+    expect(row?.accepted_source).toBe('human');
+    expect(new Date(row!.accepted_at).toISOString()).toBe(detectedAt);
+  });
+
+  it('refuses to overwrite a human ruling with a detection', async () => {
+    const actionId = await vanishedInvite('already-judged');
+    // A person reported a reply -- strictly more information than a badge.
+    await ingestOutcome(db, { workspaceId: WORKSPACE_ID, actionId, outcome: 'replied' }, NOW);
+
+    const written = await recordDetectedAcceptance(
+      db,
+      { workspaceId: WORKSPACE_ID, actionId },
+      NOW
+    );
+    expect(written.applied).toBe(false);
+    expect(await statusOf(actionId)).toBe('replied');
+
+    // And the direct writer refuses it too, so the rule does not depend on the
+    // wrapper having asked first.
+    await expect(
+      writeActionStatus(
+        db,
+        { workspaceId: WORKSPACE_ID, actionId, status: 'accepted', via: 'acceptance-detector' },
+        NOW
+      )
+    ).rejects.toThrow(/no longer an undecided invite/);
+  });
+
+  it('refuses every status but accepted from the detector', async () => {
+    const actionId = await vanishedInvite('scope');
+    for (const status of ['sent', 'replied'] as const) {
+      await expect(
+        writeActionStatus(
+          db,
+          { workspaceId: WORKSPACE_ID, actionId, status, via: 'acceptance-detector' },
+          NOW
+        )
+      ).rejects.toThrow(/Trevra plans and approves/);
+    }
+  });
+
+  it('does not move the invite recorded_at, so an old invite keeps its budget day', async () => {
+    const actionId = await vanishedInvite('old-invite', 40);
+    const before = await db
+      .prepare('SELECT recorded_at FROM linkedin_actions WHERE id=?')
+      .get<{ recorded_at: string }>(actionId);
+    const { driver } = fakeDegreeDriver({ [url('old-invite')]: degree(url('old-invite'), 1) });
+    await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+    const after = await db
+      .prepare('SELECT recorded_at FROM linkedin_actions WHERE id=?')
+      .get<{ recorded_at: string }>(actionId);
+    // Forty days ago is when it was sent, and every rolling window reads this
+    // column. An acceptance today must not bill today's invite budget.
+    expect(new Date(after!.recorded_at).getTime()).toBe(new Date(before!.recorded_at).getTime());
+  });
+
+  it('makes the acceptance rate non-zero end to end, with no human anywhere', async () => {
+    await vanishedInvite('yes-one');
+    await vanishedInvite('yes-two');
+    await vanishedInvite('no-one');
+    const { driver } = fakeDegreeDriver({
+      [url('yes-one')]: degree(url('yes-one'), 1),
+      [url('yes-two')]: degree(url('yes-two'), 1),
+      [url('no-one')]: degree(url('no-one'), 3)
+    });
+
+    // Zero before -- the state every unattended campaign was stuck in.
+    expect((await acceptanceRate(db, SEAT, 90, NOW)).accepted).toBe(0);
+
+    await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    const rate = await acceptanceRate(db, SEAT, 90, NOW);
+    expect(rate.accepted).toBe(2);
+    expect(rate.decided).toBe(2);
+    // And the number an operator actually looks at, on the screen that shows it.
+    const analytics = await linkedinAnalytics(db, WORKSPACE_ID, null, NOW, {
+      seatKey: OWNER_SEAT_KEY
+    });
+    expect(analytics.invites.invitesAccepted).toBe(2);
+    expect(analytics.invites.invitesSent).toBe(3);
+    expect(analytics.invites.acceptanceRate).toBeCloseTo(2 / 3);
+  });
+
+  it('files a profile_view ledger row for every page it opens', async () => {
+    await vanishedInvite('viewed');
+    const { driver } = fakeDegreeDriver({ [url('viewed')]: degree(url('viewed'), 1) });
+    await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    // Reading a degree IS viewing the profile. If this row is missing the seat
+    // spends a view budget nothing charges it for.
+    const views = await db
+      .prepare(
+        `
+      SELECT source, status, target_ref FROM linkedin_actions WHERE workspace_id=? AND kind='profile_view'
+    `
+      )
+      .all<{ source: string; status: string; target_ref: string }>(WORKSPACE_ID);
+    expect(views).toHaveLength(1);
+    expect(views[0]).toMatchObject({ source: 'system', status: 'sent', target_ref: url('viewed') });
+    expect(await countActionsInWindow(db, SEAT, 'profile_view', 24, NOW)).toBe(1);
+  });
+
+  it('runs the safety gate before every navigation and stops when it refuses', async () => {
+    await vanishedInvite('gated-one');
+    await vanishedInvite('gated-two');
+    const { driver, opened } = fakeDegreeDriver({});
+    const asked: string[] = [];
+
+    const result = await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async (candidate) => {
+        asked.push(candidate.targetRef);
+        return { ...allowedGate(), allowed: false, reason: 'Outside working hours.' };
+      }
+    });
+
+    // Asked once, refused, and NOT ONE PROFILE OPENED.
+    expect(asked).toHaveLength(1);
+    expect(opened).toEqual([]);
+    expect(result).toMatchObject({
+      blocked: 1,
+      checked: 0,
+      halted: true,
+      haltReason: 'Outside working hours.'
+    });
+  });
+
+  it('cools the seat and halts on a limit wall', async () => {
+    await vanishedInvite('walled');
+    await vanishedInvite('never-reached');
+    const { driver, opened } = fakeDegreeDriver({
+      [url('walled')]: { ok: false, failureKind: 'limit_wall', detail: 'LinkedIn refused.' },
+      [url('never-reached')]: { ok: false, failureKind: 'limit_wall', detail: 'LinkedIn refused.' }
+    });
+
+    const result = await detectAcceptedInvites(db, SEAT, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    // ONE profile, whichever the ordering put first. LinkedIn said stop, so the
+    // pass is over -- continuing past a limit wall is what turns a temporary
+    // restriction into a permanent one.
+    expect(opened).toHaveLength(1);
+    expect(result.halted).toBe(true);
+    expect((await getSeat(db, WORKSPACE_ID, OWNER_SEAT_KEY))?.posture).toBe('cooldown');
+  });
+
+  it('never reads one seat’s invites with another seat’s browser', async () => {
+    const other: SeatRef = { workspaceId: WORKSPACE_ID, seatKey: 'second' };
+    await upsertSeat(
+      db,
+      WORKSPACE_ID,
+      { label: 'Second', timezone: 'UTC' },
+      new Date('2026-01-01T09:00:00.000Z'),
+      other.seatKey
+    );
+
+    // One vanished invite on the OWNER seat only.
+    await vanishedInvite('owner-target');
+    const { driver, opened } = fakeDegreeDriver({
+      [url('owner-target')]: degree(url('owner-target'), 1)
+    });
+
+    const result = await detectAcceptedInvites(db, other, {
+      driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+
+    // The second seat has nothing of its own, and the owner's invite is not its
+    // business: a degree is a fact about the SIGNED-IN account's relationship,
+    // so reading it from the wrong browser would file a stranger's connection
+    // as this seat's acceptance.
+    expect(opened).toEqual([]);
+    expect(result).toMatchObject({ checked: 0, accepted: 0, seatKey: 'second' });
+  });
+
+  it('licenses no conclusion from a TRUNCATED pending sync', async () => {
+    const actionId = await pendingInvite('tail-of-a-big-backlog', 30);
+    await syncPendingInvites(
+      db,
+      SEAT,
+      list([{ profileUrl: url('tail-of-a-big-backlog'), name: null, sentAt: null }]),
+      new Date(NOW.getTime() - 5 * 86_400_000)
+    );
+    // Today's read hit LinkedIn's own card bound, so this invite's absence means
+    // "not reached", not "gone".
+    await syncPendingInvites(db, SEAT, list([], true), NOW);
+
+    expect(await selectAcceptanceCandidates(db, SEAT)).toEqual([]);
+    expect(actionId).toBeTruthy();
+  });
+
+  it('does not re-read an invite it has already decided nothing about', async () => {
+    await vanishedInvite('read-once');
+    const answers = { [url('read-once')]: degree(url('read-once'), 3) };
+
+    const first = fakeDegreeDriver(answers);
+    await detectAcceptedInvites(db, SEAT, {
+      driver: first.driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+    expect(first.opened).toHaveLength(1);
+
+    const second = fakeDegreeDriver(answers);
+    await detectAcceptedInvites(db, SEAT, {
+      driver: second.driver,
+      page: detectorPage,
+      now: () => NOW,
+      sleep: async () => {},
+      evaluate: async () => allowedGate()
+    });
+    expect(second.opened).toEqual([]);
+  });
+});
+
+describe('the withdrawal ledger row', () => {
+  it('files a withdraw action when LinkedIn confirms the click', async () => {
+    await steadySeat();
+    const actionId = await pendingInvite('taken-back', 30);
+    const [candidate] = await selectWithdrawalCandidates(db, SEAT, NOW);
+    const { ids } = await enqueueWithdrawals(db, SEAT, [candidate], NOW);
+    const claimed = await claimNextWithdrawal(db, SEAT, 'lwbatch_test', NOW);
+    expect(claimed?.id).toBe(ids[0]);
+
+    const { driver } = fakeDriver();
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed!,
+      NOW
+    );
+    expect(outcome.status).toBe('withdrawn');
+    expect(await statusOf(actionId)).toBe(WITHDRAWN_STATUS);
+
+    /*
+     * THE WITHDRAWAL IS ITS OWN ACTION. The invite's terminal status says the
+     * invite was taken back; it says nothing about the click, which happened
+     * today, on this account, and used to be invisible to every rolling count
+     * in the product.
+     */
+    const rows = await db
+      .prepare(
+        `
+      SELECT kind, status, source, target_ref, external_ref, recorded_at, seat_key
+      FROM linkedin_actions WHERE workspace_id=? AND kind='withdraw'
+    `
+      )
+      .all<{
+        kind: string;
+        status: string;
+        source: string;
+        target_ref: string;
+        external_ref: string;
+        seat_key: string;
+      }>(WORKSPACE_ID);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      status: 'sent',
+      source: 'system',
+      target_ref: url('taken-back'),
+      external_ref: actionId,
+      seat_key: OWNER_SEAT_KEY
+    });
+    expect(await countActionsInWindow(db, SEAT, 'withdraw', 24, NOW)).toBe(1);
+  });
+
+  it('files nothing when nothing was withdrawn', async () => {
+    await steadySeat();
+    await pendingInvite('still-standing', 30);
+    const [candidate] = await selectWithdrawalCandidates(db, SEAT, NOW);
+    await enqueueWithdrawals(db, SEAT, [candidate], NOW);
+    const claimed = await claimNextWithdrawal(db, SEAT, 'lwbatch_test', NOW);
+
+    // The entry was not on the live list: accepted, declined, expired and
+    // already-withdrawn are indistinguishable, so nothing is concluded and
+    // nothing is filed.
+    const { driver } = fakeDriver(() => ({
+      ok: false,
+      failureKind: 'already_connected',
+      detail: 'gone'
+    }));
+    const outcome = await executeWithdrawal(
+      db,
+      SEAT,
+      { driver, page, evaluate: async () => allowed() },
+      claimed!,
+      NOW
+    );
+    expect(outcome.status).toBe('stale');
+
+    const rows = await db
+      .prepare(`SELECT id FROM linkedin_actions WHERE workspace_id=? AND kind='withdraw'`)
+      .all<{ id: string }>(WORKSPACE_ID);
+    expect(rows).toEqual([]);
+  });
+});

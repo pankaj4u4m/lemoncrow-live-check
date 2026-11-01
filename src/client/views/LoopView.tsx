@@ -1,0 +1,1821 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { CheckCircle2, ChevronRight, Copy, Inbox, LoaderCircle, Send } from 'lucide-react';
+import type { DashboardPayload, PlaybookRun } from '../../shared/types';
+import {
+  fetchLoopCost,
+  getAgentSetup,
+  getAgentTokens,
+  getLinkedInActions,
+  getLinkedInAnalytics,
+  getLinkedInManagedCampaigns,
+  getLinkedInManagerLeadLists,
+  getPlaybookRuns,
+  getPolicies,
+  getToday,
+  decidePlaybookStep,
+  prepareDemandRecommendation,
+  planGtmIntent,
+  prepareCompiledGtmPlan,
+  type LinkedInAnalytics,
+  type LinkedInLimitsReport,
+  type LoopCost
+} from '../api';
+import { errorMessage, useOutreachRefresh, useSeatLimits } from '../LinkedInSafety';
+import { DEFAULT_WINDOW_DAYS, LinkedInFunnel } from '../LinkedInAnalyticsScreen';
+import { ConfidenceTag, WindowPicker } from '../LinkedInViz';
+import { Button, Field, Input, Select, SwitchField, Textarea } from '../ui/primitives';
+import { approveLabel, formatCredits, planCostLines } from './planCost';
+import { emailSkipSummary, planIssues } from './gtmPlanFormat';
+import { ACTIVATION_STEPS, nextActivationStep, type ActivationSignals } from './activation';
+import { LinkedInHandoffCard } from './LinkedInHandoffCard';
+import { money, usd } from './format';
+
+type StageId = 'find' | 'reach' | 'answer';
+
+interface Stage {
+  id: StageId;
+  label: string;
+  value: string;
+  unit: string;
+  href: string | null;
+  unavailable?: boolean;
+}
+
+interface Block {
+  stage: StageId;
+  sentence: string;
+  action: string;
+  href: string;
+}
+
+interface LoopData {
+  planned: number | null;
+  /** Of planned, the subset that is an invite rather than a follow-up step. */
+  plannedInvites: number | null;
+  waitingApprovals: PlaybookRun[] | null;
+}
+
+interface RemoteActivation {
+  agent: boolean | null;
+  policy: boolean | null;
+  work: boolean | null;
+  problems: string[];
+}
+
+function combineChecks(left: boolean | null, right: boolean | null): boolean | null {
+  if (left === true || right === true) return true;
+  if (left === false && right === false) return false;
+  return null;
+}
+
+function useWorkspaceActivation(
+  data: DashboardPayload,
+  limits: LinkedInLimitsReport | null,
+  seatError: string
+) {
+  const [remote, setRemote] = useState<RemoteActivation>({
+    agent: null,
+    policy: null,
+    work: null,
+    problems: []
+  });
+
+  const reload = useCallback(async () => {
+    setRemote({ agent: null, policy: null, work: null, problems: [] });
+    const [tokensResult, setupResult, policiesResult, listsResult, campaignsResult] =
+      await Promise.allSettled([
+        getAgentTokens(),
+        getAgentSetup(),
+        getPolicies(),
+        getLinkedInManagerLeadLists(),
+        getLinkedInManagedCampaigns()
+      ]);
+
+    const problems: string[] = [];
+    if (tokensResult.status === 'rejected') problems.push('agent access');
+    if (setupResult.status === 'rejected') problems.push('hosted agent setup');
+    if (policiesResult.status === 'rejected') problems.push('approval policies');
+    if (listsResult.status === 'rejected') problems.push('People lists');
+    if (campaignsResult.status === 'rejected') problems.push('campaigns');
+
+    const tokenAgent =
+      tokensResult.status === 'fulfilled'
+        ? tokensResult.value.some((token) => !token.revokedAt)
+        : null;
+    const hostedAgent =
+      setupResult.status === 'fulfilled'
+        ? Boolean(
+            setupResult.value &&
+            ((setupResult.value.config && setupResult.value.secret) ||
+              (setupResult.value.cli.config &&
+                setupResult.value.cli.tokenStored &&
+                setupResult.value.cli.riskAccepted))
+          )
+        : null;
+    const policy =
+      policiesResult.status === 'fulfilled'
+        ? policiesResult.value.some((entry) => entry.enabled)
+        : null;
+    const listsHaveWork = listsResult.status === 'fulfilled' ? listsResult.value.length > 0 : null;
+    const campaignsHaveWork =
+      campaignsResult.status === 'fulfilled' ? campaignsResult.value.length > 0 : null;
+
+    setRemote({
+      agent: combineChecks(tokenAgent, hostedAgent),
+      policy,
+      work: combineChecks(listsHaveWork, campaignsHaveWork),
+      problems
+    });
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const hasConnectedSource = data.connections.some(
+    (connection) => connection.status === 'connected'
+  );
+  const source = hasConnectedSource ? true : limits ? Boolean(limits.seat?.configured) : null;
+  const problems =
+    !hasConnectedSource && seatError
+      ? [...remote.problems, 'connected outreach source']
+      : remote.problems;
+
+  return {
+    signals: {
+      agent: remote.agent,
+      source,
+      policy: remote.policy,
+      work: remote.work
+    } satisfies ActivationSignals,
+    problems,
+    reload
+  };
+}
+
+function ActivationGuide({
+  signals,
+  problems,
+  onRetry,
+  onNavigate,
+  onPlan,
+  onExplore
+}: {
+  signals: ActivationSignals;
+  problems: string[];
+  onRetry: () => void;
+  onNavigate: (path: string) => void;
+  onPlan: () => void;
+  onExplore: () => void;
+}) {
+  const resolution = nextActivationStep(signals);
+  const activeId = resolution.step?.id ?? null;
+
+  return (
+    <section className="onboarding-card activation-card" aria-labelledby="activation-title">
+      <div className="onboarding-head">
+        <div>
+          <span className="activation-kicker">Advanced setup</span>
+          <h2 id="activation-title">Connect your AI tools</h2>
+          <p>
+            Trevra checks each prerequisite and gives you one next action. Nothing is sent merely
+            because you finish setup.
+          </p>
+        </div>
+        <span className="status-pill">
+          {ACTIVATION_STEPS.filter((step) => signals[step.id] === true).length} of{' '}
+          {ACTIVATION_STEPS.length}
+        </span>
+      </div>
+
+      <ol className="onboarding-steps activation-steps">
+        {ACTIVATION_STEPS.map((step, index) => {
+          const done = signals[step.id] === true;
+          const active = step.id === activeId;
+          const stateLabel = done
+            ? 'Complete'
+            : active && resolution.state === 'next'
+              ? 'Next'
+              : active
+                ? 'Not verified'
+                : 'Later';
+          return (
+            <li
+              key={step.id}
+              className={done ? 'is-done' : active ? 'is-next' : undefined}
+              aria-current={active && !done ? 'step' : undefined}
+            >
+              <span className="activation-step-index" aria-hidden="true">
+                {done ? <CheckCircle2 size={18} /> : index + 1}
+              </span>
+              <div>
+                <strong>{step.title}</strong>
+                <small>{step.detail}</small>
+                <span className="activation-step-state">{stateLabel}</span>
+              </div>
+              {active && resolution.state === 'next' && (
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => (step.href ? onNavigate(step.href) : onPlan())}
+                >
+                  {step.action} <ChevronRight size={15} />
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+
+      {resolution.state === 'unknown' &&
+        (problems.length ? (
+          <div className="activation-problem" role="alert">
+            <p>
+              Trevra could not verify {problems.join(', ')}. Those states remain unknown; they were
+              not treated as empty.
+            </p>
+            <button className="primary-button" type="button" onClick={onRetry}>
+              Check again
+            </button>
+          </div>
+        ) : (
+          <p className="onboarding-loading" role="status">
+            <LoaderCircle className="spin" size={16} /> Checking this workspace…
+          </p>
+        ))}
+
+      <div className="activation-actions">
+        <p>External actions still stop at the approval boundary you set.</p>
+        <button className="ghost-button" type="button" onClick={onExplore}>
+          Explore without finishing setup
+        </button>
+      </div>
+    </section>
+  );
+}
+
+export function LoopView({
+  data,
+  onNavigate
+}: {
+  data: DashboardPayload;
+  onNavigate: (path: string) => void;
+}) {
+  const { limits, error: seatError } = useSeatLimits();
+  const activation = useWorkspaceActivation(data, limits, seatError);
+  const [explore, setExplore] = useState(false);
+  const [plannerInitiallyOpen, setPlannerInitiallyOpen] = useState(false);
+  const [loop, setLoop] = useState<LoopData>({
+    planned: null,
+    plannedInvites: null,
+    waitingApprovals: null
+  });
+  const [loopLoading, setLoopLoading] = useState(true);
+  const [loopError, setLoopError] = useState('');
+  const [cost, setCost] = useState<LoopCost | null>(null);
+  const [today, setToday] = useState<Awaited<ReturnType<typeof getToday>> | null>(null);
+  const [todayError, setTodayError] = useState('');
+  const [days, setDays] = useState(DEFAULT_WINDOW_DAYS);
+  const [analytics, setAnalytics] = useState<LinkedInAnalytics | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
+  const [analyticsError, setAnalyticsError] = useState('');
+
+  const loadLoop = useCallback(async () => {
+    setLoopLoading(true);
+    const [plannedResult, waitingResult, costResult] = await Promise.allSettled([
+      getLinkedInActions({ status: 'planned', limit: 200 }),
+      getPlaybookRuns({ status: 'waiting_approval', limit: 20 }),
+      fetchLoopCost(30)
+    ]);
+    const unread: string[] = [];
+    if (plannedResult.status === 'rejected') unread.push('queued outreach');
+    if (waitingResult.status === 'rejected') unread.push('waiting approvals');
+    if (costResult.status === 'rejected') unread.push('cost and activity');
+
+    setLoop({
+      planned: plannedResult.status === 'fulfilled' ? plannedResult.value.length : null,
+      plannedInvites:
+        plannedResult.status === 'fulfilled'
+          ? plannedResult.value.filter((action) => action.kind === 'invite').length
+          : null,
+      waitingApprovals: waitingResult.status === 'fulfilled' ? waitingResult.value : null
+    });
+    setCost(costResult.status === 'fulfilled' ? costResult.value : null);
+    setLoopError(
+      unread.length
+        ? 'Could not read ' +
+            unread.join(', ') +
+            '. Those values remain unknown; nothing was changed.'
+        : ''
+    );
+    setLoopLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void loadLoop();
+  }, [loadLoop]);
+
+  const loadToday = useCallback(async () => {
+    try {
+      setToday(await getToday());
+      setTodayError('');
+    } catch (error) {
+      setTodayError(errorMessage(error, 'Unable to read what needs you right now.'));
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadToday();
+  }, [loadToday]);
+  useOutreachRefresh(loadToday);
+
+  const loadAnalytics = useCallback(async () => {
+    setAnalyticsLoading(true);
+    try {
+      setAnalytics(await getLinkedInAnalytics(days));
+      setAnalyticsError('');
+    } catch (err) {
+      setAnalytics(null);
+      setAnalyticsError(
+        errorMessage(err, 'Unable to read the outreach ledger. Nothing was changed — try again.')
+      );
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }, [days]);
+
+  useEffect(() => {
+    void loadAnalytics();
+  }, [loadAnalytics]);
+  useOutreachRefresh(loadAnalytics);
+
+  const seat = limits?.seat ?? null;
+  const queued = loop.planned;
+  const invitesQueued = loop.plannedInvites;
+  const followUpsQueued = queued !== null && invitesQueued !== null ? queued - invitesQueued : null;
+  const funnel = analytics?.total ?? null;
+  const waitingCount = loop.waitingApprovals?.length ?? null;
+  const inviteDay =
+    limits?.limits.find((limit) => limit.kind === 'invite' && limit.window === 'day') ?? null;
+
+  const stages: Stage[] = [
+    {
+      id: 'find',
+      label: 'Find',
+      value: 'Build a lead list',
+      unit: 'CSV or search',
+      href: '/outreach'
+    },
+    {
+      id: 'reach',
+      label: 'Reach',
+      value: limits
+        ? seat?.configured
+          ? queued === null
+            ? 'Not read'
+            : String(queued)
+          : 'No account'
+        : seatError
+          ? 'Not read'
+          : 'Reading…',
+      unit: limits
+        ? seat?.configured
+          ? queued === null
+            ? 'unavailable'
+            : 'queued'
+          : 'connect an account'
+        : seatError
+          ? 'unavailable'
+          : 'loading',
+      href: limits ? (seat?.configured ? '/outreach' : '/setup/workspace') : null,
+      unavailable: !limits || queued === null
+    },
+    {
+      id: 'answer',
+      label: 'Answer',
+      value: 'Open Messages',
+      unit: 'conversations',
+      href: '/outreach/inbox'
+    }
+  ];
+
+  const block = useMemo<Block | null>(() => {
+    if (!limits) return null;
+    if (seat?.configured && seat.posture === 'paused') {
+      return {
+        stage: 'reach',
+        sentence:
+          queued !== null && queued > 0
+            ? String(queued) +
+              ' scheduled ' +
+              (queued === 1 ? 'action is' : 'actions are') +
+              ' paused' +
+              (seat.pausedReason ? ': ' + seat.pausedReason : '.')
+            : 'This LinkedIn account is paused' +
+              (seat.pausedReason ? ': ' + seat.pausedReason : '.'),
+        action: 'Open workspace setup',
+        href: '/setup/workspace'
+      };
+    }
+    if (!seat?.configured)
+      return {
+        stage: 'reach',
+        sentence: 'No LinkedIn account is connected.',
+        action: 'Connect an account',
+        href: '/setup/workspace'
+      };
+    if (waitingCount !== null && waitingCount > 0)
+      return {
+        stage: 'answer',
+        sentence:
+          String(waitingCount) +
+          ' ' +
+          (waitingCount === 1 ? 'run needs' : 'runs need') +
+          ' your approval.',
+        action: 'Review activity',
+        href: '/ledger'
+      };
+    if (queued === 0)
+      return {
+        stage: 'find',
+        sentence: 'Nothing is queued.',
+        action: 'Start a campaign',
+        href: '/outreach'
+      };
+    return null;
+  }, [limits, seat, queued, waitingCount]);
+
+  if (!explore && activation.signals.work !== true) {
+    return (
+      <>
+        <TodayAttention
+          today={today}
+          problem={todayError}
+          onNavigate={onNavigate}
+          onRefresh={() => void loadToday()}
+        />
+        <section className="onboarding-card marketer-start" aria-labelledby="marketer-start-title">
+          <div>
+            <span className="activation-kicker">Start here</span>
+            <h2 id="marketer-start-title">
+              {seat?.configured
+                ? 'Ready to prepare your first campaign?'
+                : 'Connect LinkedIn to get started'}
+            </h2>
+            <p>
+              {seat?.configured
+                ? 'Upload a list of people, review the message, then decide when to start.'
+                : 'Connect your account once. Then upload a list of people and prepare a campaign.'}
+            </p>
+          </div>
+          <Button
+            variant="primary"
+            onClick={() => onNavigate(seat?.configured ? '/outreach/new' : '/setup/workspace')}
+          >
+            {seat?.configured ? 'Create a campaign' : 'Connect LinkedIn'}
+            <ChevronRight size={16} />
+          </Button>
+          <p className="marketer-safety-copy">
+            Preparing a campaign never sends messages. Sending still follows your account limits and
+            approval rules.
+          </p>
+        </section>
+        <details className="loop-secondary">
+          <summary>
+            <span>
+              <strong>Agent setup (advanced)</strong>
+              <small>
+                Only needed if you want to run Trevra with Claude Code, Codex, or other agents.
+              </small>
+            </span>
+            <ChevronRight size={17} aria-hidden="true" />
+          </summary>
+          <div className="loop-secondary-body">
+            <ActivationGuide
+              signals={activation.signals}
+              problems={activation.problems}
+              onRetry={() => void activation.reload()}
+              onNavigate={onNavigate}
+              onPlan={() => {
+                setPlannerInitiallyOpen(true);
+                setExplore(true);
+              }}
+              onExplore={() => setExplore(true)}
+            />
+          </div>
+        </details>
+      </>
+    );
+  }
+
+  const awaitingReply = funnel ? funnel.sent : null;
+
+  return (
+    <>
+      <TodayAttention
+        today={today}
+        problem={todayError}
+        onNavigate={onNavigate}
+        onRefresh={() => void loadToday()}
+      />
+      {today && today.needsAttention.length === 0 && (
+        <section className="marketer-next-actions" aria-label="What to do next">
+          <div>
+            <strong>Keep your outreach moving</strong>
+            <p>Start another campaign or catch up on conversations.</p>
+          </div>
+          <div className="marketer-next-buttons">
+            <Button variant="primary" onClick={() => onNavigate('/outreach/new')}>
+              Create a campaign <ChevronRight size={15} />
+            </Button>
+            <Button onClick={() => onNavigate('/outreach/inbox')}>Read messages</Button>
+          </div>
+        </section>
+      )}
+      {today && today.working.length > 0 && (
+        <TodayStatusSection
+          title="In progress"
+          description="Tasks Trevra is currently handling."
+          items={today.working}
+          empty=""
+          mode="working"
+          onNavigate={onNavigate}
+        />
+      )}
+      {today && today.recentResults.length > 0 && (
+        <TodayStatusSection
+          title="Recent results"
+          description="Confirmed outcomes from the last seven days."
+          items={today.recentResults}
+          empty=""
+          mode="results"
+          onNavigate={onNavigate}
+        />
+      )}
+
+      {today && today.needsAttention.length === 0 && block && (
+        <section className="loop-block" aria-label="Current blocker">
+          <div>
+            <strong>Next operational decision</strong>
+            <p>{block.sentence}</p>
+          </div>
+          <button className="primary-button" type="button" onClick={() => onNavigate(block.href)}>
+            {block.action} <ChevronRight size={15} />
+          </button>
+        </section>
+      )}
+
+      {loopError && (
+        <div className="loop-read-error" role="alert">
+          <p>{loopError}</p>
+          <button className="secondary-button" type="button" onClick={() => void loadLoop()}>
+            Retry state
+          </button>
+        </div>
+      )}
+
+      <details className="loop-secondary">
+        <summary>
+          <span>
+            <strong>Campaign activity and advanced planning</strong>
+            <small>Queued actions, outreach steps and custom agent plans.</small>
+          </span>
+          <ChevronRight size={17} aria-hidden="true" />
+        </summary>
+        <div className="loop-secondary-body page-stack">
+          <section className="loop-stages" aria-label="The outreach loop, stage by stage">
+            {stages.map((stage) => {
+              const className =
+                'loop-stage' +
+                (block?.stage === stage.id ? ' is-stuck' : '') +
+                (stage.unavailable ? ' is-unavailable' : '');
+              const inner = (
+                <>
+                  <span>{stage.label}</span>
+                  <strong>{stage.value}</strong>
+                  <small>{stage.unit}</small>
+                </>
+              );
+              return stage.href ? (
+                <button
+                  key={stage.id}
+                  type="button"
+                  className={className}
+                  onClick={() => onNavigate(stage.href as string)}
+                >
+                  {inner}
+                </button>
+              ) : (
+                <div key={stage.id} className={className}>
+                  {inner}
+                </div>
+              );
+            })}
+          </section>
+
+          <section className="metrics-grid metrics-grid-two" aria-label="Current outreach movement">
+            <Metric
+              icon={<Send />}
+              label="Going out"
+              value={
+                invitesQueued === null || followUpsQueued === null
+                  ? '—'
+                  : String(invitesQueued) + ' / ' + String(followUpsQueued)
+              }
+              detail={
+                !seat?.configured
+                  ? 'No LinkedIn account connected'
+                  : invitesQueued === null || followUpsQueued === null
+                    ? loopLoading
+                      ? 'Reading queued actions…'
+                      : 'Queued actions unavailable'
+                    : String(invitesQueued) +
+                      ' invite' +
+                      (invitesQueued === 1 ? '' : 's') +
+                      ' · ' +
+                      String(followUpsQueued) +
+                      ' follow-up' +
+                      (followUpsQueued === 1 ? '' : 's') +
+                      ' queued' +
+                      (inviteDay ? ' · ' + String(inviteDay.ceiling) + '/day invite limit' : '')
+              }
+            />
+            <Metric
+              icon={<Inbox />}
+              label="Waiting on a reply"
+              value={awaitingReply === null ? '—' : String(awaitingReply)}
+              detail={
+                analyticsError ? 'Outreach ledger unavailable' : 'Last ' + String(days) + ' days'
+              }
+            />
+          </section>
+
+          <PlanWork onNavigate={onNavigate} initiallyOpen={plannerInitiallyOpen} />
+        </div>
+      </details>
+
+      <details className="loop-secondary">
+        <summary>
+          <span>
+            <strong>Performance and cost</strong>
+            <small>Outreach outcomes and model spend, when you need the detail.</small>
+          </span>
+          <ChevronRight size={17} aria-hidden="true" />
+        </summary>
+        <div className="loop-secondary-body loop-performance-grid">
+          <LinkedInFunnel
+            analytics={analytics}
+            loading={analyticsLoading}
+            error={analyticsError}
+            reload={loadAnalytics}
+            days={days}
+            onDaysChange={setDays}
+          />
+
+          <section className="page-panel loop-cost-summary">
+            <div className="section-heading">
+              <div>
+                <h2>Model usage</h2>
+                <p>Last 30 days.</p>
+              </div>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => onNavigate('/loop/cost')}
+              >
+                Cost details <ChevronRight size={15} />
+              </button>
+            </div>
+            {cost ? (
+              <div className="run-facts">
+                <div className="run-fact">
+                  <span>Spent</span>
+                  <strong>{usd(cost.spent.costCents)}</strong>
+                  <small>USD, billed by your model provider</small>
+                </div>
+                <div className="run-fact">
+                  <span>Model calls</span>
+                  <strong>{cost.spent.calls.toLocaleString('en-US')}</strong>
+                </div>
+              </div>
+            ) : (
+              <p className="onboarding-loading">
+                {loopLoading ? 'Reading model usage…' : 'Model usage unavailable.'}
+              </p>
+            )}
+          </section>
+        </div>
+      </details>
+    </>
+  );
+}
+function Metric({
+  icon,
+  label,
+  value,
+  detail
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+}) {
+  return (
+    <article className="metric-card">
+      <span className="metric-icon">{icon}</span>
+      <div>
+        <p>{label}</p>
+        <strong>{value}</strong>
+        <span>{detail}</span>
+      </div>
+    </article>
+  );
+}
+
+type TodayPayload = Awaited<ReturnType<typeof getToday>>;
+
+function TodayStatusSection({
+  title,
+  description,
+  items,
+  empty,
+  mode,
+  onNavigate
+}: {
+  title: string;
+  description: string;
+  items: TodayPayload['working'];
+  empty: string;
+  mode: 'working' | 'results';
+  onNavigate: (path: string) => void;
+}) {
+  return (
+    <section className="recommendations-panel">
+      <div className="section-heading">
+        <div>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+        <span className="status-pill">{items.length}</span>
+      </div>
+      {items.length === 0 ? (
+        <div className="empty-state">
+          {mode === 'working' ? <Send size={22} /> : <CheckCircle2 size={22} />}
+          <p>{empty}</p>
+        </div>
+      ) : (
+        <ol className="onboarding-steps">
+          {items.map((item) => (
+            <li key={item.id}>
+              {mode === 'working' ? <Send size={19} /> : <CheckCircle2 size={19} />}
+              <div>
+                <strong>{item.title}</strong>
+                <small>{item.detail}</small>
+              </div>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => onNavigate(item.href)}
+              >
+                Open <ChevronRight size={15} />
+              </button>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+function todayActionLabel(
+  item: Awaited<ReturnType<typeof getToday>>['needsAttention'][number]
+): string {
+  if (item.kind === 'qualification_decision') {
+    if (item.metadata.recommendedAction === 'reply') return 'Prepare reply';
+    if (item.metadata.demandOrigin === 'person_discovery') return 'Find person';
+    return item.metadata.demandOrigin === 'known_contact' ? 'Prepare outreach' : 'Prepare response';
+  }
+  if (item.kind === 'verified_reply') return 'Reply';
+  if (item.kind === 'deliverability_blocked') return 'Fix email setup';
+  if (item.kind === 'inbound_submission') return 'Review inbound';
+  if (item.kind === 'customer_cancelled') return 'Review customer';
+  if (item.kind === 'high_priority_account') return 'Review account';
+  if (item.kind === 'meeting_upcoming') return 'Prepare';
+  return 'Open';
+}
+
+function TodayAttention({
+  today,
+  problem,
+  onNavigate,
+  onRefresh
+}: {
+  today: Awaited<ReturnType<typeof getToday>> | null;
+  problem: string;
+  onNavigate: (path: string) => void;
+  onRefresh: () => void;
+}) {
+  const items = today?.needsAttention ?? [];
+  const [prepared, setPrepared] = useState<
+    Record<string, { mode: 'reply' | 'outreach'; run: PlaybookRun }>
+  >({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState('');
+
+  const prepare = async (item: Awaited<ReturnType<typeof getToday>>['needsAttention'][number]) => {
+    if (item.metadata.recommendationType === 'person_discovery') {
+      onNavigate(item.href);
+      return;
+    }
+    if (item.reference.type !== 'recommendation') {
+      onNavigate(item.href);
+      return;
+    }
+    setBusyId(item.id);
+    setActionError('');
+    try {
+      const result = await prepareDemandRecommendation(item.reference.id);
+      setPrepared((current) => ({ ...current, [item.id]: result }));
+    } catch (error) {
+      setActionError(errorMessage(error, 'Unable to prepare this action. Nothing was sent.'));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const decide = async (
+    itemId: string,
+    entry: { mode: 'reply' | 'outreach'; run: PlaybookRun },
+    decision: 'approve' | 'reject'
+  ) => {
+    const approval = entry.run.steps.find(
+      (step) => step.stepType === 'approval' && step.status === 'waiting_approval'
+    );
+    if (!approval) return;
+    setBusyId(itemId);
+    setActionError('');
+    try {
+      const run = await decidePlaybookStep(entry.run.id, approval.stepId, decision);
+      if (decision === 'reject') {
+        setPrepared((current) => {
+          const next = { ...current };
+          delete next[itemId];
+          return next;
+        });
+      } else {
+        setPrepared((current) => ({ ...current, [itemId]: { ...entry, run } }));
+        if (run.status === 'completed') onRefresh();
+      }
+    } catch (error) {
+      setActionError(
+        errorMessage(
+          error,
+          decision === 'approve'
+            ? 'Unable to approve this action. Nothing was sent.'
+            : 'Unable to discard this action.'
+        )
+      );
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <section className="recommendations-panel">
+      <div className="section-heading">
+        <div>
+          <h2>Needs you</h2>
+          <p>Messages and decisions waiting for you.</p>
+        </div>
+        {today && <span className="status-pill">{items.length} open</span>}
+      </div>
+
+      {(problem || actionError) && <div className="error-banner">{problem || actionError}</div>}
+      {!problem && !today ? (
+        <p className="onboarding-loading">
+          <LoaderCircle className="spin" size={16} /> Checking for updates…
+        </p>
+      ) : today && items.length === 0 ? (
+        <div className="empty-state">
+          <CheckCircle2 size={24} />
+          <h4>You're all caught up</h4>
+          <p>No messages or decisions need your attention right now.</p>
+        </div>
+      ) : (
+        <ol className="onboarding-steps">
+          {items.map((item) => {
+            if (item.kind === 'linkedin_handoff_waiting')
+              return <LinkedInHandoffCard key={item.id} item={item} onResolved={onRefresh} />;
+            const entry = prepared[item.id];
+            const approval = entry?.run.steps.find(
+              (step) => step.stepType === 'approval' && step.status === 'waiting_approval'
+            );
+            const payload =
+              approval?.input &&
+              typeof approval.input === 'object' &&
+              !Array.isArray(approval.input)
+                ? (approval.input as Record<string, unknown>)
+                : null;
+            const completed = entry?.run.status === 'completed';
+            const isDemand = item.kind === 'qualification_decision';
+            return (
+              <li key={item.id} className={entry ? 'today-item-expanded' : undefined}>
+                <Inbox size={19} />
+                <div>
+                  <strong>{item.title}</strong>
+                  <small>{item.detail}</small>
+                </div>
+                <button
+                  className={isDemand ? 'primary-button' : 'secondary-button'}
+                  type="button"
+                  disabled={busyId === item.id || completed}
+                  onClick={() => void (isDemand ? prepare(item) : onNavigate(item.href))}
+                >
+                  {busyId === item.id
+                    ? 'Working…'
+                    : completed
+                      ? 'Done'
+                      : isDemand && item.metadata.recommendationType !== 'person_discovery'
+                        ? entry
+                          ? 'Prepared'
+                          : 'Prepare action'
+                        : todayActionLabel(item)}{' '}
+                  {!entry && <ChevronRight size={15} />}
+                </button>
+                {entry && payload && approval && (
+                  <div className="today-action-review">
+                    <div className="today-action-review-head">
+                      <div>
+                        <strong>
+                          {entry.mode === 'reply' ? 'Email reply ready' : 'Email ready'}
+                        </strong>
+                        <small>Nothing is sent until you approve these exact bytes.</small>
+                      </div>
+                      <span className="status-pill">{entry.mode}</span>
+                    </div>
+                    <dl>
+                      <div>
+                        <dt>To</dt>
+                        <dd>{String(payload.recipient ?? '')}</dd>
+                      </div>
+                      <div>
+                        <dt>Subject</dt>
+                        <dd>{String(payload.subject ?? '')}</dd>
+                      </div>
+                    </dl>
+                    <pre>{String(payload.body ?? '')}</pre>
+                    <div className="today-action-review-actions">
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={busyId === item.id}
+                        onClick={() => void decide(item.id, entry, 'reject')}
+                      >
+                        Discard
+                      </button>
+                      <button
+                        className="primary-button"
+                        type="button"
+                        disabled={busyId === item.id}
+                        onClick={() => void decide(item.id, entry, 'approve')}
+                      >
+                        Approve & send
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+type PlannerObjective =
+  | 'find_accounts'
+  | 'research_accounts'
+  | 'prepare_outreach'
+  | 'watch_accounts'
+  | 'capture_inbound'
+  | 'enrich_contacts';
+
+const PLANNER_OBJECTIVES: ReadonlyArray<{ value: PlannerObjective; label: string }> = [
+  { value: 'find_accounts', label: 'Find prospects' },
+  { value: 'research_accounts', label: 'Research accounts' },
+  { value: 'prepare_outreach', label: 'Prepare outreach' },
+  { value: 'watch_accounts', label: 'Watch accounts' },
+  { value: 'capture_inbound', label: 'Capture inbound' },
+  { value: 'enrich_contacts', label: 'Find contacts (Hunter)' }
+];
+
+function plannerPrepareKey(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return `gtm-plan-${uuid ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+}
+function clampEmailsPerDomain(value: string): number {
+  return Math.max(1, Math.min(10, Math.trunc(Number(value)) || 1));
+}
+function plannerDomains(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(/[\s,;]+/)
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+    )
+  ].slice(0, 500);
+}
+
+function PlanWork({
+  onNavigate,
+  initiallyOpen = false
+}: {
+  onNavigate: (path: string) => void;
+  initiallyOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(initiallyOpen);
+  const [objective, setObjective] = useState<PlannerObjective>('find_accounts');
+  const [audience, setAudience] = useState('');
+  const [quantity, setQuantity] = useState(25);
+  const [accountDomains, setAccountDomains] = useState('');
+  const [emailsPerDomain, setEmailsPerDomain] = useState('3');
+  const [includeUnverified, setIncludeUnverified] = useState(false);
+  const [captureName, setCaptureName] = useState('Website');
+  const [captureKind, setCaptureKind] = useState<
+    'website' | 'form' | 'signup' | 'partner' | 'integration'
+  >('website');
+  const [leadLists, setLeadLists] = useState<
+    Awaited<ReturnType<typeof getLinkedInManagerLeadLists>>
+  >([]);
+  const [leadListId, setLeadListId] = useState('');
+  const [outreachChannel, setOutreachChannel] = useState<'linkedin' | 'email'>('linkedin');
+  const [plan, setPlan] = useState<Awaited<ReturnType<typeof planGtmIntent>> | null>(null);
+  const [prepared, setPrepared] = useState<Awaited<
+    ReturnType<typeof prepareCompiledGtmPlan>
+  > | null>(null);
+  const [prepareKey, setPrepareKey] = useState('');
+  const [planning, setPlanning] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const [problem, setProblem] = useState('');
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void getLinkedInManagerLeadLists()
+      .then((lists) => {
+        if (cancelled) return;
+        setLeadLists(lists);
+        setLeadListId((current) =>
+          current && lists.some((list) => list.id === current) ? current : (lists[0]?.id ?? '')
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setLeadLists([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const resetPlan = () => {
+    setPlan(null);
+    setPrepared(null);
+    setPrepareKey('');
+    setProblem('');
+  };
+
+  const compile = async () => {
+    setPlanning(true);
+    setProblem('');
+    setPrepared(null);
+    try {
+      const intent =
+        objective === 'prepare_outreach'
+          ? {
+              objective,
+              ...(leadListId ? { people: { existingListId: leadListId } } : {}),
+              channels: [outreachChannel] as Array<'linkedin' | 'email' | 'community'>,
+              autonomy: 'approval_required' as const
+            }
+          : objective === 'capture_inbound'
+            ? {
+                objective,
+                capture: {
+                  name: captureName.trim() || 'Website',
+                  kind: captureKind
+                }
+              }
+            : objective === 'watch_accounts'
+              ? {
+                  objective,
+                  audience: {
+                    ...(audience.trim() ? { description: audience.trim() } : {}),
+                    domains: plannerDomains(accountDomains)
+                  },
+                  timing: { recurring: true }
+                }
+              : objective === 'enrich_contacts'
+                ? {
+                    objective,
+                    audience: { domains: plannerDomains(accountDomains) },
+                    enrichment: {
+                      emailsPerDomain: clampEmailsPerDomain(emailsPerDomain),
+                      includeUnverified
+                    }
+                  }
+                : {
+                    objective,
+                    audience: {
+                      ...(audience.trim() ? { description: audience.trim() } : {}),
+                      quantity
+                    }
+                  };
+      const next = await planGtmIntent(intent);
+      setPlan(next);
+      setPrepareKey(plannerPrepareKey());
+    } catch (error) {
+      setProblem(errorMessage(error, 'Unable to plan this GTM job. Nothing was changed.'));
+    } finally {
+      setPlanning(false);
+    }
+  };
+
+  const prepare = async () => {
+    if (!plan) return;
+    const key = prepareKey || plannerPrepareKey();
+    if (!prepareKey) setPrepareKey(key);
+    setPreparing(true);
+    setProblem('');
+    try {
+      setPrepared(await prepareCompiledGtmPlan(plan, key));
+    } catch (error) {
+      setProblem(errorMessage(error, 'Unable to prepare this GTM plan. Nothing was sent.'));
+    } finally {
+      setPreparing(false);
+    }
+  };
+
+  const prepareSupported = plan?.defaults.prepareSupported === true && plan.blockers.length === 0;
+  const planWarnings = planIssues(plan?.defaults.warnings);
+
+  return (
+    <section className="page-panel gtm-plan-work">
+      <div className="section-heading">
+        <div>
+          <h2>Start new work</h2>
+          <p>
+            State a bounded GTM job, inspect Trevra's deterministic plan, then prepare only what the
+            plan allows.
+          </p>
+        </div>
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={() => setOpen((current) => !current)}
+        >
+          {open ? 'Close' : 'Plan work'}
+        </button>
+      </div>
+
+      {open && (
+        <div className="gtm-plan-body">
+          <div
+            className={
+              objective === 'enrich_contacts' ? 'gtm-plan-form is-enrich-contacts' : 'gtm-plan-form'
+            }
+          >
+            <Field label="Goal">
+              <Select
+                value={objective}
+                onChange={(event) => {
+                  setObjective(event.target.value as PlannerObjective);
+                  resetPlan();
+                }}
+              >
+                {PLANNER_OBJECTIVES.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+
+            {objective === 'prepare_outreach' ? (
+              <>
+                <Field label="People">
+                  <Select
+                    value={leadListId}
+                    onChange={(event) => {
+                      setLeadListId(event.target.value);
+                      resetPlan();
+                    }}
+                  >
+                    <option value="">Choose a People list</option>
+                    {leadLists.map((list) => (
+                      <option key={list.id} value={list.id}>
+                        {list.name} · {list.leadCount} people
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label="Channel">
+                  <Select
+                    value={outreachChannel}
+                    onChange={(event) => {
+                      setOutreachChannel(event.target.value === 'email' ? 'email' : 'linkedin');
+                      resetPlan();
+                    }}
+                  >
+                    <option value="linkedin">LinkedIn</option>
+                    <option value="email">Email</option>
+                  </Select>
+                </Field>
+              </>
+            ) : objective === 'capture_inbound' ? (
+              <>
+                <label>
+                  Source name
+                  <input
+                    value={captureName}
+                    onChange={(event) => {
+                      setCaptureName(event.target.value);
+                      resetPlan();
+                    }}
+                    placeholder="Website"
+                    maxLength={120}
+                  />
+                </label>
+                <label>
+                  Type
+                  <Select
+                    value={captureKind}
+                    onChange={(event) => {
+                      setCaptureKind(
+                        event.target.value as
+                          'website' | 'form' | 'signup' | 'partner' | 'integration'
+                      );
+                      resetPlan();
+                    }}
+                  >
+                    <option value="website">Website</option>
+                    <option value="form">Form</option>
+                    <option value="signup">Signup</option>
+                    <option value="partner">Partner</option>
+                    <option value="integration">Integration</option>
+                  </Select>
+                </label>
+              </>
+            ) : objective === 'watch_accounts' ? (
+              <>
+                <label>
+                  Accounts to watch
+                  <textarea
+                    value={accountDomains}
+                    onChange={(event) => {
+                      setAccountDomains(event.target.value);
+                      resetPlan();
+                    }}
+                    placeholder={'acme.com\nnorthstar.ai\nexample.ch'}
+                    rows={4}
+                  />
+                </label>
+                <label>
+                  Context
+                  <input
+                    value={audience}
+                    onChange={(event) => {
+                      setAudience(event.target.value);
+                      resetPlan();
+                    }}
+                    placeholder="Optional: Swiss B2B SaaS targets"
+                    maxLength={500}
+                  />
+                </label>
+              </>
+            ) : objective === 'enrich_contacts' ? (
+              <>
+                <Field label="Company domains" hint="One per line. Up to 100 per run.">
+                  <Textarea
+                    value={accountDomains}
+                    onChange={(event) => {
+                      setAccountDomains(event.target.value);
+                      resetPlan();
+                    }}
+                    placeholder={'acme.com\nnorthstar.ai'}
+                    rows={4}
+                  />
+                </Field>
+                <Field
+                  label="Contacts per company"
+                  hint="Each one found costs up to 1.5 Hunter credits."
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={emailsPerDomain}
+                    onChange={(event) => {
+                      setEmailsPerDomain(event.target.value);
+                      resetPlan();
+                    }}
+                    onBlur={() => setEmailsPerDomain(String(clampEmailsPerDomain(emailsPerDomain)))}
+                  />
+                </Field>
+                <SwitchField
+                  label="Also save unverified emails"
+                  description="Off by default. Accept-all or unknown addresses are saved marked unverified."
+                  checked={includeUnverified}
+                  onChange={(event) => {
+                    setIncludeUnverified(event.target.checked);
+                    resetPlan();
+                  }}
+                />
+              </>
+            ) : (
+              <>
+                <label>
+                  Audience
+                  <input
+                    value={audience}
+                    onChange={(event) => {
+                      setAudience(event.target.value);
+                      resetPlan();
+                    }}
+                    placeholder="Swiss B2B SaaS companies hiring salespeople"
+                    maxLength={500}
+                  />
+                </label>
+                <label>
+                  Quantity
+                  <input
+                    type="number"
+                    min={1}
+                    max={500}
+                    value={quantity}
+                    onChange={(event) => {
+                      setQuantity(Math.max(1, Math.min(500, Number(event.target.value) || 1)));
+                      resetPlan();
+                    }}
+                  />
+                </label>
+              </>
+            )}
+
+            <button
+              className="primary-button"
+              type="button"
+              disabled={planning}
+              onClick={() => void compile()}
+            >
+              {planning ? 'Planning…' : 'Show plan'}
+            </button>
+          </div>
+
+          {problem && <div className="error-banner">{problem}</div>}
+
+          {plan && (
+            <div className="gtm-plan-preview">
+              <div className="gtm-plan-preview-head">
+                <div>
+                  <span>Your plan</span>
+                  <strong>{plan.summary}</strong>
+                </div>
+                <span className="status-pill">
+                  {plan.consequences.externalWrites ? 'External write' : 'No external write'}
+                </span>
+              </div>
+
+              <ol className="gtm-plan-steps">
+                {plan.steps.map((step) => (
+                  <li key={`${step.kind}:${step.title}`}>
+                    <strong>{step.title}</strong>
+                    <span>{step.detail}</span>
+                  </li>
+                ))}
+              </ol>
+
+              {plan.cost && (
+                <div className="gtm-plan-cost">
+                  <strong>Hunter credits</strong>
+                  {planCostLines(plan.cost).map((line) => (
+                    <span key={line}>{line}</span>
+                  ))}
+                  <a href={plan.cost.pricingUrl} target="_blank" rel="noreferrer">
+                    Hunter pricing
+                  </a>
+                </div>
+              )}
+
+              {plan.blockers.length > 0 && (
+                <div className="gtm-plan-blockers">
+                  <strong>
+                    {plan.blockers.length === 1 ? 'One thing is missing' : 'Things to resolve'}
+                  </strong>
+                  {plan.blockers.map((blocker) => (
+                    <div key={blocker.code}>
+                      <span>{blocker.message}</span>
+                      {blocker.actionHref && (
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => onNavigate(blocker.actionHref!)}
+                        >
+                          Resolve <ChevronRight size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {planWarnings.length > 0 && (
+                <div className="gtm-plan-warnings">
+                  <strong>Worth knowing</strong>
+                  {planWarnings.map((warning) => (
+                    <div key={warning.code}>
+                      <span>{warning.message}</span>
+                      {warning.actionHref && (
+                        <Button onClick={() => onNavigate(warning.actionHref!)}>
+                          Open <ChevronRight size={15} />
+                        </Button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="gtm-plan-actions">
+                {prepareSupported ? (
+                  <button
+                    className="primary-button"
+                    type="button"
+                    disabled={preparing}
+                    onClick={() => void prepare()}
+                  >
+                    {approveLabel(plan.cost, preparing)}
+                  </button>
+                ) : plan.blockers.length === 0 ? (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => onNavigate(plan.next.href)}
+                  >
+                    Continue <ChevronRight size={15} />
+                  </button>
+                ) : null}
+                <span>
+                  {plan.consequences.approvalRequired
+                    ? 'Nothing will be sent until the consequential action is approved.'
+                    : 'This plan contains no consequential external action.'}
+                </span>
+              </div>
+
+              {prepared && (
+                <div className="gtm-plan-result">
+                  <strong>Prepared</strong>
+                  {prepared.objective === 'capture_inbound' ? (
+                    <>
+                      <span>
+                        Signed {prepared.result.source.kind} source “{prepared.result.source.name}”
+                        is ready. Copy this signing secret now; it is not listed again after you
+                        leave this result.
+                      </span>
+                      <code>{prepared.result.secret}</code>
+                      <div className="gtm-plan-actions">
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => void navigator.clipboard.writeText(prepared.result.secret)}
+                        >
+                          <Copy size={15} /> Copy secret
+                        </button>
+                        <button
+                          className="primary-button"
+                          type="button"
+                          onClick={() => onNavigate(prepared.next.href)}
+                        >
+                          Configure capture <ChevronRight size={15} />
+                        </button>
+                      </div>
+                    </>
+                  ) : prepared.objective === 'watch_accounts' ? (
+                    <>
+                      <span>
+                        {prepared.result.accounts.length}{' '}
+                        {prepared.result.accounts.length === 1 ? 'account is' : 'accounts are'}{' '}
+                        active and due for Trevra’s paced observation sweep.
+                      </span>
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => onNavigate(prepared.next.href)}
+                      >
+                        Review accounts <ChevronRight size={15} />
+                      </button>
+                    </>
+                  ) : prepared.objective === 'enrich_contacts' ? (
+                    <>
+                      <span>
+                        Approved. Hunter enrichment for {prepared.result.run.domainCount}{' '}
+                        {prepared.result.run.domainCount === 1 ? 'company' : 'companies'} is queued
+                        with an approved estimate of{' '}
+                        {formatCredits(prepared.result.run.estimatedCredits)}. Once it reaches that
+                        estimate, it stops before its next call. Its progress, spend and outcome
+                        show in the Contact enrichment panel under Setup → Workspace. Saved contacts
+                        appear in the Person picker on Opportunities, with unverified ones marked
+                        Inferred.
+                      </span>
+                      <Button variant="primary" onClick={() => onNavigate(prepared.next.href)}>
+                        View enrichment runs <ChevronRight size={15} />
+                      </Button>
+                    </>
+                  ) : prepared.channel === 'email' ? (
+                    <>
+                      <span>
+                        {prepared.result.prepared.length}{' '}
+                        {prepared.result.prepared.length === 1 ? 'email waits' : 'emails wait'} for
+                        your approval. Nothing is sent before you approve.
+                        {emailSkipSummary(prepared.result.skipped)
+                          ? ` ${emailSkipSummary(prepared.result.skipped)}`
+                          : ''}
+                        {prepared.result.truncated
+                          ? ' This list is larger than one preparation; prepare again for the rest.'
+                          : ''}
+                      </span>
+                      <Button variant="primary" onClick={() => onNavigate(prepared.next.href)}>
+                        Review approvals <ChevronRight size={15} />
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <span>
+                        {prepared.result.campaign.enrolled} people · campaign remains{' '}
+                        {prepared.result.campaign.status}
+                      </span>
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => onNavigate(prepared.next.href)}
+                      >
+                        Review campaign <ChevronRight size={15} />
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+export function LoopCostView({ onNavigate }: { onNavigate: (path: string) => void }) {
+  const [days, setDays] = useState(30);
+  const [cost, setCost] = useState<LoopCost | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [problem, setProblem] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void (async () => {
+      try {
+        const next = await fetchLoopCost(days);
+        if (!cancelled) {
+          setCost(next);
+          setProblem('');
+        }
+      } catch (error) {
+        if (!cancelled)
+          setProblem(
+            error instanceof Error
+              ? error.message
+              : 'Could not read this period. Nothing changed — try again.'
+          );
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [days]);
+
+  return (
+    <div className="page-stack">
+      <section className="page-panel">
+        <div className="section-heading">
+          <div>
+            <h2>What this cost, and what it produced</h2>
+            <p>One period, three rows. The rows are adjacent; they are not a chain.</p>
+          </div>
+          <button className="secondary-button" type="button" onClick={() => onNavigate('/loop')}>
+            Back to the loop
+          </button>
+        </div>
+        <WindowPicker days={days} onDaysChange={setDays} loading={loading} standalone />
+        {problem && (
+          <div className="error-banner">
+            <strong>{problem}</strong> The period selector still works — pick another window, or try
+            this one again.
+          </div>
+        )}
+      </section>
+
+      {!cost && loading && (
+        <section className="page-panel">
+          <div className="empty-state">
+            <LoaderCircle className="spin" size={28} />
+            <h4 aria-level={2}>Reading the period…</h4>
+            <p>One moment.</p>
+          </div>
+        </section>
+      )}
+
+      {cost && (
+        <>
+          <section className="page-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Spent</h2>
+                <p>
+                  {usd(cost.spent.costCents)} on {cost.spent.calls.toLocaleString('en-US')} model{' '}
+                  {cost.spent.calls === 1 ? 'call' : 'calls'} in this window. Every figure in this
+                  panel is USD, billed by your model provider. Trevra does not model customer
+                  revenue or payment state.
+                </p>
+              </div>
+              <span className="status-pill">{usd(cost.spent.budget.spentCents)} this month</span>
+            </div>
+
+            {/* The meter is month-to-date and the table is the window. Two spans,
+            said out loud, because they are two different numbers and putting
+            them side by side without saying so is how a founder concludes the
+            product cannot add up. */}
+            <p className="byok-meter-copy">
+              The cap is a calendar month: {usd(cost.spent.budget.spentCents)} of{' '}
+              {usd(cost.spent.budget.monthlyCapCents)} used since{' '}
+              {new Date(cost.spent.budget.periodStart).toLocaleDateString()}. The table below is the{' '}
+              {cost.windowDays}-day window you picked.
+            </p>
+            {cost.spent.budget.spentCents > 0 && (
+              <div className="byok-meter">
+                <i
+                  style={{
+                    width: `${Math.min(100, Math.round((cost.spent.budget.spentCents / Math.max(cost.spent.budget.monthlyCapCents, 1)) * 100))}%`
+                  }}
+                />
+              </div>
+            )}
+
+            <div className="cost-table">
+              {cost.spent.byModel.map((line) => (
+                <div className="cost-row is-spend" key={`${line.model}:${line.confidence}`}>
+                  <span>{line.model}</span>
+                  <ConfidenceTag
+                    confidence={line.confidence}
+                    source={
+                      line.usageReported
+                        ? 'your provider reported this usage'
+                        : 'estimated from a list-price table'
+                    }
+                  />
+                  <span>
+                    {line.calls.toLocaleString('en-US')} {line.calls === 1 ? 'call' : 'calls'}
+                  </span>
+                  <strong>{usd(line.costCents)}</strong>
+                </div>
+              ))}
+              {cost.spent.byModel.length === 0 && (
+                <p className="empty-copy">No paid model call in this window.</p>
+              )}
+            </div>
+            <p className="cost-note">
+              <strong>HARD FACT</strong> means your provider reported what that call actually used.{' '}
+              <strong>REPORTED</strong> means nothing came back and Trevra priced it from a
+              list-price table — deliberately high, so the cap holds. A model that reported some
+              calls and not others appears twice, because averaging the two would erase the
+              difference.
+            </p>
+            <div className="panel-footer">
+              <span>The cap and the spending switch are settings, so they live in Setup.</span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => onNavigate('/setup')}
+              >
+                Change the cap <ChevronRight size={15} />
+              </button>
+            </div>
+          </section>
+
+          <section className="page-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Sent</h2>
+                <p>
+                  What actually left, in the same window. Scheduled and skipped actions are not in
+                  here.
+                </p>
+              </div>
+              <span className="status-pill">
+                {cost.sent.actionsTotal.toLocaleString('en-US')} actions
+              </span>
+            </div>
+            <div className="cost-table">
+              {cost.sent.actions.map((action) => (
+                <div className="cost-row" key={action.kind}>
+                  <span>{action.kind.replaceAll('_', ' ')}</span>
+                  <strong>{action.count.toLocaleString('en-US')}</strong>
+                </div>
+              ))}
+              {cost.sent.actions.length === 0 && (
+                <p className="empty-copy">Nothing went out in this window.</p>
+              )}
+            </div>
+            {/* Operational/debugging detail -- how the agent runs behind this
+                spend behaved -- not part of the cost summary itself, so it
+                stays closed by default. The counts are already in `cost`,
+                fetched above for this same window; opening this costs no
+                extra read. */}
+            <details className="run-raw">
+              <summary>
+                Agent run detail ({cost.sent.agentRuns.total.toLocaleString('en-US')} runs)
+              </summary>
+              <div className="run-facts">
+                <div className="run-fact">
+                  <span>Agent runs</span>
+                  <strong>{cost.sent.agentRuns.total.toLocaleString('en-US')}</strong>
+                </div>
+                <div className="run-fact">
+                  <span>Completed</span>
+                  <strong>{cost.sent.agentRuns.completed.toLocaleString('en-US')}</strong>
+                </div>
+                <div className="run-fact">
+                  <span>Failed</span>
+                  <strong>{cost.sent.agentRuns.failed.toLocaleString('en-US')}</strong>
+                </div>
+                <div className="run-fact">
+                  <span>Stopped</span>
+                  <strong>{cost.sent.agentRuns.stopped.toLocaleString('en-US')}</strong>
+                </div>
+                <div className="run-fact">
+                  <span>Still running</span>
+                  <strong>{cost.sent.agentRuns.running.toLocaleString('en-US')}</strong>
+                </div>
+              </div>
+            </details>
+          </section>
+          <section className="page-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Produced</h2>
+                <p>Outreach outcomes recorded in the same window.</p>
+              </div>
+            </div>
+            <div className="cost-table">
+              <div className="cost-row">
+                <span>Invites accepted</span>
+                <strong>{cost.produced.accepted.toLocaleString('en-US')}</strong>
+              </div>
+              <div className="cost-row">
+                <span>Replies</span>
+                <strong>{cost.produced.replied.toLocaleString('en-US')}</strong>
+              </div>
+            </div>
+          </section>
+
+          <section className="page-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Where these came from</h2>
+                <p>Every number above is a read of something already recorded.</p>
+              </div>
+            </div>
+            <div className="run-facts">
+              <div className="run-fact">
+                <span>Window</span>
+                <strong>
+                  {cost.windowDays} days, from {new Date(cost.since).toLocaleDateString()}
+                </strong>
+              </div>
+            </div>
+            <div className="panel-footer">
+              <span>The evidence behind each run is in the ledger.</span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => onNavigate('/ledger')}
+              >
+                Open the run ledger <ChevronRight size={15} />
+              </button>
+            </div>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}

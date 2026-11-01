@@ -1,0 +1,186 @@
+import express, { type Express, type Request, type Response } from 'express';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import type { Db } from '../db.js';
+import {
+  CITATION_SOURCE_KIND,
+  inboundSubmissionSchema,
+  LeadCaptureError,
+  type CaptureSourceRecord
+} from './types.js';
+import {
+  getCaptureSourceById,
+  readCaptureSourceSigningSecrets,
+  recordCaptureSourceAccepted,
+  recordCaptureSourceRejected
+} from './sources.js';
+import { acceptInboundSubmission, payloadHash } from './submissions.js';
+import { accountForPerson } from '../person-identities.js';
+import { isMilestoneKind } from './milestones.js';
+import { recordProductMilestone } from './milestone-recorder.js';
+import {
+  captureHeaderProblem,
+  captureSignatureMatches,
+  MAX_CAPTURE_BODY_BYTES,
+  rawCaptureBody,
+  readCaptureHeaders,
+  type CaptureHeaders
+} from './signature.js';
+
+/**
+ * The shared front of both public intakes (this one and watch/citation-intake.ts).
+ *
+ * Header problems need no source, so they are answered first and say nothing
+ * about one. After that an unknown source, a disabled source, a source with no
+ * usable secret and a bad signature are the same 401 with the same body, so an
+ * unsigned caller cannot learn whether a source exists or is enabled. None of
+ * them counts as a rejection: rejected_count is the source's own record of
+ * authenticated-but-refused deliveries, not something anyone can inflate.
+ *
+ * Answers the request and returns null when the caller is not authenticated.
+ */
+export async function authenticateCaptureRequest(
+  db: Db,
+  req: Request,
+  res: Response
+): Promise<{ source: CaptureSourceRecord; headers: CaptureHeaders; rawBody: Buffer } | null> {
+  const headers = readCaptureHeaders(req.headers);
+  const problem = captureHeaderProblem(headers, Math.floor(Date.now() / 1000));
+  if (problem) {
+    res.status(problem.status).json({ error: problem.error });
+    return null;
+  }
+  const source = headers.sourceId ? await getCaptureSourceById(db, headers.sourceId) : null;
+  const rawBody = rawCaptureBody(req.body);
+  const secrets =
+    source && source.status === 'active' ? await readCaptureSourceSigningSecrets(db, source) : [];
+  if (!source || !captureSignatureMatches(secrets, headers, rawBody)) {
+    res.status(401).json({ error: 'Invalid capture signature' });
+    return null;
+  }
+  return { source, headers, rawBody };
+}
+
+async function handleIntake(db: Db, req: Request, res: Response): Promise<void> {
+  const authenticated = await authenticateCaptureRequest(db, req, res);
+  if (!authenticated) return;
+  const { source, headers, rawBody } = authenticated;
+  const reject = async (status: number, message: string) => {
+    await recordCaptureSourceRejected(db, source.id);
+    res.status(status).json({ error: message });
+  };
+  // Checked after the signature, so an unsigned probe cannot learn a source's
+  // kind. A citation secret proves who signed; it does not make this the
+  // endpoint the secret was issued for.
+  if (source.kind === CITATION_SOURCE_KIND)
+    return void (await reject(403, 'This capture source only accepts AI-answer citation samples'));
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return void (await reject(400, 'Invalid JSON body'));
+  }
+  const validated = inboundSubmissionSchema.safeParse(parsed);
+  if (!validated.success)
+    return void (await reject(
+      400,
+      validated.error.issues.map((issue) => issue.message).join('; ')
+    ));
+
+  try {
+    const result = await acceptInboundSubmission(db, {
+      source,
+      idempotencyKey: headers.idempotencyKey,
+      body: validated.data,
+      payloadHash: payloadHash(rawBody)
+    });
+    await recordCaptureSourceAccepted(db, source.id);
+    const kind = result.submission.kind;
+    if (isMilestoneKind(kind)) {
+      // A milestone is an outcome, not inbound to qualify. The submission row stays as
+      // provenance and the milestone is recorded against it. This also runs on a duplicate,
+      // so a retry heals a crash between the two writes. The submission is already accepted,
+      // so a recorder failure is a server fault (5xx, sender retries), never a rejection.
+      try {
+        await recordProductMilestone(db, {
+          workspaceId: source.workspaceId,
+          kind,
+          contactId: result.contactId,
+          accountId:
+            result.accountId ?? (await accountForPerson(db, source.workspaceId, result.contactId)),
+          sourceType: 'inbound_submission',
+          sourceId: result.submission.id,
+          occurredAt: new Date(result.submission.occurredAt ?? result.submission.receivedAt)
+        });
+      } catch (error) {
+        // Name and code only: a pg error's message and detail can carry an email.
+        console.error('milestone recording failed', {
+          name: error instanceof Error ? error.name : 'Error',
+          code: (error as { code?: unknown } | null)?.code
+        });
+        res
+          .status(503)
+          .json({ error: 'Milestone recording failed. Retry with the same idempotency key.' });
+        return;
+      }
+    }
+    res.status(result.duplicate ? 200 : 202).json({
+      submissionId: result.submission.id,
+      personId: result.contactId,
+      accountId: result.accountId,
+      duplicate: result.duplicate
+    });
+  } catch (error) {
+    if (error instanceof LeadCaptureError) {
+      await recordCaptureSourceRejected(db, source.id);
+      res.status(error.status).json({ error: error.message });
+      return;
+    }
+    throw error;
+  }
+}
+
+export function createCaptureSourceLimiter() {
+  return rateLimit({
+    windowMs: 60_000,
+    limit: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // Keyed by caller address AND claimed source: the source header is caller
+    // supplied, so keying on it alone let anyone exhaust a real source's quota
+    // by sending its ID. One source still never spends another's quota.
+    keyGenerator: (req) =>
+      `${ipKeyGenerator(req.ip ?? '')}:${String(req.headers['x-trevra-source'] ?? 'unknown')}`,
+    message: {
+      error: 'Capture source has made too many requests. Retry with the same idempotency key.'
+    }
+  });
+}
+
+export function isEntityTooLarge(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'type' in error &&
+    (error as { type?: string }).type === 'entity.too.large'
+  );
+}
+
+export function registerLeadCaptureIntake(app: Express, db: Db): void {
+  app.post(
+    '/api/intake/v1/submissions',
+    createCaptureSourceLimiter(),
+    express.raw({ type: 'application/json', limit: MAX_CAPTURE_BODY_BYTES }),
+    async (req, res, next) => {
+      try {
+        await handleIntake(db, req, res);
+      } catch (error) {
+        if (isEntityTooLarge(error)) {
+          res.status(413).json({ error: 'Capture payload is too large' });
+          return;
+        }
+        next(error);
+      }
+    }
+  );
+}

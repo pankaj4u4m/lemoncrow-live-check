@@ -1,0 +1,1722 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const nangoMock = vi.hoisted(() => ({
+  createConnectSession: vi.fn(async (_body: Record<string, unknown>) => ({
+    data: { token: 'session-token', expires_at: '2030-01-01T00:00:00.000Z' }
+  })),
+  verifyIncomingWebhookRequest: vi.fn((_raw: string, _headers: Record<string, unknown>) => true),
+  listRecords: vi.fn(async () => ({
+    records: [] as Array<Record<string, unknown>>,
+    next_cursor: null as string | null
+  })),
+  get: vi.fn(async (_config: Record<string, unknown>) => ({ data: {}, headers: {} })),
+  post: vi.fn(async (_config: Record<string, unknown>) => ({ data: {}, headers: {} }))
+}));
+
+const notificationMock = vi.hoisted(() => ({
+  notifyIntegrationNeedsReauth: vi.fn(async () => undefined)
+}));
+vi.mock('./notifications.js', () => notificationMock);
+
+vi.mock('@nangohq/node', () => ({
+  Nango: class {
+    createConnectSession = nangoMock.createConnectSession;
+    verifyIncomingWebhookRequest = nangoMock.verifyIncomingWebhookRequest;
+    listRecords = nangoMock.listRecords;
+    get = nangoMock.get;
+    post = nangoMock.post;
+  }
+}));
+
+const { Db, id, openDatabase } = await import('./db.js');
+const {
+  createNangoConnectSession,
+  defaultConnectSessionIntegrations,
+  handleNangoWebhook,
+  buildMimeMessage,
+  executeConnectedAction,
+  GMAIL_MESSAGE_ID_READ_TIMEOUT_MS,
+  githubProviderConfigKey,
+  ingestCanonicalRecord,
+  listAvailableIntegrations,
+  readConnectedEmailThreadEvents
+} = await import('./integration-service.js');
+const { createSuppression, findSuppression } = await import('./suppressions.js');
+const { resolveContact } = await import('./lead-capture/people.js');
+const { upsertSeat } = await import('./linkedin/seats.js');
+const { createLeadList, importLeadCsv } = await import('./linkedin/lead-lists.js');
+const { addExclusions } = await import('./linkedin/exclusions.js');
+const { findUnsubscribeDelivery } = await import('./email/unsubscribe.js');
+
+type DbQueryable = ConstructorParameters<typeof Db>[0];
+type LiveDb = InstanceType<typeof Db>;
+
+function stubDb(connectedKeys: string[] = []): InstanceType<typeof Db> {
+  return new Db({
+    query: async () => ({
+      rows: connectedKeys.map((provider_config_key) => ({ provider_config_key })),
+      rowCount: connectedKeys.length
+    })
+  } as unknown as DbQueryable);
+}
+
+const managedEnv = [
+  'NANGO_API_KEY',
+  'NANGO_HOST',
+  'NANGO_PUBLIC_SERVER_URL',
+  'NANGO_HUBSPOT_INTEGRATION',
+  'NANGO_ATTIO_INTEGRATION',
+  'NANGO_EXA_INTEGRATION',
+  'NANGO_REDDIT_INTEGRATION',
+  'NANGO_BUFFER_INTEGRATION',
+  'NANGO_GITHUB_INTEGRATION'
+];
+
+let live: LiveDb | undefined;
+const createdWorkspaces: string[] = [];
+
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  for (const key of managedEnv) delete process.env[key];
+  nangoMock.createConnectSession.mockClear();
+  nangoMock.verifyIncomingWebhookRequest.mockClear();
+  nangoMock.listRecords.mockClear();
+  nangoMock.get.mockReset();
+  nangoMock.get.mockResolvedValue({ data: {}, headers: {} });
+  nangoMock.post.mockReset();
+  nangoMock.post.mockResolvedValue({ data: {}, headers: {} });
+  notificationMock.notifyIntegrationNeedsReauth.mockClear();
+  if (live) {
+    for (const workspaceId of createdWorkspaces.splice(0)) {
+      await live.prepare('DELETE FROM workspaces WHERE id=?').run(workspaceId);
+    }
+    await live.close();
+    live = undefined;
+  }
+});
+
+async function openLiveDatabase(): Promise<LiveDb> {
+  live = await openDatabase({ connectionString: process.env.TEST_DATABASE_URL, seedDemo: false });
+  return live;
+}
+
+/** A throwaway tenant with one GTM identity, torn down in afterEach. */
+async function seedTenant(database: LiveDb): Promise<{ workspaceId: string }> {
+  const now = new Date().toISOString();
+  const workspaceId = id('ws');
+  createdWorkspaces.push(workspaceId);
+  await database
+    .prepare('INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?)')
+    .run(workspaceId, `Tenant ${workspaceId}`, now);
+  return { workspaceId };
+}
+
+describe('integration catalog', () => {
+  it('exposes CRM and prospecting sources with the right mode and category', async () => {
+    const integrations = await listAvailableIntegrations(stubDb(), 'ws_test');
+    const byProvider = new Map(integrations.map((item) => [item.provider, item]));
+
+    expect(byProvider.get('hubspot')).toMatchObject({
+      key: 'trevra-hubspot',
+      name: 'HubSpot',
+      category: 'crm',
+      mode: 'oauth',
+      connected: false
+    });
+    expect(byProvider.get('attio')).toMatchObject({
+      key: 'trevra-attio',
+      name: 'Attio',
+      category: 'crm',
+      mode: 'oauth',
+      connected: false
+    });
+    expect(byProvider.get('exa')).toMatchObject({
+      key: 'trevra-exa',
+      name: 'Exa',
+      category: 'data',
+      mode: 'apiKey',
+      connected: false
+    });
+    expect(byProvider.get('reddit')).toMatchObject({
+      key: 'trevra-reddit',
+      name: 'Reddit',
+      category: 'data',
+      mode: 'oauth',
+      connected: false
+    });
+    expect(byProvider.get('buffer')).toMatchObject({
+      key: 'trevra-buffer',
+      name: 'Buffer',
+      category: 'communication',
+      mode: 'apiKey',
+      connected: false
+    });
+  });
+
+  // Apollo's terms forbid integrating their API with another product, so the catalog must not offer
+  // it however convenient Nango's `apollo` provider config makes it. Asserted, not just commented,
+  // because the next person to add a data source will reach for Apollo first.
+  it('does not offer Apollo', async () => {
+    const integrations = await listAvailableIntegrations(stubDb(), 'ws_test');
+    expect(integrations.map((item) => item.provider)).not.toContain('apollo');
+  });
+
+  it('resolves a key-based integration id from the environment exactly like an OAuth one', async () => {
+    process.env.NANGO_EXA_INTEGRATION = 'acme-exa';
+    process.env.NANGO_HUBSPOT_INTEGRATION = 'acme-hubspot';
+    const integrations = await listAvailableIntegrations(stubDb(['acme-exa']), 'ws_test');
+
+    expect(integrations.find((item) => item.provider === 'exa')).toMatchObject({
+      key: 'acme-exa',
+      connected: true
+    });
+    expect(integrations.find((item) => item.provider === 'hubspot')).toMatchObject({
+      key: 'acme-hubspot',
+      connected: false
+    });
+  });
+
+  it('never exposes a credential on a catalog row', async () => {
+    const integrations = await listAvailableIntegrations(stubDb(), 'ws_test');
+    expect(integrations.length).toBeGreaterThan(0);
+    for (const item of integrations) {
+      expect(Object.keys(item).sort()).toEqual([
+        'category',
+        'connected',
+        'description',
+        'key',
+        'mode',
+        'name',
+        'provider'
+      ]);
+    }
+  });
+
+  it('offers GitHub as a read-only OAuth data source', async () => {
+    const integrations = await listAvailableIntegrations(stubDb(), 'ws_test');
+    expect(integrations.find((item) => item.provider === 'github')).toMatchObject({
+      key: 'trevra-github',
+      name: 'GitHub',
+      category: 'data',
+      mode: 'oauth',
+      connected: false
+    });
+    expect(defaultConnectSessionIntegrations()).toContain('trevra-github');
+  });
+
+  it('resolves the GitHub integration id from NANGO_GITHUB_INTEGRATION', () => {
+    expect(githubProviderConfigKey()).toBe('trevra-github');
+    process.env.NANGO_GITHUB_INTEGRATION = 'acme-github';
+    expect(githubProviderConfigKey()).toBe('acme-github');
+  });
+});
+
+describe('Nango connect sessions', () => {
+  it('offers key-based integrations in the default allow-list', async () => {
+    const allowed = defaultConnectSessionIntegrations();
+
+    expect(allowed).toEqual(
+      expect.arrayContaining([
+        'trevra-exa',
+        'trevra-reddit',
+        'trevra-hubspot',
+        'trevra-attio',
+        'trevra-gmail'
+      ])
+    );
+    expect(allowed).not.toEqual(expect.arrayContaining(['upwork', 'fiverr', 'contra']));
+  });
+
+  it('sends key-based integrations to Nango when the caller does not restrict the session', async () => {
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    process.env.NANGO_PUBLIC_SERVER_URL = 'https://connect.example';
+
+    const session = await createNangoConnectSession({
+      workspaceId: 'ws_test',
+      userId: 'usr_test',
+      userEmail: 'operator@example.com',
+      allowedIntegrations: []
+    });
+
+    expect(session).toMatchObject({
+      token: 'session-token',
+      browser_host: 'https://connect.example'
+    });
+    const body = nangoMock.createConnectSession.mock.calls[0]![0] as {
+      allowed_integrations: string[];
+    };
+    expect(body.allowed_integrations).toEqual(
+      expect.arrayContaining(['trevra-exa', 'trevra-hubspot', 'trevra-attio'])
+    );
+    expect(body.allowed_integrations).not.toEqual(expect.arrayContaining(['upwork']));
+  });
+
+  it('honours an explicit key-based allow-list', async () => {
+    process.env.NANGO_API_KEY = 'test-nango-key';
+
+    await createNangoConnectSession({
+      workspaceId: 'ws_test',
+      userId: 'usr_test',
+      userEmail: 'operator@example.com',
+      allowedIntegrations: ['trevra-exa']
+    });
+
+    const body = nangoMock.createConnectSession.mock.calls[0]![0] as {
+      allowed_integrations: string[];
+    };
+    expect(body.allowed_integrations).toEqual(['trevra-exa']);
+  });
+});
+
+describe('GTM canonical ingestion', () => {
+  it('stores GTM messages and opportunities on canonical People', async () => {
+    const database = await openLiveDatabase();
+    const tenant = await seedTenant(database);
+    const occurredAt = new Date().toISOString();
+
+    await ingestCanonicalRecord(database, tenant.workspaceId, 'test', null, {
+      kind: 'message',
+      id: `msg-${id('x')}`,
+      accountName: 'Prospect Co',
+      personName: 'Ada Example',
+      personEmail: 'ada@example.test',
+      direction: 'inbound',
+      subject: 'Demo request',
+      body: 'Can we talk next week?',
+      occurredAt
+    });
+    await ingestCanonicalRecord(database, tenant.workspaceId, 'test', null, {
+      kind: 'opportunity',
+      id: `opp-${id('x')}`,
+      accountName: 'Prospect Co',
+      personName: 'Ada Example',
+      personEmail: 'ada@example.test',
+      title: 'Demo follow-up',
+      status: 'qualified',
+      proposalSentAt: occurredAt
+    });
+
+    const canonicalPerson = await database
+      .prepare(
+        'SELECT id,name,email_normalized FROM contacts WHERE workspace_id=? AND email_normalized=?'
+      )
+      .get<{ id: string; name: string; email_normalized: string }>(
+        tenant.workspaceId,
+        'ada@example.test'
+      );
+    expect(canonicalPerson).toMatchObject({
+      name: 'Ada Example',
+      email_normalized: 'ada@example.test'
+    });
+
+    const identity = await database
+      .prepare(
+        'SELECT provider,identity_type,identity_value,person_id FROM person_identities WHERE workspace_id=? AND normalized_value=?'
+      )
+      .get<Record<string, unknown>>(tenant.workspaceId, 'ada@example.test');
+    expect(identity).toMatchObject({
+      provider: 'test',
+      identity_type: 'email',
+      identity_value: 'ada@example.test',
+      person_id: canonicalPerson?.id
+    });
+
+    const message = await database
+      .prepare(
+        'SELECT direction,subject,body,person_id FROM messages WHERE workspace_id=? AND subject=?'
+      )
+      .get<Record<string, unknown>>(tenant.workspaceId, 'Demo request');
+    expect(message).toEqual({
+      direction: 'inbound',
+      subject: 'Demo request',
+      body: 'Can we talk next week?',
+      person_id: canonicalPerson?.id
+    });
+
+    const opportunity = await database
+      .prepare(
+        'SELECT title,stage,proposal_sent_at,person_id FROM opportunities WHERE workspace_id=? AND title=?'
+      )
+      .get<Record<string, unknown>>(tenant.workspaceId, 'Demo follow-up');
+    expect(opportunity).toMatchObject({
+      title: 'Demo follow-up',
+      stage: 'qualified',
+      person_id: canonicalPerson?.id
+    });
+    expect(opportunity?.proposal_sent_at).toBeTruthy();
+
+    const sourceRecords = await database
+      .prepare(
+        'SELECT object_type,provider FROM source_records WHERE workspace_id=? ORDER BY object_type'
+      )
+      .all<Record<string, unknown>>(tenant.workspaceId);
+    expect(sourceRecords).toEqual([
+      { object_type: 'message', provider: 'test' },
+      { object_type: 'opportunity', provider: 'test' }
+    ]);
+  });
+});
+
+describe('connected mailbox threading', () => {
+  async function mailbox(provider: 'gmail' | 'microsoft') {
+    const database = await openLiveDatabase();
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    const tenant = await seedTenant(database);
+    const connectionId = id('conn');
+    await database
+      .prepare(
+        'INSERT INTO connections (id,workspace_id,provider,provider_config_key,external_connection_id,display_name,status,is_demo,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      )
+      .run(
+        connectionId,
+        tenant.workspaceId,
+        provider,
+        `trevra-${provider}`,
+        `${provider}-external`,
+        `${provider}@example.test`,
+        'connected',
+        0,
+        new Date().toISOString(),
+        new Date().toISOString()
+      );
+    return { database, workspaceId: tenant.workspaceId, connectionId };
+  }
+
+  async function seedLinkedInRecipient(database: LiveDb, workspaceId: string) {
+    await upsertSeat(
+      database,
+      workspaceId,
+      { label: 'Owner', timezone: 'Europe/Zurich' },
+      new Date()
+    );
+    const list = await createLeadList(database, { workspaceId, name: 'Import only' });
+    await importLeadCsv(database, {
+      workspaceId,
+      listId: list.id,
+      csv: 'First Name,Last Name,Company,Email,LinkedIn URL\nMaya,Smith,Acme,lead@example.test,https://linkedin.com/in/maya-optout\n'
+    });
+  }
+
+  it('blocks noncampaign email when a linked lead is DNC without a suppression row', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await seedLinkedInRecipient(database, workspaceId);
+    await database
+      .prepare(
+        'UPDATE linkedin_lead_contacts SET do_not_contact=TRUE WHERE workspace_id=? AND email=?'
+      )
+      .run(workspaceId, 'lead@example.test');
+    expect(
+      await findSuppression(database, workspaceId, { channel: 'email', email: 'lead@example.test' })
+    ).toBeNull();
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Should be held',
+        body: 'No send',
+        structured_payload_json: '{}',
+        payload_hash: 'legacy-lead-dnc'
+      })
+    ).rejects.toThrow(/do-not-contact/);
+    expect(nangoMock.post).not.toHaveBeenCalled();
+    expect(
+      await database
+        .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+        .get<{ status: string }>(workspaceId, 'legacy-lead-dnc')
+    ).toEqual({ status: 'failed' });
+  });
+
+  it('blocks a noncampaign send to a Person whose canonical email changed but whose imported lead is DNC', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await seedLinkedInRecipient(database, workspaceId);
+    await database
+      .prepare(
+        `UPDATE contacts SET email='alias@example.test', email_normalized='alias@example.test'
+       WHERE workspace_id=? AND id=(SELECT person_id FROM linkedin_lead_contacts WHERE workspace_id=? AND email=?)`
+      )
+      .run(workspaceId, workspaceId, 'lead@example.test');
+    await database
+      .prepare(
+        'UPDATE linkedin_lead_contacts SET do_not_contact=TRUE WHERE workspace_id=? AND email=?'
+      )
+      .run(workspaceId, 'lead@example.test');
+    expect(
+      await findSuppression(database, workspaceId, {
+        channel: 'email',
+        email: 'alias@example.test'
+      })
+    ).toBeNull();
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'alias@example.test',
+        subject: 'Alternate address',
+        body: 'Must not send',
+        structured_payload_json: '{}',
+        payload_hash: 'same-person-new-address-dnc'
+      })
+    ).rejects.toThrow(/do-not-contact/);
+    expect(nangoMock.post).not.toHaveBeenCalled();
+  });
+
+  it('blocks noncampaign email for a linked Never Contact profile without a suppression row', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await seedLinkedInRecipient(database, workspaceId);
+    await addExclusions(
+      database,
+      workspaceId,
+      [
+        {
+          targetRef: 'https://www.linkedin.com/in/maya-optout/?trk=operator',
+          reason: 'Asked not to be contacted',
+          source: 'test'
+        }
+      ],
+      new Date()
+    );
+    expect(
+      await findSuppression(database, workspaceId, { channel: 'email', email: 'lead@example.test' })
+    ).toBeNull();
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Should be held',
+        body: 'No send',
+        structured_payload_json: '{}',
+        payload_hash: 'legacy-lead-never-contact'
+      })
+    ).rejects.toThrow(/Never Contact/);
+    expect(nangoMock.post).not.toHaveBeenCalled();
+  });
+  it('refuses a globally suppressed email before contacting the provider', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await createSuppression(database, {
+      workspaceId,
+      channel: 'email',
+      email: 'blocked@example.test',
+      reason: 'Unsubscribed',
+      source: 'test'
+    });
+
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'BLOCKED@example.test',
+        subject: 'Should not send',
+        body: 'Blocked',
+        structured_payload_json: '{}',
+        payload_hash: 'blocked-key'
+      })
+    ).rejects.toThrow(/Unsubscribed/);
+    expect(nangoMock.post).not.toHaveBeenCalled();
+  });
+
+  it('blocks a Gmail send when suppression arrives during thread lookup', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    let signalLookup!: () => void;
+    let releaseLookup!: () => void;
+    const lookupStarted = new Promise<void>((resolve) => (signalLookup = resolve));
+    const lookupRelease = new Promise<void>((resolve) => (releaseLookup = resolve));
+    nangoMock.get.mockImplementation(async (config: Record<string, unknown>) => {
+      if ((config.params as { format?: string } | undefined)?.format === 'minimal') {
+        signalLookup();
+        await lookupRelease;
+        return { data: { threadId: 'existing-thread' }, headers: {} };
+      }
+      return { data: {}, headers: {} };
+    });
+    const sending = executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Follow-up',
+      body: 'Checking back',
+      structured_payload_json: JSON.stringify({ threaded: true, threadExternalRef: 'old-message' }),
+      payload_hash: 'race-gmail-thread-suppression'
+    });
+    await lookupStarted;
+    await createSuppression(database, {
+      workspaceId,
+      channel: 'all',
+      email: 'lead@example.test',
+      reason: 'Opted out during lookup',
+      source: 'race_test'
+    });
+    releaseLookup();
+    await expect(sending).rejects.toThrow(/Opted out during lookup/);
+    expect(nangoMock.post).not.toHaveBeenCalled();
+    expect(
+      await database
+        .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+        .get<{ status: string }>(workspaceId, 'race-gmail-thread-suppression')
+    ).toEqual({ status: 'failed' });
+  });
+
+  it('prevents Microsoft send when suppression arrives after a draft was created', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('microsoft');
+    let signalDraft!: () => void;
+    let releaseDraft!: () => void;
+    const draftStarted = new Promise<void>((resolve) => (signalDraft = resolve));
+    const draftRelease = new Promise<void>((resolve) => (releaseDraft = resolve));
+    nangoMock.post.mockImplementation(async (config: Record<string, unknown>) => {
+      if (config.endpoint === '/v1.0/me/messages') {
+        signalDraft();
+        await draftRelease;
+        return { data: { id: 'prepared-draft' }, headers: {} };
+      }
+      throw new Error('Unexpected provider send after suppression');
+    });
+    const sending = executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Draft',
+      body: 'Must not send',
+      structured_payload_json: '{}',
+      payload_hash: 'race-ms-draft-suppression'
+    });
+    await draftStarted;
+    await createSuppression(database, {
+      workspaceId,
+      channel: 'email',
+      email: 'lead@example.test',
+      reason: 'Opted out while drafting',
+      source: 'race_test'
+    });
+    releaseDraft();
+    await expect(sending).rejects.toThrow(/Opted out while drafting/);
+    expect(nangoMock.post).toHaveBeenCalledTimes(1);
+    expect(nangoMock.post.mock.calls[0]?.[0]).toMatchObject({ endpoint: '/v1.0/me/messages' });
+    expect(
+      await database
+        .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+        .get<{ status: string }>(workspaceId, 'race-ms-draft-suppression')
+    ).toEqual({ status: 'failed' });
+  });
+
+  it('threads Gmail follow-ups with threadId and RFC reply headers', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post
+      .mockResolvedValueOnce({ data: { id: 'gmail-first', threadId: 'thread-1' }, headers: {} })
+      .mockResolvedValueOnce({ data: { id: 'gmail-second', threadId: 'thread-1' }, headers: {} });
+    // The post-send Message-ID read-back finds no header; the thread lookup answers.
+    nangoMock.get.mockImplementation(async (config: Record<string, unknown>) =>
+      (config.params as { format?: string } | undefined)?.format === 'minimal'
+        ? { data: { threadId: 'thread-1' }, headers: {} }
+        : { data: {}, headers: {} }
+    );
+
+    const first = await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'First body',
+      structured_payload_json: JSON.stringify({ threaded: true }),
+      payload_hash: 'first-key'
+    });
+    expect(first).toEqual({ provider: 'gmail', externalRef: 'gmail-first' });
+
+    const second = await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'Second body',
+      structured_payload_json: JSON.stringify({
+        threaded: true,
+        threadExternalRef: 'gmail-first',
+        threadIdempotencyKey: 'first-key'
+      }),
+      payload_hash: 'second-key'
+    });
+    expect(second).toEqual({ provider: 'gmail', externalRef: 'gmail-second' });
+    expect(nangoMock.get.mock.calls[1]?.[0]).toMatchObject({
+      endpoint: '/gmail/v1/users/me/messages/gmail-first',
+      params: { format: 'minimal' }
+    });
+    const secondSend = nangoMock.post.mock.calls[1]?.[0] as {
+      data?: { raw?: string; threadId?: string };
+    };
+    expect(secondSend.data?.threadId).toBe('thread-1');
+    const mime = Buffer.from(String(secondSend.data?.raw ?? ''), 'base64url').toString('utf8');
+    expect(mime).toContain('In-Reply-To: <first-key@trevra.app>');
+    expect(mime).toContain('References: <first-key@trevra.app>');
+    expect(mime).toContain('Message-ID: <second-key@trevra.app>');
+  });
+
+  it('sends an HTML alternative through Gmail when campaign tracking prepared one', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({
+      data: { id: 'gmail-html', threadId: 'thread-html' },
+      headers: {}
+    });
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Tracked',
+      body: 'Read https://example.test/demo',
+      structured_payload_json: JSON.stringify({
+        threaded: false,
+        htmlBody:
+          'Read <a href="https://trevra.test/t/e/open/c/link">https://example.test/demo</a><img src="https://trevra.test/t/e/open/open.gif" />'
+      }),
+      payload_hash: 'html-key'
+    });
+    const send = nangoMock.post.mock.calls[0]?.[0] as { data?: { raw?: string } };
+    const mime = Buffer.from(String(send.data?.raw ?? ''), 'base64url').toString('utf8');
+    expect(mime).toContain('Content-Type: multipart/alternative');
+    expect(mime).toContain('Content-Type: text/html; charset=UTF-8');
+    expect(mime).toContain('https://trevra.test/t/e/open/open.gif');
+  });
+
+  it('reads Gmail thread replies and delivery failures as idempotent provider events', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.get
+      .mockResolvedValueOnce({ data: { threadId: 'thread-telemetry' }, headers: {} })
+      .mockResolvedValueOnce({
+        data: {
+          messages: [
+            { id: 'gmail-sent', internalDate: '1787216400000', payload: { headers: [] } },
+            {
+              id: 'gmail-reply',
+              internalDate: '1787216460000',
+              payload: {
+                mimeType: 'text/plain',
+                body: { data: Buffer.from('Interested — Friday works.').toString('base64url') },
+                headers: [
+                  { name: 'From', value: 'Lead <lead@example.test>' },
+                  { name: 'Subject', value: 'Re: hello' }
+                ]
+              }
+            },
+            {
+              id: 'gmail-bounce',
+              internalDate: '1787216520000',
+              payload: {
+                headers: [
+                  { name: 'From', value: 'Mail Delivery Subsystem <mailer-daemon@googlemail.com>' },
+                  { name: 'Subject', value: 'Delivery Status Notification (Failure)' }
+                ]
+              }
+            }
+          ]
+        },
+        headers: {}
+      });
+
+    const events = await readConnectedEmailThreadEvents(database, workspaceId, {
+      localConnectionId: connectionId,
+      externalRef: 'gmail-sent',
+      recipient: 'lead@example.test'
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'reply',
+          providerEventId: 'gmail:gmail-reply',
+          body: 'Interested — Friday works.',
+          subject: 'Re: hello',
+          sender: 'lead@example.test'
+        }),
+        expect.objectContaining({
+          kind: 'delivery_failure',
+          providerEventId: 'gmail:gmail-bounce'
+        })
+      ])
+    );
+  });
+
+  it('threads Microsoft follow-ups through Graph reply drafts', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('microsoft');
+    nangoMock.post
+      .mockResolvedValueOnce({ data: { id: 'ms-first' }, headers: {} })
+      .mockResolvedValueOnce({ data: {}, headers: {} })
+      .mockResolvedValueOnce({ data: { id: 'ms-reply' }, headers: {} })
+      .mockResolvedValueOnce({ data: {}, headers: {} });
+
+    const first = await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'First body',
+      structured_payload_json: JSON.stringify({ threaded: true }),
+      payload_hash: 'ms-first-key'
+    });
+    expect(first).toEqual({ provider: 'microsoft', externalRef: 'ms-first' });
+    expect(nangoMock.post.mock.calls[0]?.[0]).toMatchObject({ endpoint: '/v1.0/me/messages' });
+    expect(nangoMock.post.mock.calls[1]?.[0]).toMatchObject({
+      endpoint: '/v1.0/me/messages/ms-first/send'
+    });
+
+    const second = await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'Second body',
+      structured_payload_json: JSON.stringify({
+        threaded: true,
+        threadExternalRef: 'ms-first',
+        threadIdempotencyKey: 'ms-first-key'
+      }),
+      payload_hash: 'ms-second-key'
+    });
+    expect(second).toEqual({ provider: 'microsoft', externalRef: 'ms-reply' });
+    expect(nangoMock.post.mock.calls[2]?.[0]).toMatchObject({
+      endpoint: '/v1.0/me/messages/ms-first/createReply',
+      data: { message: { body: { contentType: 'Text', content: 'Second body' } } }
+    });
+    expect(nangoMock.post.mock.calls[3]?.[0]).toMatchObject({
+      endpoint: '/v1.0/me/messages/ms-reply/send'
+    });
+  });
+
+  it('adds RFC 8058 one-click unsubscribe headers to Gmail outreach', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-outreach' }, headers: {} });
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Hello',
+      body: 'Hi there',
+      structured_payload_json: JSON.stringify({ requireListUnsubscribe: true }),
+      payload_hash: 'outreach-unsubscribe-key'
+    });
+    const send = nangoMock.post.mock.calls[0]?.[0] as { data?: { raw?: string } };
+    const mime = Buffer.from(String(send.data?.raw ?? ''), 'base64url').toString('utf8');
+    const token = /List-Unsubscribe: <https:\/\/api\.trevra\.test\/u\/([^>]+)>/.exec(mime)?.[1];
+    expect(token).toBeTruthy();
+    expect(mime).toContain('List-Unsubscribe-Post: List-Unsubscribe=One-Click');
+    expect(mime.indexOf('List-Unsubscribe:')).toBeLessThan(mime.indexOf('MIME-Version: 1.0'));
+    expect(await findUnsubscribeDelivery(database, token!)).toMatchObject({
+      workspaceId,
+      recipient: 'lead@example.test'
+    });
+  });
+
+  it('keeps unsubscribe headers out of conversation replies', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-reply-only' }, headers: {} });
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Re: Hello',
+      body: 'Thanks!',
+      structured_payload_json: JSON.stringify({ deliveryPurpose: 'reply' }),
+      payload_hash: 'reply-no-unsubscribe-key'
+    });
+    const send = nangoMock.post.mock.calls[0]?.[0] as { data?: { raw?: string } };
+    const mime = Buffer.from(String(send.data?.raw ?? ''), 'base64url').toString('utf8');
+    expect(mime).not.toContain('List-Unsubscribe');
+  });
+
+  it('sends Microsoft outreach as MIME so the unsubscribe headers survive', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('microsoft');
+    nangoMock.post
+      .mockResolvedValueOnce({
+        data: { id: 'ms-mime-first', internetMessageId: '<first@outlook.test>' },
+        headers: {}
+      })
+      .mockResolvedValueOnce({ data: {}, headers: {} })
+      .mockResolvedValueOnce({ data: { id: 'ms-mime-second' }, headers: {} })
+      .mockResolvedValueOnce({ data: {}, headers: {} });
+
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'First body',
+      structured_payload_json: JSON.stringify({ threaded: true, requireListUnsubscribe: true }),
+      payload_hash: 'ms-mime-first-key'
+    });
+    const draft = nangoMock.post.mock.calls[0]?.[0] as {
+      endpoint?: string;
+      headers?: Record<string, string>;
+      data?: unknown;
+    };
+    expect(draft.endpoint).toBe('/v1.0/me/messages');
+    expect(draft.headers).toEqual({ 'Content-Type': 'text/plain' });
+    const mime = Buffer.from(String(draft.data), 'base64').toString('utf8');
+    expect(mime).toContain('List-Unsubscribe: <https://api.trevra.test/u/del_');
+    expect(mime).toContain('List-Unsubscribe-Post: List-Unsubscribe=One-Click');
+    const firstRow = await database
+      .prepare(
+        'SELECT internet_message_id FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?'
+      )
+      .get<{ internet_message_id: string | null }>(workspaceId, 'ms-mime-first-key');
+    expect(firstRow?.internet_message_id).toBe('<first@outlook.test>');
+    expect(nangoMock.post.mock.calls[1]?.[0]).toMatchObject({
+      endpoint: '/v1.0/me/messages/ms-mime-first/send'
+    });
+
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Same subject',
+      body: 'Second body',
+      structured_payload_json: JSON.stringify({
+        threaded: true,
+        threadExternalRef: 'ms-mime-first',
+        threadIdempotencyKey: 'ms-mime-first-key',
+        requireListUnsubscribe: true
+      }),
+      payload_hash: 'ms-mime-second-key'
+    });
+    const followUp = nangoMock.post.mock.calls[2]?.[0] as { endpoint?: string; data?: unknown };
+    expect(followUp.endpoint).toBe('/v1.0/me/messages');
+    expect(Buffer.from(String(followUp.data), 'base64').toString('utf8')).toContain(
+      'In-Reply-To: <first@outlook.test>'
+    );
+    expect(Buffer.from(String(followUp.data), 'base64').toString('utf8')).toContain(
+      'References: <first@outlook.test>'
+    );
+  });
+
+  it('stores the Message-ID Gmail actually sent, so a threaded reply to it suppresses', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    const now = new Date().toISOString();
+    await database
+      .prepare(
+        "INSERT INTO email_inbound_mailboxes (workspace_id,connection_id,address,sync_status,designated_at,updated_at) VALUES (?,?,'box@example.test','syncing',?,?)"
+      )
+      .run(workspaceId, connectionId, now, now);
+    await resolveContact(database, workspaceId, {
+      name: 'Lead Person',
+      email: 'lead@example.test'
+    });
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-readback' }, headers: {} });
+    nangoMock.get.mockResolvedValueOnce({
+      data: {
+        id: 'gmail-readback',
+        payload: {
+          headers: [{ name: 'Message-Id', value: ' <CAF.provider-1@mail.gmail.com> ' }]
+        }
+      },
+      headers: {}
+    });
+
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Hello',
+      body: 'Hi there',
+      structured_payload_json: '{}',
+      payload_hash: 'gmail-readback-key'
+    });
+
+    expect(nangoMock.get).toHaveBeenCalledTimes(1);
+    expect(nangoMock.get.mock.calls[0]?.[0]).toMatchObject({
+      endpoint: '/gmail/v1/users/me/messages/gmail-readback',
+      providerConfigKey: 'trevra-gmail',
+      connectionId: 'gmail-external',
+      params: { format: 'metadata', metadataHeaders: 'Message-ID' }
+    });
+    expect(
+      await database
+        .prepare(
+          'SELECT status,internet_message_id FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?'
+        )
+        .get(workspaceId, 'gmail-readback-key')
+    ).toEqual({ status: 'sent', internet_message_id: '<CAF.provider-1@mail.gmail.com>' });
+
+    await ingestCanonicalRecord(database, workspaceId, 'gmail', connectionId, {
+      kind: 'message',
+      id: 'gmail-readback-reply',
+      personEmail: 'lead@example.test',
+      personName: 'Lead Person',
+      direction: 'inbound',
+      subject: 'Re: Hello',
+      body: 'Please unsubscribe me.',
+      occurredAt: new Date().toISOString(),
+      mailboxAddress: 'box@example.test',
+      replyToMessageIds: ['<CAF.provider-1@mail.gmail.com>']
+    });
+    expect(
+      await findSuppression(database, workspaceId, { channel: 'email', email: 'lead@example.test' })
+    ).toMatchObject({ source: 'email_reply_unsubscribe' });
+  });
+
+  it('keeps the generated Message-ID and the sent delivery when the Gmail read-back fails', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-readback-fail' }, headers: {} });
+    nangoMock.get.mockRejectedValueOnce(new Error('Gmail metadata read failed'));
+
+    const result = await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Hello',
+      body: 'Hi there',
+      structured_payload_json: '{}',
+      payload_hash: 'gmail-readback-fail-key'
+    });
+
+    expect(result).toEqual({ provider: 'gmail', externalRef: 'gmail-readback-fail' });
+    expect(nangoMock.post).toHaveBeenCalledTimes(1);
+    expect(nangoMock.get).toHaveBeenCalledTimes(1);
+    expect(
+      await database
+        .prepare(
+          'SELECT status,internet_message_id FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?'
+        )
+        .get(workspaceId, 'gmail-readback-fail-key')
+    ).toEqual({ status: 'sent', internet_message_id: '<gmail-readback-fail-key@trevra.app>' });
+  });
+
+  it('gives up on a Gmail read-back that never answers and keeps the generated Message-ID', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-readback-hang' }, headers: {} });
+    // The read-back's bound is armed before nango.get is called, so the mock can
+    // run the clock past it while the read itself never settles.
+    nangoMock.get.mockImplementationOnce(() => {
+      vi.advanceTimersByTime(GMAIL_MESSAGE_ID_READ_TIMEOUT_MS);
+      return new Promise<never>(() => undefined);
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const result = await executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Hello',
+        body: 'Hi there',
+        structured_payload_json: '{}',
+        payload_hash: 'gmail-readback-hang-key'
+      });
+      expect(result).toEqual({ provider: 'gmail', externalRef: 'gmail-readback-hang' });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(nangoMock.get).toHaveBeenCalledTimes(1);
+    expect(
+      await database
+        .prepare(
+          'SELECT status,internet_message_id FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?'
+        )
+        .get(workspaceId, 'gmail-readback-hang-key')
+    ).toEqual({ status: 'sent', internet_message_id: '<gmail-readback-hang-key@trevra.app>' });
+  }, 10_000);
+
+  it('blocks legacy campaign email without Person binding, consent-safe header and verified sender', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    vi.stubEnv('TREVRA_SECRETS_KEY', 'legacy-path-secrets-key');
+    const ms = await mailbox('microsoft');
+    await expect(
+      executeConnectedAction(ms.database, ms.workspaceId, {
+        type: 'email_draft',
+        connection_id: ms.connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Campaign step',
+        body: 'Hello from the campaign',
+        structured_payload_json: JSON.stringify({
+          deliveryPurpose: 'outreach',
+          deliverySourceType: 'campaign_email',
+          deliverySourceId: 'lcca_legacy_path'
+        }),
+        payload_hash: 'ms-campaign-legacy-key'
+      })
+    ).rejects.toThrow('Campaign email has no bound Person and contact identity');
+    expect(nangoMock.post).not.toHaveBeenCalled();
+  });
+
+  it('adds no List-Unsubscribe header to Gmail outreach not approved with it', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    vi.stubEnv('TREVRA_SECRETS_KEY', 'legacy-path-secrets-key');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    nangoMock.post.mockResolvedValueOnce({ data: { id: 'gmail-legacy' }, headers: {} });
+
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Hello',
+      body: 'Hi there',
+      structured_payload_json: '{}',
+      payload_hash: 'gmail-legacy-key'
+    });
+
+    const send = nangoMock.post.mock.calls[0]?.[0] as { data?: { raw?: string } };
+    const mime = Buffer.from(String(send.data?.raw ?? ''), 'base64url').toString('utf8');
+    expect(mime).not.toContain('List-Unsubscribe');
+  });
+
+  it('refuses an email approved with unsubscribe when unsubscribe is not configured', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', '');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Hello',
+        body: 'Hi',
+        structured_payload_json: JSON.stringify({ requireListUnsubscribe: true }),
+        payload_hash: 'require-unsubscribe-key'
+      })
+    ).rejects.toMatchObject({ status: 409 });
+    expect(nangoMock.post).not.toHaveBeenCalled();
+    const row = await database
+      .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+      .get<{ status: string }>(workspaceId, 'require-unsubscribe-key');
+    expect(row?.status).toBe('failed');
+  });
+
+  it('refuses requireListUnsubscribe on a non-outreach send with its own message', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Re: Hello',
+        body: 'Hi',
+        structured_payload_json: JSON.stringify({
+          deliveryPurpose: 'reply',
+          requireListUnsubscribe: true
+        }),
+        payload_hash: 'require-unsubscribe-reply-key'
+      })
+    ).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('apply only to outreach')
+    });
+    expect(nangoMock.post).not.toHaveBeenCalled();
+  });
+
+  it('records no internet message id when Graph returns none for MIME outreach', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('microsoft');
+    nangoMock.post
+      .mockResolvedValueOnce({ data: { id: 'ms-no-imid' }, headers: {} })
+      .mockResolvedValueOnce({ data: {}, headers: {} });
+    await executeConnectedAction(database, workspaceId, {
+      type: 'email_draft',
+      connection_id: connectionId,
+      recipient: 'lead@example.test',
+      subject: 'Hello',
+      body: 'Hi',
+      structured_payload_json: JSON.stringify({ requireListUnsubscribe: true }),
+      payload_hash: 'ms-no-imid-key'
+    });
+    const row = await database
+      .prepare(
+        'SELECT internet_message_id FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?'
+      )
+      .get<{ internet_message_id: string | null }>(workspaceId, 'ms-no-imid-key');
+    expect(row?.internet_message_id).toBeNull();
+  });
+
+  it('rejects header injection before contacting the provider', async () => {
+    expect(() =>
+      buildMimeMessage({
+        recipient: 'lead@example.test\r\nBcc: spy@example.test',
+        subject: 'x',
+        body: 'y',
+        idempotencyKey: 'k'
+      })
+    ).toThrow(/line breaks/);
+    expect(() =>
+      buildMimeMessage({
+        recipient: 'lead@example.test\0',
+        subject: 'x',
+        body: 'y',
+        idempotencyKey: 'k'
+      })
+    ).toThrow(/line breaks or NUL characters/);
+    for (const bad of ['no colon here', 'Bad Name: x', ': empty', 'X-Ok:nospace']) {
+      expect(() =>
+        buildMimeMessage({
+          recipient: 'lead@example.test',
+          subject: 'x',
+          body: 'y',
+          idempotencyKey: 'k',
+          extraHeaders: [bad]
+        })
+      ).toThrow(/Name: value/);
+    }
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test\nBcc: spy@example.test',
+        subject: 'Hello',
+        body: 'Hi',
+        structured_payload_json: '{}',
+        payload_hash: 'injection-key'
+      })
+    ).rejects.toMatchObject({ status: 400 });
+    expect(nangoMock.post).not.toHaveBeenCalled();
+    const row = await database
+      .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+      .get<{ status: string }>(workspaceId, 'injection-key');
+    expect(row?.status).toBe('failed');
+  });
+
+  it('rejects a CRLF-bearing inbound mailbox address in the unsubscribe mailto before any provider call', async () => {
+    vi.stubEnv('TREVRA_PUBLIC_API_URL', 'https://api.trevra.test');
+    const { database, workspaceId, connectionId } = await mailbox('gmail');
+    const now = new Date().toISOString();
+    await database
+      .prepare(
+        "INSERT INTO email_inbound_mailboxes (workspace_id,connection_id,address,sync_status,designated_at,updated_at) VALUES (?,?,?,'syncing',?,?)"
+      )
+      .run(workspaceId, connectionId, 'box@example.test\r\nbcc: spy@example.test', now, now);
+    await expect(
+      executeConnectedAction(database, workspaceId, {
+        type: 'email_draft',
+        connection_id: connectionId,
+        recipient: 'lead@example.test',
+        subject: 'Hello',
+        body: 'Hi',
+        structured_payload_json: JSON.stringify({ requireListUnsubscribe: true }),
+        payload_hash: 'mailbox-injection-key'
+      })
+    ).rejects.toMatchObject({ status: 400 });
+    expect(nangoMock.post).not.toHaveBeenCalled();
+    const row = await database
+      .prepare('SELECT status FROM gtm_deliveries WHERE workspace_id=? AND idempotency_key=?')
+      .get<{ status: string }>(workspaceId, 'mailbox-injection-key');
+    expect(row?.status).toBe('failed');
+  });
+
+  it('reads Microsoft conversation replies and NDRs as provider events', async () => {
+    const { database, workspaceId, connectionId } = await mailbox('microsoft');
+    nangoMock.get
+      .mockResolvedValueOnce({ data: { conversationId: 'conv-1' }, headers: {} })
+      .mockResolvedValueOnce({
+        data: {
+          value: [
+            {
+              id: 'ms-reply-event',
+              receivedDateTime: '2026-08-20T09:02:00.000Z',
+              subject: 'RE: hello',
+              from: { emailAddress: { address: 'lead@example.test', name: 'Lead' } },
+              body: { contentType: 'HTML', content: '<p>Yes, Friday works.</p>' }
+            },
+            {
+              id: 'ms-ndr-event',
+              receivedDateTime: '2026-08-20T09:03:00.000Z',
+              subject: 'Undeliverable: hello',
+              from: {
+                emailAddress: { address: 'postmaster@example.test', name: 'Microsoft Outlook' }
+              }
+            }
+          ]
+        },
+        headers: {}
+      });
+
+    const events = await readConnectedEmailThreadEvents(database, workspaceId, {
+      localConnectionId: connectionId,
+      externalRef: 'ms-sent',
+      recipient: 'lead@example.test'
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'reply',
+          providerEventId: 'microsoft:ms-reply-event',
+          body: 'Yes, Friday works.',
+          subject: 'RE: hello',
+          sender: 'lead@example.test'
+        }),
+        expect.objectContaining({
+          kind: 'delivery_failure',
+          providerEventId: 'microsoft:ms-ndr-event'
+        })
+      ])
+    );
+  });
+});
+
+describe('Nango sync tenancy', () => {
+  it('refuses a sync whose connection exists in more than one workspace', async () => {
+    const database = await openLiveDatabase();
+    process.env.NANGO_API_KEY = 'test-nango-key';
+
+    const providerConfigKey = 'trevra-gmail';
+    const externalConnectionId = `conn-${id('dup')}`;
+    const now = new Date().toISOString();
+    // Legal rows: `connections` is UNIQUE(workspace_id, provider_config_key,
+    // external_connection_id), so the same pair in two tenants violates nothing.
+    for (const _ of [0, 1]) {
+      const tenant = await seedTenant(database);
+      await database
+        .prepare(
+          'INSERT INTO connections (id,workspace_id,provider,provider_config_key,external_connection_id,display_name,status,is_demo,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+        )
+        .run(
+          id('conn'),
+          tenant.workspaceId,
+          'gmail',
+          providerConfigKey,
+          externalConnectionId,
+          null,
+          'connected',
+          0,
+          now,
+          now
+        );
+    }
+
+    const payload = JSON.stringify({
+      id: `nango_${id('evt')}`,
+      type: 'sync',
+      success: true,
+      providerConfigKey,
+      connectionId: externalConnectionId,
+      model: 'trevra-messages'
+    });
+
+    await expect(handleNangoWebhook(database, payload, {})).rejects.toThrow(
+      /registered in 2 workspaces/
+    );
+    // Nothing was fetched, so nothing could have been filed under the wrong tenant.
+    expect(nangoMock.listRecords).not.toHaveBeenCalled();
+
+    const audit = await database
+      .prepare(
+        'SELECT status,workspace_id FROM webhook_events WHERE provider=? AND external_event_id=?'
+      )
+      .get<{ status: string; workspace_id: string | null }>('nango', JSON.parse(payload).id);
+    expect(audit?.status).toBe('failed');
+    expect(audit?.workspace_id).toBeNull();
+  });
+});
+
+describe('Nango authorization notifications', () => {
+  it('alerts once per transition into needs_reauth and alerts again after a successful reconnect', async () => {
+    const database = await openLiveDatabase();
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    const tenant = await seedTenant(database);
+    const providerConfigKey = 'trevra-gmail';
+    const connectionId = `gmail-${id('conn')}`;
+
+    const authEvent = (eventId: string, success: boolean) =>
+      JSON.stringify({
+        id: eventId,
+        type: 'auth',
+        success,
+        provider: 'gmail',
+        providerConfigKey,
+        connectionId,
+        error: success ? undefined : 'Authorization expired',
+        tags: { organization_id: tenant.workspaceId, end_user_email: 'owner@example.test' }
+      });
+
+    expect(await handleNangoWebhook(database, authEvent(`evt-${id('reauth')}`, false), {})).toEqual(
+      { duplicate: false, processed: 'connection-needs-reauth' }
+    );
+    expect(notificationMock.notifyIntegrationNeedsReauth).toHaveBeenCalledTimes(1);
+
+    expect(await handleNangoWebhook(database, authEvent(`evt-${id('reauth')}`, false), {})).toEqual(
+      { duplicate: false, processed: 'connection-needs-reauth' }
+    );
+    expect(notificationMock.notifyIntegrationNeedsReauth).toHaveBeenCalledTimes(1);
+
+    expect(await handleNangoWebhook(database, authEvent(`evt-${id('reauth')}`, true), {})).toEqual({
+      duplicate: false,
+      processed: 'connection-upserted'
+    });
+
+    expect(await handleNangoWebhook(database, authEvent(`evt-${id('reauth')}`, false), {})).toEqual(
+      { duplicate: false, processed: 'connection-needs-reauth' }
+    );
+    expect(notificationMock.notifyIntegrationNeedsReauth).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Nango calendar sync', () => {
+  it('stores meetings with known people, ignores internal and personal events, and counts unreadable ones', async () => {
+    const database = await openLiveDatabase();
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    const tenant = await seedTenant(database);
+    const now = new Date().toISOString();
+    const founder = `founder-${tenant.workspaceId}@lemoncrow.example`;
+    const teammate = `teammate-${tenant.workspaceId}@lemoncrow.example`;
+    for (const [userId, email] of [
+      [id('usr'), founder],
+      [id('usr'), teammate]
+    ]) {
+      await database
+        .prepare('INSERT INTO users (id,workspace_id,email,name,created_at) VALUES (?,?,?,?,?)')
+        .run(userId, tenant.workspaceId, email, 'Team', now);
+    }
+    await database
+      .prepare(
+        'INSERT INTO contacts (id,workspace_id,name,email,email_normalized,created_at,updated_at) VALUES (?,?,?,?,?,?,?)'
+      )
+      .run(
+        id('con'),
+        tenant.workspaceId,
+        'Maya Patel',
+        'maya@acme.example',
+        'maya@acme.example',
+        now,
+        now
+      );
+    const providerConfigKey = 'trevra-google-calendar';
+    const externalConnectionId = `gcal-${id('conn')}`;
+    await database
+      .prepare(
+        'INSERT INTO connections (id,workspace_id,provider,provider_config_key,external_connection_id,display_name,status,is_demo,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      )
+      .run(
+        id('conn'),
+        tenant.workspaceId,
+        'google-calendar',
+        providerConfigKey,
+        externalConnectionId,
+        null,
+        'connected',
+        0,
+        now,
+        now
+      );
+
+    const times = {
+      kind: 'calendar#event',
+      start: { dateTime: '2026-11-03T10:00:00+01:00' },
+      end: { dateTime: '2026-11-03T10:30:00+01:00' }
+    };
+    const self = { email: founder, self: true, responseStatus: 'accepted' };
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        {
+          id: 'evt-known',
+          status: 'confirmed',
+          summary: 'Acme intro',
+          description: 'Agenda nobody should store',
+          ...times,
+          attendees: [self, { email: 'maya@acme.example', displayName: 'Maya Patel' }],
+          _nango_metadata: { last_action: 'ADDED', deleted_at: null }
+        },
+        { id: 'evt-internal', ...times, attendees: [self, { email: teammate }] },
+        {
+          id: 'evt-all-day',
+          kind: 'calendar#event',
+          start: { date: '2026-11-04' },
+          end: { date: '2026-11-05' },
+          attendees: [self]
+        },
+        { id: 'evt-stranger', ...times, attendees: [self, { email: 'stranger@else.example' }] },
+        {
+          id: 'graph-1',
+          start: { dateTime: '2026-11-03T10:00:00.0000000', timeZone: 'UTC' },
+          end: { dateTime: '2026-11-03T10:30:00.0000000', timeZone: 'UTC' },
+          attendees: [{ emailAddress: { address: 'maya@acme.example' } }]
+        }
+      ],
+      next_cursor: null
+    });
+
+    const result = await handleNangoWebhook(
+      database,
+      JSON.stringify({
+        id: `nango_${id('evt')}`,
+        type: 'sync',
+        success: true,
+        providerConfigKey,
+        connectionId: externalConnectionId,
+        model: 'GoogleCalendarEvent'
+      }),
+      {}
+    );
+    expect(result).toEqual({ duplicate: false, processed: 'synced-1-skipped-1-ignored-3' });
+
+    const meetings = await database
+      .prepare('SELECT external_id,status,origin FROM meetings WHERE workspace_id=?')
+      .all(tenant.workspaceId);
+    expect(meetings).toEqual([
+      { external_id: 'evt-known', status: 'scheduled', origin: 'calendar' }
+    ]);
+    const contacts = await database
+      .prepare('SELECT COUNT(*)::int AS n FROM contacts WHERE workspace_id=?')
+      .get<{ n: number }>(tenant.workspaceId);
+    expect(contacts?.n).toBe(1);
+    const sources = await database
+      .prepare('SELECT payload_json::text AS payload FROM source_records WHERE workspace_id=?')
+      .all<{ payload: string }>(tenant.workspaceId);
+    expect(sources).toHaveLength(1);
+    expect(sources[0].payload).not.toMatch(/Acme intro|Agenda|stranger|teammate/);
+    const connection = await database
+      .prepare('SELECT last_error FROM connections WHERE workspace_id=?')
+      .get<{ last_error: string | null }>(tenant.workspaceId);
+    expect(connection?.last_error).toBe(
+      "1 record from 'GoogleCalendarEvent' could not be read and was not stored."
+    );
+  });
+
+  async function seedSyncTenant(
+    database: LiveDb,
+    provider: string,
+    providerConfigKey: string
+  ): Promise<{ workspaceId: string; externalConnectionId: string; providerConfigKey: string }> {
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    const tenant = await seedTenant(database);
+    const now = new Date().toISOString();
+    const externalConnectionId = `sync-${id('conn')}`;
+    await database
+      .prepare(
+        'INSERT INTO connections (id,workspace_id,provider,provider_config_key,external_connection_id,display_name,status,is_demo,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      )
+      .run(
+        id('conn'),
+        tenant.workspaceId,
+        provider,
+        providerConfigKey,
+        externalConnectionId,
+        null,
+        'connected',
+        0,
+        now,
+        now
+      );
+    await database
+      .prepare(
+        'INSERT INTO contacts (id,workspace_id,name,email,email_normalized,created_at,updated_at) VALUES (?,?,?,?,?,?,?)'
+      )
+      .run(
+        id('con'),
+        tenant.workspaceId,
+        'Maya Patel',
+        'maya@acme.example',
+        'maya@acme.example',
+        now,
+        now
+      );
+    return { workspaceId: tenant.workspaceId, externalConnectionId, providerConfigKey };
+  }
+
+  function syncWebhook(
+    seed: { externalConnectionId: string; providerConfigKey: string },
+    model: string
+  ): string {
+    return JSON.stringify({
+      id: `nango_${id('evt')}`,
+      type: 'sync',
+      success: true,
+      providerConfigKey: seed.providerConfigKey,
+      connectionId: seed.externalConnectionId,
+      model
+    });
+  }
+
+  it('never lets an InboundEmailMessage without a mailbox address reach the Person-creating path', async () => {
+    const database = await openLiveDatabase();
+    const seed = await seedSyncTenant(database, 'gmail', 'trevra-gmail');
+    const before = await database
+      .prepare('SELECT COUNT(*)::int AS total FROM contacts WHERE workspace_id=?')
+      .get<{ total: number }>(seed.workspaceId);
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        {
+          kind: 'message',
+          id: 'stranger-1',
+          personEmail: 'stranger@elsewhere.test',
+          direction: 'inbound',
+          subject: 'Hi',
+          body: 'Hello',
+          occurredAt: '2026-10-06T08:30:00.000Z'
+        }
+      ],
+      next_cursor: null
+    });
+    const result = await handleNangoWebhook(database, syncWebhook(seed, 'InboundEmailMessage'), {});
+    expect(result).toEqual({ duplicate: false, processed: 'synced-0-skipped-1' });
+    const after = await database
+      .prepare('SELECT COUNT(*)::int AS total FROM contacts WHERE workspace_id=?')
+      .get<{ total: number }>(seed.workspaceId);
+    expect(after?.total).toBe(before?.total);
+    const messages = await database
+      .prepare('SELECT COUNT(*)::int AS total FROM messages WHERE workspace_id=?')
+      .get<{ total: number }>(seed.workspaceId);
+    expect(messages?.total).toBe(0);
+  });
+
+  it('skips one malformed canonical record and still ingests the good ones', async () => {
+    const database = await openLiveDatabase();
+    const seed = await seedSyncTenant(database, 'gmail', 'trevra-gmail');
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        {
+          kind: 'opportunity',
+          id: 'opp-good',
+          accountName: 'Acme',
+          personName: 'Maya Patel',
+          personEmail: 'maya@acme.example',
+          title: 'Good',
+          status: 'qualified'
+        },
+        { kind: 'opportunity', id: 12 },
+        {
+          kind: 'opportunity',
+          id: 'opp-good-2',
+          accountName: 'Acme',
+          personName: 'Maya Patel',
+          personEmail: 'maya@acme.example',
+          title: 'Good two',
+          status: 'qualified'
+        }
+      ],
+      next_cursor: null
+    });
+    const result = await handleNangoWebhook(database, syncWebhook(seed, 'TrevraOpportunity'), {});
+    expect(result).toEqual({ duplicate: false, processed: 'synced-2-skipped-1' });
+  });
+
+  it('skips a meeting record it cannot read on a meeting alias model and keeps the batch going', async () => {
+    const database = await openLiveDatabase();
+    const seed = await seedSyncTenant(database, 'microsoft', 'trevra-microsoft');
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        {
+          id: 'graph-1',
+          start: { dateTime: '2026-11-03T10:00:00.0000000', timeZone: 'UTC' },
+          end: { dateTime: '2026-11-03T10:30:00.0000000', timeZone: 'UTC' },
+          attendees: [{ emailAddress: { address: 'maya@acme.example' } }]
+        },
+        {
+          kind: 'opportunity',
+          id: 'opp-after-graph',
+          accountName: 'Acme',
+          personName: 'Maya Patel',
+          personEmail: 'maya@acme.example',
+          title: 'After Graph',
+          status: 'qualified'
+        }
+      ],
+      next_cursor: null
+    });
+    const result = await handleNangoWebhook(database, syncWebhook(seed, 'TrevraMeeting'), {});
+    expect(result).toEqual({ duplicate: false, processed: 'synced-1-skipped-1' });
+    const opportunities = await database
+      .prepare('SELECT title FROM opportunities WHERE workspace_id=?')
+      .all<{ title: string }>(seed.workspaceId);
+    expect(opportunities.map((row) => row.title)).toContain('After Graph');
+    const meetings = await database
+      .prepare('SELECT COUNT(*)::int AS n FROM meetings WHERE workspace_id=?')
+      .get<{ n: number }>(seed.workspaceId);
+    expect(meetings?.n).toBe(0);
+  });
+
+  it('cancels a stored calendar meeting once the event stops being a prospect meeting', async () => {
+    const database = await openLiveDatabase();
+    const seed = await seedSyncTenant(database, 'google-calendar', 'trevra-google-calendar');
+    const self = { email: 'owner@lemoncrow.example', self: true, responseStatus: 'accepted' };
+    const times = {
+      kind: 'calendar#event',
+      start: { dateTime: '2026-11-03T10:00:00+01:00' },
+      end: { dateTime: '2026-11-03T10:30:00+01:00' }
+    };
+    const maya = { email: 'maya@acme.example', responseStatus: 'accepted' };
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        { id: 'evt-lost', ...times, attendees: [self, maya] },
+        { id: 'evt-all-day', ...times, attendees: [self, maya] }
+      ],
+      next_cursor: null
+    });
+    expect(
+      await handleNangoWebhook(database, syncWebhook(seed, 'GoogleCalendarEvent'), {})
+    ).toEqual({ duplicate: false, processed: 'synced-2' });
+
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        { id: 'evt-lost', ...times, attendees: [self, { email: 'stranger@else.example' }] },
+        {
+          id: 'evt-all-day',
+          kind: 'calendar#event',
+          start: { date: '2026-11-03' },
+          end: { date: '2026-11-04' },
+          attendees: [self, maya]
+        },
+        { id: 'evt-never-stored', ...times, attendees: [self] }
+      ],
+      next_cursor: null
+    });
+    await handleNangoWebhook(database, syncWebhook(seed, 'GoogleCalendarEvent'), {});
+    const meetings = await database
+      .prepare('SELECT external_id,status FROM meetings WHERE workspace_id=? ORDER BY external_id')
+      .all<{ external_id: string; status: string }>(seed.workspaceId);
+    expect(meetings).toEqual([
+      { external_id: 'evt-all-day', status: 'cancelled' },
+      { external_id: 'evt-lost', status: 'cancelled' }
+    ]);
+  });
+
+  it("does not read another provider's events model as calendar meetings", async () => {
+    const database = await openLiveDatabase();
+    const seed = await seedSyncTenant(database, 'hubspot', 'trevra-hubspot');
+    nangoMock.listRecords.mockResolvedValueOnce({
+      records: [
+        {
+          id: 'evt-other',
+          kind: 'calendar#event',
+          start: { dateTime: '2026-11-03T10:00:00+01:00' },
+          end: { dateTime: '2026-11-03T10:30:00+01:00' },
+          attendees: [{ email: 'maya@acme.example' }]
+        }
+      ],
+      next_cursor: null
+    });
+    const result = await handleNangoWebhook(database, syncWebhook(seed, 'events'), {});
+    expect(result).toEqual({ duplicate: false, processed: 'synced-0-skipped-1' });
+    const meetings = await database
+      .prepare('SELECT COUNT(*)::int AS n FROM meetings WHERE workspace_id=?')
+      .get<{ n: number }>(seed.workspaceId);
+    expect(meetings?.n).toBe(0);
+  });
+});
+
+describe('mailbox identity on re-authorization', () => {
+  it('clears the cached mailbox address whenever Nango re-authorizes the connection', async () => {
+    const database = await openLiveDatabase();
+    process.env.NANGO_API_KEY = 'test-nango-key';
+    const tenant = await seedTenant(database);
+    const connectionId = `gmail-${id('conn')}`;
+    const authEvent = (eventId: string) =>
+      JSON.stringify({
+        id: eventId,
+        type: 'auth',
+        success: true,
+        provider: 'gmail',
+        providerConfigKey: 'trevra-gmail',
+        connectionId,
+        tags: { organization_id: tenant.workspaceId, end_user_email: 'owner@example.test' }
+      });
+
+    await handleNangoWebhook(database, authEvent(`evt-${id('auth')}`), {});
+    await database
+      .prepare(
+        "UPDATE connections SET mailbox_address='old-owner@acme.test' WHERE workspace_id=? AND external_connection_id=?"
+      )
+      .run(tenant.workspaceId, connectionId);
+    await handleNangoWebhook(database, authEvent(`evt-${id('auth')}`), {});
+
+    const row = await database
+      .prepare(
+        'SELECT mailbox_address FROM connections WHERE workspace_id=? AND external_connection_id=?'
+      )
+      .get<{ mailbox_address: string | null }>(tenant.workspaceId, connectionId);
+    expect(row?.mailbox_address).toBeNull();
+  });
+});

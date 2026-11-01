@@ -1,0 +1,759 @@
+locals {
+  public_host = trimsuffix(trimprefix(var.app_origin, "https://"), "/")
+  alert_email = var.alert_email != "" ? var.alert_email : var.support_email
+
+  required_apis = toset([
+    "artifactregistry.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "monitoring.googleapis.com",
+    "secretmanager.googleapis.com",
+    "sqladmin.googleapis.com"
+  ])
+
+  isolated_authward_environment = {
+    AUTHWARD_ISOLATED_ENABLED            = tostring(var.authward_isolated_enabled)
+    AUTHWARD_ACCOUNT_MIGRATION_ENABLED   = tostring(var.authward_account_migration_enabled)
+    AUTHWARD_ISOLATED_HOSTED_LOGIN_READY = tostring(var.authward_isolated_hosted_login_ready)
+    AUTHWARD_ISOLATED_RESOURCE_SCOPES    = var.authward_isolated_resource_scopes
+  }
+
+  billing_environment = var.billing_client_secret != "" ? {
+    BILLING_BASE_URL  = var.billing_base_url
+    BILLING_CLIENT_ID = var.billing_client_id
+    BILLING_AUDIENCE  = var.billing_audience
+  } : {}
+
+  secret_values = merge({
+    "database-url"              = "postgresql://${var.database_user}:${urlencode(random_password.database.result)}@/${var.database_name}?host=/cloudsql/${google_sql_database_instance.trevra.connection_name}"
+    "better-auth-secret"        = random_password.better_auth.result
+    "marketing-hash-salt"       = random_password.marketing_hash.result
+    "traction-admin-token"      = random_password.traction_admin.result
+    "indexnow-key"              = random_id.indexnow.hex
+    "smtp-server"               = var.smtp_server
+    "smtp-username"             = var.smtp_username
+    "smtp-password"             = var.smtp_password
+    "email-from"                = var.email_from
+    "trevra-secrets-key"        = random_id.trevra_secrets_key.b64_std
+    "nango-api-key"             = var.nango_api_key
+    "nango-webhook-signing-key" = var.nango_webhook_signing_key
+    "ingest-api-key"            = random_password.ingest.result
+    "trevra-agent-token-pepper" = random_password.agent_token_pepper.result
+    "authward-client-secret"    = var.authward_client_secret
+    }, var.billing_client_secret != "" ? {
+    "billing-client-secret" = var.billing_client_secret
+    } : {}, var.temporal_api_key != "" ? {
+    "temporal-api-key" = var.temporal_api_key
+    } : {}, var.sandbox_gateway_token != "" ? {
+    "trevra-sandbox-gateway-token" = var.sandbox_gateway_token
+    } : {}, var.remote_action_adapter_token != "" ? {
+    "trevra-remote-action-adapter-token" = var.remote_action_adapter_token
+  } : {})
+}
+
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+resource "google_project_service" "required" {
+  for_each = local.required_apis
+  project  = var.project_id
+  service  = each.value
+
+  disable_on_destroy = false
+}
+
+resource "google_artifact_registry_repository" "trevra" {
+  project       = var.project_id
+  location      = var.region
+  repository_id = var.artifact_repository
+  description   = "Trevra production containers"
+  format        = "DOCKER"
+
+  cleanup_policy_dry_run = false
+  cleanup_policies {
+    id     = "remove-old-untagged"
+    action = "DELETE"
+    condition {
+      tag_state  = "UNTAGGED"
+      older_than = "2592000s"
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "cloud_run" {
+  project      = var.project_id
+  account_id   = "trevra-cloud-run"
+  display_name = "Trevra Cloud Run runtime"
+}
+
+resource "google_project_iam_member" "cloud_sql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "runtime_reader" {
+  project    = var.project_id
+  location   = var.region
+  repository = google_artifact_registry_repository.trevra.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_project_iam_member" "cloud_build_writer" {
+  project = var.project_id
+  role    = "roles/artifactregistry.writer"
+  member  = "serviceAccount:${data.google_project.current.number}@cloudbuild.gserviceaccount.com"
+}
+
+resource "random_password" "database" {
+  length           = 40
+  special          = true
+  override_special = "-._~"
+}
+
+resource "random_password" "better_auth" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "ingest" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "marketing_hash" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "traction_admin" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "agent_token_pepper" {
+  length  = 64
+  special = false
+}
+
+resource "random_id" "indexnow" {
+  byte_length = 16
+}
+
+resource "random_id" "trevra_secrets_key" {
+  byte_length = 32
+}
+
+resource "google_sql_database_instance" "trevra" {
+  project             = var.project_id
+  name                = "trevra-postgres"
+  region              = var.region
+  database_version    = "POSTGRES_16"
+  deletion_protection = var.deletion_protection
+
+  settings {
+    tier              = var.database_tier
+    availability_type = "REGIONAL"
+    disk_type         = "PD_SSD"
+    disk_size         = var.database_disk_size_gb
+    disk_autoresize   = true
+    edition           = "ENTERPRISE"
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "02:00"
+      point_in_time_recovery_enabled = true
+      transaction_log_retention_days = 7
+
+      backup_retention_settings {
+        retained_backups = 14
+        retention_unit   = "COUNT"
+      }
+    }
+
+    insights_config {
+      query_insights_enabled  = true
+      record_application_tags = true
+      record_client_address   = false
+      query_string_length     = 2048
+    }
+
+    ip_configuration {
+      ipv4_enabled = true
+      ssl_mode     = "ENCRYPTED_ONLY"
+    }
+
+    maintenance_window {
+      day          = 7
+      hour         = 3
+      update_track = "stable"
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_sql_database" "trevra" {
+  project  = var.project_id
+  name     = var.database_name
+  instance = google_sql_database_instance.trevra.name
+}
+
+resource "google_sql_user" "trevra" {
+  project  = var.project_id
+  name     = var.database_user
+  instance = google_sql_database_instance.trevra.name
+  password = random_password.database.result
+}
+
+resource "google_secret_manager_secret" "application" {
+  for_each  = local.secret_values
+  project   = var.project_id
+  secret_id = "trevra-${each.key}"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret_version" "application" {
+  for_each    = local.secret_values
+  secret      = google_secret_manager_secret.application[each.key].id
+  secret_data = each.value
+}
+
+resource "google_secret_manager_secret_iam_member" "runtime" {
+  for_each  = google_secret_manager_secret.application
+  project   = var.project_id
+  secret_id = each.value.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+# The independently provisioned credential is referenced by name only.
+# Never put its plaintext in tfvars or Terraform state.
+resource "google_secret_manager_secret_iam_member" "isolated_authward_runtime" {
+  count     = var.authward_isolated_client_secret_name != "" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.authward_isolated_client_secret_name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_cloud_run_v2_service" "trevra" {
+  project             = var.project_id
+  name                = var.service_name
+  location            = var.region
+  deletion_protection = var.deletion_protection
+  ingress             = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    service_account                  = google_service_account.cloud_run.email
+    timeout                          = "300s"
+    max_instance_request_concurrency = 80
+
+    scaling {
+      min_instance_count = var.min_instances
+      max_instance_count = var.max_instances
+    }
+
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.trevra.connection_name]
+      }
+    }
+
+    containers {
+      image = var.image
+
+      ports {
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+        cpu_idle          = true
+        startup_cpu_boost = true
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
+
+      env {
+        name  = "NODE_ENV"
+        value = "production"
+      }
+      env {
+        name  = "TREVRA_DEPLOYMENT_MODE"
+        value = "hosted"
+      }
+      env {
+        name  = "SMTP_PORT"
+        value = tostring(var.smtp_port)
+      }
+      env {
+        name  = "EMAIL_FROM_NAME"
+        value = var.email_from_name
+      }
+      env {
+        name  = "PORT"
+        value = "8080"
+      }
+      env {
+        name  = "APP_ORIGIN"
+        value = var.app_origin
+      }
+      env {
+        name  = "BETTER_AUTH_URL"
+        value = var.better_auth_url
+      }
+      env {
+        name  = "AUTHWARD_ISSUER"
+        value = var.authward_issuer
+      }
+      env {
+        name  = "AUTHWARD_CLIENT_ID"
+        value = var.authward_client_id
+      }
+      dynamic "env" {
+        for_each = local.isolated_authward_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+      dynamic "env" {
+        for_each = var.authward_isolated_client_secret_name != "" ? [1] : []
+        content {
+          name = "AUTHWARD_ISOLATED_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = var.authward_isolated_client_secret_name
+              version = "latest"
+            }
+          }
+        }
+      }
+      dynamic "env" {
+        for_each = local.billing_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+      env {
+        name  = "PUBLIC_SITE_URL"
+        value = var.app_origin
+      }
+      env {
+        name  = "PUBLIC_LEGAL_NAME"
+        value = var.legal_name
+      }
+      env {
+        name  = "PUBLIC_SUPPORT_EMAIL"
+        value = var.support_email
+      }
+      env {
+        name  = "SECURITY_CONTACT_EMAIL"
+        value = var.security_contact_email
+      }
+      env {
+        name  = "GOOGLE_SITE_VERIFICATION"
+        value = var.google_site_verification
+      }
+      env {
+        name  = "BING_SITE_VERIFICATION"
+        value = var.bing_site_verification
+      }
+      env {
+        name  = "COOKIE_SECURE"
+        value = "true"
+      }
+      env {
+        name  = "DATABASE_POOL_MAX"
+        value = tostring(var.database_pool_max)
+      }
+      env {
+        name  = "NANGO_HOST"
+        value = var.nango_host
+      }
+      env {
+        name  = "NANGO_PUBLIC_SERVER_URL"
+        value = var.nango_host
+      }
+      env {
+        name  = "ALLOW_DEMO_AUTH"
+        value = "false"
+      }
+      env {
+        name  = "ALLOW_SIMULATED_EXECUTION"
+        value = "false"
+      }
+      env {
+        name  = "TREVRA_ORCHESTRATOR"
+        value = var.orchestrator
+      }
+      env {
+        name  = "TEMPORAL_ADDRESS"
+        value = var.temporal_address
+      }
+      env {
+        name  = "TEMPORAL_NAMESPACE"
+        value = var.temporal_namespace
+      }
+      env {
+        name  = "TEMPORAL_TASK_QUEUE"
+        value = var.temporal_task_queue
+      }
+      env {
+        name  = "TEMPORAL_TLS"
+        value = tostring(var.temporal_tls)
+      }
+      env {
+        name  = "PUBLIC_REGISTRY_API_URL"
+        value = var.app_origin
+      }
+      env {
+        name  = "PUBLIC_REGISTRY_CORS_ORIGIN"
+        value = var.registry_cors_origin != "" ? var.registry_cors_origin : var.app_origin
+      }
+      env {
+        name  = "TREVRA_SANDBOX_GATEWAY_URL"
+        value = var.sandbox_gateway_url
+      }
+      env {
+        name  = "TREVRA_REMOTE_ACTION_ADAPTERS_JSON"
+        value = var.remote_action_adapters_json
+      }
+
+      dynamic "env" {
+        for_each = local.secret_values
+        content {
+          name = upper(replace(env.key, "-", "_"))
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.application[env.key].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      startup_probe {
+        initial_delay_seconds = 5
+        timeout_seconds       = 5
+        period_seconds        = 5
+        failure_threshold     = 24
+        http_get {
+          path = "/api/health"
+          port = 8080
+        }
+      }
+
+      liveness_probe {
+        initial_delay_seconds = 30
+        timeout_seconds       = 5
+        period_seconds        = 30
+        failure_threshold     = 3
+        http_get {
+          path = "/api/health"
+          port = 8080
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_project_iam_member.cloud_sql_client,
+    google_secret_manager_secret_iam_member.runtime,
+    google_secret_manager_secret_iam_member.isolated_authward_runtime,
+    google_secret_manager_secret_version.application,
+    google_sql_database.trevra,
+    google_sql_user.trevra
+  ]
+}
+
+resource "google_cloud_run_v2_service" "trevra_worker" {
+  project             = var.project_id
+  name                = "${var.service_name}-worker"
+  location            = var.region
+  deletion_protection = var.deletion_protection
+  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  template {
+    service_account                  = google_service_account.cloud_run.email
+    timeout                          = "3600s"
+    max_instance_request_concurrency = 1
+
+    scaling {
+      min_instance_count = var.worker_min_instances
+      max_instance_count = var.worker_max_instances
+    }
+
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.trevra.connection_name]
+      }
+    }
+
+    containers {
+      image   = var.image
+      command = ["node"]
+      args    = ["dist-server/worker/index.js"]
+
+      ports {
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+        cpu_idle          = false
+        startup_cpu_boost = true
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
+
+      dynamic "env" {
+        for_each = {
+          NODE_ENV                           = "production"
+          TREVRA_DEPLOYMENT_MODE             = "hosted"
+          SMTP_PORT                          = tostring(var.smtp_port)
+          EMAIL_FROM_NAME                    = var.email_from_name
+          PORT                               = "8080"
+          APP_ORIGIN                         = var.app_origin
+          BETTER_AUTH_URL                    = var.better_auth_url
+          AUTHWARD_ISSUER                    = var.authward_issuer
+          AUTHWARD_CLIENT_ID                 = var.authward_client_id
+          PUBLIC_SITE_URL                    = var.app_origin
+          PUBLIC_LEGAL_NAME                  = var.legal_name
+          PUBLIC_SUPPORT_EMAIL               = var.support_email
+          SECURITY_CONTACT_EMAIL             = var.security_contact_email
+          COOKIE_SECURE                      = "true"
+          DATABASE_POOL_MAX                  = tostring(var.database_pool_max)
+          NANGO_HOST                         = var.nango_host
+          NANGO_PUBLIC_SERVER_URL            = var.nango_host
+          ALLOW_DEMO_AUTH                    = "false"
+          ALLOW_SIMULATED_EXECUTION          = "false"
+          TREVRA_ORCHESTRATOR                = var.orchestrator
+          TEMPORAL_ADDRESS                   = var.temporal_address
+          TEMPORAL_NAMESPACE                 = var.temporal_namespace
+          TEMPORAL_TASK_QUEUE                = var.temporal_task_queue
+          TEMPORAL_TLS                       = tostring(var.temporal_tls)
+          PUBLIC_REGISTRY_API_URL            = var.app_origin
+          PUBLIC_REGISTRY_CORS_ORIGIN        = var.registry_cors_origin != "" ? var.registry_cors_origin : var.app_origin
+          TREVRA_SANDBOX_GATEWAY_URL         = var.sandbox_gateway_url
+          TREVRA_REMOTE_ACTION_ADAPTERS_JSON = var.remote_action_adapters_json
+        }
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.isolated_authward_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+      dynamic "env" {
+        for_each = var.authward_isolated_client_secret_name != "" ? [1] : []
+        content {
+          name = "AUTHWARD_ISOLATED_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = var.authward_isolated_client_secret_name
+              version = "latest"
+            }
+          }
+        }
+      }
+      dynamic "env" {
+        for_each = local.billing_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.secret_values
+        content {
+          name = upper(replace(env.key, "-", "_"))
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.application[env.key].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      startup_probe {
+        initial_delay_seconds = 5
+        timeout_seconds       = 5
+        period_seconds        = 5
+        failure_threshold     = 24
+        http_get {
+          path = "/health"
+          port = 8080
+        }
+      }
+
+      liveness_probe {
+        initial_delay_seconds = 30
+        timeout_seconds       = 5
+        period_seconds        = 30
+        failure_threshold     = 3
+        http_get {
+          path = "/health"
+          port = 8080
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_project_iam_member.cloud_sql_client,
+    google_secret_manager_secret_iam_member.runtime,
+    google_secret_manager_secret_iam_member.isolated_authward_runtime,
+    google_secret_manager_secret_version.application,
+    google_sql_database.trevra,
+    google_sql_user.trevra
+  ]
+}
+
+resource "google_monitoring_notification_channel" "uptime_email" {
+  project      = var.project_id
+  display_name = "Trevra uptime email"
+  type         = "email"
+  enabled      = true
+  labels = {
+    email_address = local.alert_email
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_monitoring_uptime_check_config" "trevra" {
+  project            = var.project_id
+  display_name       = "Trevra public health"
+  timeout            = "10s"
+  period             = "300s"
+  checker_type       = "STATIC_IP_CHECKERS"
+  log_check_failures = true
+
+  http_check {
+    path           = "/api/health"
+    port           = 443
+    use_ssl        = true
+    validate_ssl   = true
+    request_method = "GET"
+  }
+
+  monitored_resource {
+    type = "uptime_url"
+    labels = {
+      project_id = var.project_id
+      host       = local.public_host
+    }
+  }
+
+  content_matchers {
+    content = "\"ok\":true"
+    matcher = "CONTAINS_STRING"
+  }
+
+  depends_on = [google_project_service.required, google_cloud_run_v2_service.trevra]
+}
+
+resource "google_monitoring_alert_policy" "uptime" {
+  project               = var.project_id
+  display_name          = "Trevra public availability"
+  combiner              = "OR"
+  enabled               = true
+  severity              = "ERROR"
+  notification_channels = [google_monitoring_notification_channel.uptime_email.name]
+
+  conditions {
+    display_name = "Trevra health check failures"
+    condition_threshold {
+      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.trevra.uptime_check_id}\" AND resource.type=\"uptime_url\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 1
+      duration        = "300s"
+
+      aggregations {
+        alignment_period     = "600s"
+        per_series_aligner   = "ALIGN_NEXT_OLDER"
+        cross_series_reducer = "REDUCE_COUNT_FALSE"
+        group_by_fields      = ["resource.label.*"]
+      }
+
+      trigger { count = 1 }
+    }
+  }
+
+  conditions {
+    display_name = "Trevra TLS certificate expires within 15 days"
+    condition_threshold {
+      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.trevra.uptime_check_id}\" AND resource.type=\"uptime_url\""
+      comparison      = "COMPARISON_LT"
+      threshold_value = 15
+      duration        = "600s"
+
+      aggregations {
+        alignment_period     = "1200s"
+        per_series_aligner   = "ALIGN_NEXT_OLDER"
+        cross_series_reducer = "REDUCE_MEAN"
+        group_by_fields      = ["resource.label.*"]
+      }
+
+      trigger { count = 1 }
+    }
+  }
+
+  documentation {
+    mime_type = "text/markdown"
+    subject   = "Trevra needs attention"
+    content   = "Trevra's public health check or TLS certificate failed. Verify ${var.app_origin}/api/health, Cloud Run revisions, Cloud SQL connectivity, DNS, and the custom-domain certificate."
+  }
+
+  alert_strategy {
+    auto_close           = "1800s"
+    notification_prompts = ["OPENED", "CLOSED"]
+  }
+
+  depends_on = [google_monitoring_uptime_check_config.trevra]
+}
+
+resource "google_cloud_run_v2_service_iam_member" "public" {
+  count    = var.allow_unauthenticated ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.trevra.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
