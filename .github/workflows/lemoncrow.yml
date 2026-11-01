@@ -11,6 +11,6 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: lemoncrow-lab/lemoncrow@MIRROR_SHA
+      - uses: lemoncrow-lab/lemoncrow@30a17adbba2f8d49a6ad2d6f44a743c5fd1ac528
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
